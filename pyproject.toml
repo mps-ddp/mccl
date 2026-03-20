@@ -1,0 +1,27 @@
+[build-system]
+requires = [
+    "setuptools>=68.0",
+    "wheel>=0.41",
+    "torch>=2.5.0",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mccl"
+version = "0.3.0"
+description = "MPS-native ProcessGroup backend for PyTorch Distributed on Apple Silicon"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-timeout>=2.1",
+]
+
+[tool.setuptools.packages.find]
+include = ["mccl*"]

@@ -10,13 +10,17 @@
 
 namespace mccl {
 
-/// Per-collective timing record.
+/// Per-collective timing record with per-phase breakdown.
 struct OpMetric {
     uint32_t seq;
     std::string op_name;
     size_t bytes;
     std::chrono::steady_clock::time_point start;
     std::chrono::steady_clock::time_point end;
+
+    double sync_ms = 0;
+    double network_ms = 0;
+    double reduce_ms = 0;
 
     double elapsed_ms() const {
         return std::chrono::duration<double, std::milli>(end - start).count();
@@ -43,6 +47,9 @@ public:
     /// End timing an operation.
     void op_end(uint32_t seq);
 
+    /// Record per-phase breakdown for an in-flight op.
+    void record_phase(uint32_t seq, double sync_ms, double network_ms, double reduce_ms);
+
     /// Record a transport-level send/recv.
     void record_transport_bytes(size_t bytes, bool is_send);
 
@@ -60,6 +67,9 @@ public:
         double p50_latency_ms;
         double p99_latency_ms;
         double peak_throughput_gbps;
+        double avg_sync_ms;
+        double avg_network_ms;
+        double avg_reduce_ms;
     };
 
     Summary summarize() const;

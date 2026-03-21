@@ -207,5 +207,8 @@ PYBIND11_MODULE(_C, m) {
         .def_readonly("avg_latency_ms", &mccl::Metrics::Summary::avg_latency_ms)
         .def_readonly("p50_latency_ms", &mccl::Metrics::Summary::p50_latency_ms)
         .def_readonly("p99_latency_ms", &mccl::Metrics::Summary::p99_latency_ms)
-        .def_readonly("peak_throughput_gbps", &mccl::Metrics::Summary::peak_throughput_gbps);
+        .def_readonly("peak_throughput_gbps", &mccl::Metrics::Summary::peak_throughput_gbps)
+        .def_readonly("avg_sync_ms", &mccl::Metrics::Summary::avg_sync_ms)
+        .def_readonly("avg_network_ms", &mccl::Metrics::Summary::avg_network_ms)
+        .def_readonly("avg_reduce_ms", &mccl::Metrics::Summary::avg_reduce_ms);
 }

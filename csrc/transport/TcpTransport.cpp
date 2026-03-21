@@ -666,7 +666,7 @@ bool TcpTransport::send_recv_overlap(
             }
         }
 
-        int ready = ::poll(pfds, nfds, 30000);
+        int ready = ::poll(pfds, nfds, 10000);
         if (ready < 0) {
             if (errno == EINTR) continue;
             MCCL_ERROR("send_recv_overlap: poll() failed: %s", strerror(errno));

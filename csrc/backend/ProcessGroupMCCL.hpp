@@ -44,6 +44,10 @@ public:
         std::vector<at::Tensor>& tensors,
         const c10d::AllreduceOptions& opts = c10d::AllreduceOptions()) override;
 
+    c10::intrusive_ptr<c10d::Work> allreduce_coalesced(
+        std::vector<at::Tensor>& tensors,
+        const c10d::AllreduceCoalescedOptions& opts = c10d::AllreduceCoalescedOptions()) override;
+
     c10::intrusive_ptr<c10d::Work> broadcast(
         std::vector<at::Tensor>& tensors,
         const c10d::BroadcastOptions& opts = c10d::BroadcastOptions()) override;

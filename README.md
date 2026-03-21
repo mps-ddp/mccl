@@ -1,8 +1,23 @@
 # MCCL
 
-**High-performance collective communication for PyTorch Distributed on Apple Silicon.**
+**Collective communication for PyTorch Distributed on Apple Silicon (MPS).**
 
-MCCL is a `torch.distributed` backend purpose-built for Apple Silicon clusters. It exploits the unified memory architecture to perform gradient reductions directly on MPS tensor memory via the AMX coprocessor (through Apple's Accelerate framework), while keeping the GPU free for training. The transport layer uses poll()-based overlapped TCP for simultaneous bidirectional data transfer.
+MCCL implements a custom `torch.distributed` backend (`backend="mccl"`) so you can run **DDP** and **collectives** on **MPS tensors** across processes—one Mac or several. It uses Apple Silicon **unified memory** where possible: float32 reductions often go through **Accelerate / vDSP** on CPU-visible shared buffers while Metal stays available for compute; fp16/bf16 paths use **Metal** shaders. The default transport is **overlapped TCP**; **RDMA** is optional when the OS and hardware support it.
+
+### New here?
+
+| Goal | Where to start |
+|------|----------------|
+| **Clone, build, run a smoke test** | [Quick start](#quick-start) → `examples/ddp_dummy_train.py` |
+| **Understand the codebase** | [docs/DEVELOPING.md](docs/DEVELOPING.md) |
+| **Run tests** | [TESTING.md](TESTING.md) |
+| **Version / platform matrix** | [COMPATIBILITY.md](COMPATIBILITY.md) |
+
+### Is this “novel” or never done before?
+
+**Not in the abstract.** Distributed training, ring allreduce, and TCP collectives are well-studied; NVIDIA’s **NCCL** and PyTorch’s **Gloo** are the familiar stacks on Linux/CUDA/CPU.
+
+What **is** specific here: PyTorch’s **MPS** path historically did not ship a **production multi-process collective library** comparable to NCCL. MCCL is an **engineering project** that plugs that gap: a **native ProcessGroup for `DeviceType::MPS`**, with transports and reduction paths tuned for **Apple Silicon unified memory**. So the *idea* of distributed training is old; the *integration*—this backend + Metal/Accelerate + optional Apple RDMA—is what this repository provides. Don’t treat it as a research claim of world-first algorithms; treat it as **infrastructure** for Mac clusters.
 
 ## Architecture
 
@@ -22,11 +37,31 @@ allreduce, broadcast, barrier, allgather, reduce_scatter, send, recv
 
 ## Quick start
 
+**Prerequisites:** macOS on **Apple Silicon**, Python **3.11+**, Xcode command-line tools, **PyTorch 2.5+** with MPS.
+
 ```bash
-# macOS 15+ / Apple Silicon / Python 3.11+
+git clone …   # your fork or upstream URL
+cd mccl
 pip install torch
 pip install -e ".[dev]"
 ```
+
+**Smoke test (single GPU, no distributed launcher):**
+
+```bash
+python examples/ddp_dummy_train.py --baseline
+```
+
+**Local two-process DDP on one Mac:**
+
+```bash
+torchrun --nproc_per_node=2 --nnodes=1 --master_addr=127.0.0.1 --master_port=29500 \
+  examples/ddp_dummy_train.py
+```
+
+See [examples/ddp_dummy_train.py](examples/ddp_dummy_train.py) for env vars (model size, steps, ports).
+
+**Application code (minimal):**
 
 ```python
 import torch
@@ -165,9 +200,13 @@ For f32 allreduce on Apple Silicon:
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for the tested matrix of macOS, PyTorch, and hardware versions.
 
+## Contributing / development
+
+See [docs/DEVELOPING.md](docs/DEVELOPING.md) for repository layout, how the backend fits together, rebuild commands, and debugging.
+
 ## Testing
 
-See [TESTING.md](TESTING.md) for build instructions, test phases, multi-host setup, and benchmarking.
+See [TESTING.md](TESTING.md) for pytest commands and test layout.
 
 ## License
 

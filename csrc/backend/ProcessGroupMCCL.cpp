@@ -16,12 +16,39 @@ namespace mccl {
 
 namespace {
 
+enum class SyncMode {
+    FULL,       // torch::mps::synchronize() every op (safest)
+    COALESCED,  // sync once at start of a batch; skip for subsequent ops in same batch
+};
+
+SyncMode global_sync_mode() {
+    static SyncMode mode = [] {
+        auto* v = std::getenv("MCCL_SYNC_MODE");
+        if (v) {
+            std::string s(v);
+            if (s == "coalesced" || s == "fast") return SyncMode::COALESCED;
+        }
+        return SyncMode::FULL;
+    }();
+    return mode;
+}
+
+thread_local bool tl_sync_done = false;
+
 inline void sync_mps_for_collective(bool overlap) {
+    if (global_sync_mode() == SyncMode::COALESCED && tl_sync_done) {
+        return;
+    }
     if (overlap) {
         mps_event_sync();
     } else {
         mps_stream_sync();
     }
+    tl_sync_done = true;
+}
+
+inline void reset_sync_state() {
+    tl_sync_done = false;
 }
 
 } // anonymous namespace
@@ -130,6 +157,8 @@ ProcessGroupMCCL::ProcessGroupMCCL(
                    es_off ? "off (env)" :
                    event_sync_available() ? "on" : "off (unavailable)");
     }
+    MCCL_INFO("  sync_mode           = %s",
+              global_sync_mode() == SyncMode::COALESCED ? "coalesced" : "full");
     MCCL_INFO("  compression         = %s", compressor_ ? compressor_->name().c_str() : "none");
     if (compressor_ && comp_mode == CompressionMode::TOPK) {
         MCCL_INFO("  topk_ratio          = %.4f", topk_ratio);
@@ -343,8 +372,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     watchdog_->watch(seq, "allreduce");
     metrics_->op_start(seq, "allreduce", nbytes);
 
-    // MPS sync must run on the PyTorch thread; transport runs on ProgressEngine.
+    auto sync_t0 = std::chrono::steady_clock::now();
     sync_mps_for_collective(overlap_comm_);
+    auto sync_t1 = std::chrono::steady_clock::now();
+    double sync_ms = std::chrono::duration<double, std::milli>(sync_t1 - sync_t0).count();
+    metrics_->record_phase(seq, sync_ms, 0, 0);
 
     engine_->submit(
         [this, tensor_copy, seq, ws, nbytes, red_op]() mutable {
@@ -354,6 +386,79 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 allreduce_two_rank(tensor_copy, seq, red_op);
             } else {
                 allreduce_ring(tensor_copy, seq, red_op);
+            }
+        },
+        [this, work_ptr, seq]() {
+            unregister_work(seq);
+            watchdog_->complete(seq);
+            metrics_->op_end(seq);
+            work_ptr->markComplete();
+        },
+        [this, work_ptr, seq](std::exception_ptr e) {
+            unregister_work(seq);
+            watchdog_->complete(seq);
+            metrics_->op_end(seq);
+            metrics_->record_error();
+            work_ptr->markError(e);
+        }
+    );
+
+    return work;
+}
+
+
+c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
+    std::vector<at::Tensor>& tensors,
+    const c10d::AllreduceCoalescedOptions& opts) {
+
+    MCCL_CHECK_TENSOR(!tensors.empty(), "allreduce_coalesced: empty tensor list");
+
+    // Flatten all tensors into one contiguous buffer for a single collective op.
+    std::vector<at::Tensor> flat_inputs;
+    flat_inputs.reserve(tensors.size());
+    for (auto& t : tensors) {
+        MCCL_CHECK_TENSOR(t.is_mps(), "MCCL requires MPS tensors");
+        flat_inputs.push_back(t.flatten());
+    }
+    at::Tensor flat = at::cat(flat_inputs, 0);
+
+    uint32_t seq = collective_seq_.fetch_add(1);
+    size_t nbytes = tensor_nbytes(flat);
+    auto work = c10::make_intrusive<WorkMCCL>(
+        c10d::OpType::ALLREDUCE, seq, std::vector<at::Tensor>{flat});
+    auto work_ptr = work;
+    int ws = getSize();
+    c10d::ReduceOp::RedOpType red_op = opts.reduceOp;
+
+    register_work(seq, work);
+    watchdog_->watch(seq, "allreduce_coalesced");
+    metrics_->op_start(seq, "allreduce_coalesced", nbytes);
+
+    auto sync_t0 = std::chrono::steady_clock::now();
+    sync_mps_for_collective(overlap_comm_);
+    auto sync_t1 = std::chrono::steady_clock::now();
+    metrics_->record_phase(seq, std::chrono::duration<double, std::milli>(sync_t1 - sync_t0).count(), 0, 0);
+
+    // Capture the tensor list + flat buffer for the engine lambda
+    auto tensors_copy = tensors;
+    auto flat_copy = flat;
+
+    engine_->submit(
+        [this, flat_copy, tensors_copy, seq, ws, nbytes, red_op]() mutable {
+            if (ws == 2) {
+                allreduce_two_rank(flat_copy, seq, red_op);
+            } else {
+                allreduce_ring(flat_copy, seq, red_op);
+            }
+
+            // Scatter the reduced flat buffer back into the original tensors
+            size_t offset = 0;
+            for (auto& t : tensors_copy) {
+                size_t t_nbytes = tensor_nbytes(t);
+                auto src_slice = flat_copy.narrow(0, static_cast<int64_t>(offset / flat_copy.element_size()),
+                                                  t.numel());
+                t.view_as(src_slice).copy_(src_slice);
+                offset += t_nbytes;
             }
         },
         [this, work_ptr, seq]() {
@@ -389,21 +494,29 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
 
         PooledBuffer recv_buf(staging_memory_pool(), nbytes);
 
+        auto net_t0 = std::chrono::steady_clock::now();
         MCCL_CHECK(transport_->send_recv_overlap(
             peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes,
             peer, OpType::ALLREDUCE, seq, 0, recv_buf.data(), nbytes),
             "allreduce_two_rank send_recv_overlap failed");
+        auto net_t1 = std::chrono::steady_clock::now();
 
         float* dst = static_cast<float*>(view.cpu_ptr);
         const float* src = static_cast<const float*>(recv_buf.data());
 
+        auto red_t0 = std::chrono::steady_clock::now();
         if (op == c10d::ReduceOp::AVG) {
             cpu_accumulate_and_scale(dst, src, count, 0.5f);
         } else {
             cpu_reduce_op(dst, src, count, op);
         }
+        auto red_t1 = std::chrono::steady_clock::now();
 
         if (overlap_comm_) signal_mccl_done(next_event_value());
+
+        double net_ms = std::chrono::duration<double, std::milli>(net_t1 - net_t0).count();
+        double red_ms = std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
+        metrics_->record_phase(seq, 0, net_ms, red_ms);
 
         metrics_->record_transport_bytes(nbytes, true);
         metrics_->record_transport_bytes(nbytes, false);
@@ -688,11 +801,19 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
                 }
             } else {
                 size_t nbytes = tensor_nbytes(tensor_copy);
-                PooledBuffer recv_buf(staging_memory_pool(), nbytes);
-                MCCL_CHECK(transport_->recv_chunks(root, OpType::BROADCAST, seq, 0,
-                                                   recv_buf.data(), nbytes),
-                           "broadcast recv from root failed");
-                unstage_from_recv(tensor_copy, recv_buf.data(), nbytes);
+                bool use_cpu = tensor_cpu_accessible(tensor_copy);
+                if (use_cpu) {
+                    MPSBufferView view = extract_mps_buffer(tensor_copy);
+                    MCCL_CHECK(transport_->recv_chunks(root, OpType::BROADCAST, seq, 0,
+                                                       view.cpu_ptr, nbytes),
+                               "broadcast recv from root failed");
+                } else {
+                    PooledBuffer recv_buf(staging_memory_pool(), nbytes);
+                    MCCL_CHECK(transport_->recv_chunks(root, OpType::BROADCAST, seq, 0,
+                                                       recv_buf.data(), nbytes),
+                               "broadcast recv from root failed");
+                    unstage_from_recv(tensor_copy, recv_buf.data(), nbytes);
+                }
                 metrics_->record_transport_bytes(nbytes, false);
             }
             if (overlap_comm_) signal_mccl_done(next_event_value());
@@ -807,7 +928,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
             int left = (rank - 1 + ws) % ws;
             int right = (rank + 1) % ws;
 
-            PooledBuffer recv_buf(staging_memory_pool(), nbytes);
+            // For CPU-accessible tensors, recv directly into output tensor memory
+            PooledBuffer recv_buf_fallback(staging_memory_pool(), use_cpu ? 0 : nbytes);
 
             for (int step = 0; step < ws - 1; step++) {
                 int send_idx = (rank - step + ws) % ws;
@@ -819,18 +941,23 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                     ? stage_for_send_nosync(outputs_copy[send_idx])
                     : stage_for_send(outputs_copy[send_idx]);
 
+                void* recv_dst;
+                if (use_cpu) {
+                    MPSBufferView view = extract_mps_buffer(outputs_copy[recv_idx]);
+                    recv_dst = view.cpu_ptr;
+                } else {
+                    recv_dst = recv_buf_fallback.data();
+                }
+
                 MCCL_CHECK(transport_->send_recv_overlap(
                     right, OpType::ALLGATHER, seq, step_tid,
                     staged.data, nbytes,
                     left, OpType::ALLGATHER, seq, recv_tid,
-                    recv_buf.data(), nbytes),
+                    recv_dst, nbytes),
                     "allgather step " + std::to_string(step) + " failed");
 
-                if (use_cpu) {
-                    MPSBufferView view = extract_mps_buffer(outputs_copy[recv_idx]);
-                    memcpy(view.cpu_ptr, recv_buf.data(), nbytes);
-                } else {
-                    unstage_from_recv(outputs_copy[recv_idx], recv_buf.data(), nbytes);
+                if (!use_cpu) {
+                    unstage_from_recv(outputs_copy[recv_idx], recv_dst, nbytes);
                 }
                 metrics_->record_transport_bytes(nbytes, true);
                 metrics_->record_transport_bytes(nbytes, false);
@@ -1050,12 +1177,21 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
 
     engine_->submit(
         [this, tensor, srcRank, seq, tag, nbytes]() mutable {
-            PooledBuffer recv_buf(staging_memory_pool(), nbytes);
-            MCCL_CHECK(transport_->recv_chunks(srcRank, OpType::RECV, seq,
-                                               static_cast<uint32_t>(tag),
-                                               recv_buf.data(), nbytes),
-                       "recv from rank " + std::to_string(srcRank) + " failed");
-            unstage_from_recv(tensor, recv_buf.data(), nbytes);
+            bool use_cpu = tensor_cpu_accessible(tensor);
+            if (use_cpu) {
+                MPSBufferView view = extract_mps_buffer(tensor);
+                MCCL_CHECK(transport_->recv_chunks(srcRank, OpType::RECV, seq,
+                                                   static_cast<uint32_t>(tag),
+                                                   view.cpu_ptr, nbytes),
+                           "recv from rank " + std::to_string(srcRank) + " failed");
+            } else {
+                PooledBuffer recv_buf(staging_memory_pool(), nbytes);
+                MCCL_CHECK(transport_->recv_chunks(srcRank, OpType::RECV, seq,
+                                                   static_cast<uint32_t>(tag),
+                                                   recv_buf.data(), nbytes),
+                           "recv from rank " + std::to_string(srcRank) + " failed");
+                unstage_from_recv(tensor, recv_buf.data(), nbytes);
+            }
             metrics_->record_transport_bytes(nbytes, false);
         },
         [this, work_ptr, seq]() {

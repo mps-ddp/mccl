@@ -46,19 +46,26 @@ void Connection::configure_socket() {
 
     int one = 1;
     setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-
-    // SO_NOSIGPIPE: prevent SIGPIPE on broken connections (macOS/BSD).
     setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 
-    // DO NOT set SO_SNDBUF/SO_RCVBUF — on macOS this triggers
-    // SOCK_SNDBUF_LOCK which disables TCP auto-tuning and can halve
-    // throughput. Let the kernel grow buffers adaptively.
+    // Socket buffer sizing: let the kernel auto-tune by default but allow
+    // explicit override via MCCL_SOCK_BUFSIZE for high-bandwidth links
+    // (e.g. Thunderbolt 5) where the default ramp-up is too slow.
+    if (auto* v = std::getenv("MCCL_SOCK_BUFSIZE")) {
+        int bufsize = std::atoi(v);
+        if (bufsize > 0) {
+            setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+            setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+        }
+    }
 
 #if defined(__APPLE__)
-    // TCP_NOTSENT_LOWAT (macOS value 0x201): controls the threshold at
-    // which the socket is considered writable. Lower values reduce
-    // latency for small messages by waking the sender sooner.
-    int lowat = 131072;  // 128 KB
+    // TCP_NOTSENT_LOWAT: higher value for better throughput on big transfers;
+    // configurable for latency-sensitive small-message workloads.
+    int lowat = 131072;
+    if (auto* v = std::getenv("MCCL_TCP_LOWAT")) {
+        lowat = std::atoi(v);
+    }
     setsockopt(fd_, IPPROTO_TCP, 0x201, &lowat, sizeof(lowat));
 #endif
 

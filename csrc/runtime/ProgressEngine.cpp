@@ -22,6 +22,10 @@ void ProgressEngine::start() {
     running_ = true;
     thread_ = std::thread(&ProgressEngine::worker_loop, this);
 
+#if defined(__APPLE__)
+    pthread_setname_np("mccl_engine");
+#endif
+
     MCCL_INFO("ProgressEngine started (max_depth=%zu)", max_depth_);
 }
 

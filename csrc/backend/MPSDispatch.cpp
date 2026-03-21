@@ -130,8 +130,28 @@ c10::intrusive_ptr<c10d::Work> recv_MPS(
       ->recv(tensor_vec, static_cast<int>(src_rank), static_cast<int>(tag));
 }
 
+std::tuple<std::vector<at::Tensor>, c10::intrusive_ptr<c10d::Work>>
+allreduce_coalesced_MPS(
+    at::TensorList tensors,
+    const c10::intrusive_ptr<c10d::ProcessGroup>& process_group,
+    const c10::intrusive_ptr<c10d::ReduceOp>& reduce_op,
+    const std::optional<at::Tensor>& sparse_indices,
+    bool async_op,
+    int64_t timeout) {
+  auto tensor_vec = tensors.vec();
+  c10d::AllreduceCoalescedOptions opts;
+  opts.reduceOp = *reduce_op;
+  opts.asyncOp = async_op;
+  if (timeout >= 0)
+    opts.timeout = std::chrono::milliseconds(timeout);
+  auto work =
+      process_group->getBackend(c10::DeviceType::MPS)->allreduce_coalesced(tensor_vec, opts);
+  return {std::move(tensor_vec), work};
+}
+
 TORCH_LIBRARY_IMPL(c10d, MPS, m) {
   m.impl("allreduce_", allreduce_MPS);
+  m.impl("allreduce_coalesced_", allreduce_coalesced_MPS);
   m.impl("broadcast_", broadcast_MPS);
   m.impl("barrier", barrier_MPS);
   m.impl("allgather_", allgather_MPS);

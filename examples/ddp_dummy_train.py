@@ -168,6 +168,9 @@ def single_gpu_baseline() -> None:
         loss.backward()
         optimizer.step()
 
+        # Synchronize so timing reflects actual GPU work, not just dispatch
+        torch.mps.synchronize()
+
         step_time = time.perf_counter() - start_time
 
         if step >= warmup_steps:
@@ -394,6 +397,13 @@ def main() -> None:
                     f"{metrics.total_bytes_recv/1e6:.1f}MB recv, "
                     f"avg_lat={metrics.avg_latency_ms:.2f}ms"
                 )
+                phase_info = ""
+                for attr in ("avg_sync_ms", "avg_network_ms", "avg_reduce_ms"):
+                    val = getattr(metrics, attr, None)
+                    if val is not None:
+                        phase_info += f"  {attr}={val:.2f}ms"
+                if phase_info:
+                    mccl_info += f"\n  Phase breakdown:{phase_info}"
             else:
                 mccl_info = "MCCL metrics unavailable"
         except Exception:

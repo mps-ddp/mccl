@@ -37,6 +37,15 @@ void Metrics::op_end(uint32_t seq) {
     }
 }
 
+void Metrics::record_phase(uint32_t seq, double sync_ms, double network_ms, double reduce_ms) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = inflight_.find(seq);
+    if (it == inflight_.end()) return;
+    it->second.sync_ms += sync_ms;
+    it->second.network_ms += network_ms;
+    it->second.reduce_ms += reduce_ms;
+}
+
 void Metrics::record_transport_bytes(size_t bytes, bool is_send) {
     if (is_send) {
         total_bytes_sent_.fetch_add(bytes, std::memory_order_relaxed);
@@ -80,6 +89,16 @@ Metrics::Summary Metrics::summarize() const {
     s.p99_latency_ms = latencies[std::min(n - 1, (size_t)(n * 0.99))];
     s.peak_throughput_gbps = peak_tp;
 
+    double total_sync = 0, total_net = 0, total_reduce = 0;
+    for (auto& m : completed_) {
+        total_sync += m.sync_ms;
+        total_net += m.network_ms;
+        total_reduce += m.reduce_ms;
+    }
+    s.avg_sync_ms = total_sync / n;
+    s.avg_network_ms = total_net / n;
+    s.avg_reduce_ms = total_reduce / n;
+
     return s;
 }
 
@@ -96,6 +115,9 @@ void Metrics::log_summary() const {
     MCCL_INFO("  P50 latency:      %.3f ms", s.p50_latency_ms);
     MCCL_INFO("  P99 latency:      %.3f ms", s.p99_latency_ms);
     MCCL_INFO("  Peak throughput:  %.2f Gbps", s.peak_throughput_gbps);
+    MCCL_INFO("  Avg sync:         %.3f ms", s.avg_sync_ms);
+    MCCL_INFO("  Avg network:      %.3f ms", s.avg_network_ms);
+    MCCL_INFO("  Avg reduce:       %.3f ms", s.avg_reduce_ms);
     MCCL_INFO("============================");
 }
 

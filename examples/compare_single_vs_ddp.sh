@@ -10,6 +10,9 @@ export PYTHONUNBUFFERED=1
 export TRAIN_STEPS="${TRAIN_STEPS:-30}"
 export BATCH_SIZE="${BATCH_SIZE:-16}"
 
+# Performance: use coalesced sync mode (safe for manual allreduce after backward)
+export MCCL_SYNC_MODE="${MCCL_SYNC_MODE:-coalesced}"
+
 # ~126M-param default (see ddp_dummy_train.py); quick smoke test, e.g.:
 #   MODEL_DEPTH=2 MODEL_HIDDEN=512 BATCH_SIZE=32 bash examples/compare_single_vs_ddp.sh
 export INPUT_DIM="${INPUT_DIM:-2048}"

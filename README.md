@@ -23,7 +23,8 @@ dist.init_process_group(backend="mccl", rank=rank, world_size=world_size)
 # Use standard DDP on MPS tensors
 ```
 
-https://github.com/user-attachments/assets/944d967c-179f-42ed-8556-625cf3669e92
+
+https://github.com/user-attachments/assets/21865149-b077-4b65-93cc-f9e319ff0328
 
 
 

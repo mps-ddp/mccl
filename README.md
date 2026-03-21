@@ -2,7 +2,15 @@
 
 **Distributed PyTorch across Apple Silicon Macs using MPS.**
 
+## Performance Reality
+
+**Current performance:** Expect **~10x slower** than single-GPU training in most cases. This is not expected to be a performance boost with the current implementation.
+
+**Future potential:** Performance could be significantly improved with additional work on RDMA over Thunderbolt 5, better collective routing algorithms from PyTorch, or other transport optimizations.
+
 ## Quick start
+
+**Prerequisites:** PyTorch must be installed before installing MCCL. This has been tested with PyTorch nightlies and the latest stable version 2.10.0.
 
 ```bash
 pip install -e .
@@ -20,30 +28,11 @@ dist.init_process_group(backend="mccl", rank=rank, world_size=world_size)
 
 ## When this makes sense
 
-| Makes sense | Probably skip |
-|-------------|----------------|
-| Multi-Mac setup, model big enough that **compute** per step is the main cost | **Small models:** one GPU + grad accumulation usually wins (sync isn't free) |
-| Playing with Apple Silicon clusters | Expecting **datacenter NCCL** numbers over two laptops |
-| Experimenting with distributed training | Assuming "distributed = automatically faster" |
+- **Experimenting** with distributed training on Apple Silicon
+- **Playing** with multi-Mac setups and Apple Silicon clusters
+- **Research** into PyTorch backends and MPS collective operations
 
-## Performance (honest numbers)
-
-From `examples/ddp_dummy_train.py`, same **global batch 8** where it matters:
-
-| Profile | Single Mac (`--baseline`) | 2 ranks DDP (local `torchrun`) | |
-|---------|---------------------------|----------------------------------|--|
-| Default small (~4M params) | ~3 ms/step | ~14 ms/step | Multi-node is **slower** here — normal. |
-| Larger models | multi-second / step | tuning-dependent | Link speed + **DDP bucket size** matter; see [docs/MULTINODE.md](docs/MULTINODE.md). |
-
-**TL;DR:** Physics is physics. Small net = sync eats the step. Big net = link + buckets matter. Add your machine to [RESULTS.md](RESULTS.md) if you want.
-
-**Quick perf comparison (baseline vs DDP):**
-
-```bash
-bash scripts/benchmark_matrix.sh
-```
-
-See [examples/ddp_dummy_train.py](examples/ddp_dummy_train.py) for env vars (`DDP_BUCKET_MB`, `BATCH_SIZE`, etc.).
+**Don't expect performance gains** — use for learning and experimentation.
 
 ## What this is
 
@@ -67,13 +56,13 @@ MCCL is a `torch.distributed` backend for **DDP** and **collectives** on **MPS t
 | Community timings | [RESULTS.md](RESULTS.md) |
 | Launch / demo notes | [docs/LAUNCH.md](docs/LAUNCH.md) |
 
-## Performance expectations
+## Benchmarking
 
-**Small models:** DDP often **loses** to one GPU for wall-clock per step — fixed collective overhead vs tiny compute. Not a bug.
+```bash
+bash scripts/benchmark_matrix.sh
+```
 
-**Large models:** Communication is a **smaller slice** of the step; tuning (`DDP_BUCKET_MB`, `MCCL_COMPRESSION`, link choice) matters. Still not InfiniBand.
-
-**YMMV:** TB3 vs Ethernet vs Wi‑Fi, PyTorch version, bucket size — see [RESULTS.md](RESULTS.md) for a place to dump numbers.
+See [examples/ddp_dummy_train.py](examples/ddp_dummy_train.py) for env vars and [RESULTS.md](RESULTS.md) to add your numbers.
 
 ## What we haven't tested
 

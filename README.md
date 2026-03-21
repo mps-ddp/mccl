@@ -2,12 +2,6 @@
 
 **Distributed PyTorch across Apple Silicon Macs using MPS.**
 
-## Performance Reality
-
-**Current performance:** **2-rank DDP** is usually **slower** than training on **one** MPS device at the **same global batch** — communication and sync eat time. On **larger networks** (e.g. the conv + attention example in `examples/ddp_dummy_train.py`), a fair baseline vs DDP comparison often shows on the order of **~2.5–3× lower DDP throughput** (e.g. ~96M params, global batch 8: ~60 vs ~23 samples/s in one run — use `examples/benchmark_throughput.py` to reproduce). With **tiny** models, the gap can be **much larger** because compute is cheap and the network stack dominates. This is still not a net speedup versus one fast GPU for most workloads today.
-
-**Future potential:** Performance could be significantly improved with additional work on RDMA over Thunderbolt 5, better collective routing algorithms from PyTorch, or other transport optimizations.
-
 ## Quick start
 
 **Prerequisites:**
@@ -151,6 +145,12 @@ dist.init_process_group(backend="mccl", rank=rank, world_size=world_size)
 
 model = DDP(MyModel().to("mps"))
 ```
+
+## Performance Reality
+
+**Current performance:** **2-rank DDP** is usually **slower** than training on **one** MPS device at the **same global batch** — communication and sync eat time. On **larger networks** (e.g. the conv + attention example in `examples/ddp_dummy_train.py`), a fair baseline vs DDP comparison often shows on the order of **~2.5–3× lower DDP throughput** (e.g. ~96M params, global batch 8: ~60 vs ~23 samples/s in one run — use `examples/benchmark_throughput.py` to reproduce). With **tiny** models, the gap can be **much larger** because compute is cheap and the network stack dominates. This is still not a net speedup versus one fast GPU for most workloads today.
+
+**Future potential:** Performance could be significantly improved with additional work on RDMA over Thunderbolt 5, better collective routing algorithms from PyTorch, or other transport optimizations.
 
 ## Supported collectives
 

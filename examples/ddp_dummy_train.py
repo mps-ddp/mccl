@@ -329,13 +329,30 @@ def main() -> None:
 
         if verbose and rank == 0 and step < 3:
             print(f"    step {step}: forward pass...", flush=True)
-        logits = ddp(x)
-        loss = loss_fn(logits, y)
 
+        # Use no_sync() so DDP does NOT fire allreduce hooks inside backward().
+        # DDP's hooks call our MCCL allreduce, which calls torch::mps::synchronize().
+        # On MPS, PyTorch may have an open command encoder while backward is running;
+        # calling synchronize() on that encoder triggers a Metal assertion crash.
+        # By deferring allreduce until after backward() returns (encoder is closed),
+        # we guarantee synchronize() is called at a safe point.
+        with ddp.no_sync():
+            logits = ddp(x)
+            loss = loss_fn(logits, y)
+
+            if verbose and rank == 0 and step < 3:
+                print(f"    step {step}: backward pass...", flush=True)
+
+            loss.backward()
+
+        # backward() has returned — MPS encoder is committed and closed.
+        # Safe to allreduce: torch::mps::synchronize() inside MCCL won't conflict.
         if verbose and rank == 0 and step < 3:
-            print(f"    step {step}: backward pass...", flush=True)
-
-        loss.backward()
+            print(f"    step {step}: allreduce...", flush=True)
+        for param in model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                param.grad.div_(world_size)
 
         if verbose and rank == 0 and step < 3:
             print(f"    step {step}: optimizer step...", flush=True)

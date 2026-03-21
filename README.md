@@ -27,7 +27,7 @@ dist.init_process_group(backend="mccl", rank=rank, world_size=world_size)
 **Demo:** See distributed training in action over Thunderbolt:
 
 <video width="800" controls>
-  <source src="mccl-demo.mp4" type="video/mp4">
+  <source src="https://raw.githubusercontent.com/mps-ddp/mccl/master/mccl-demo.mp4" type="video/mp4">
   Your browser does not support the video tag.
 </video>
 

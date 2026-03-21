@@ -311,6 +311,12 @@ def main() -> None:
             flush=True,
         )
 
+    # Pre-allocate a flat gradient buffer on MPS. torch.zeros on MPS uses shared
+    # storage (cpu_accessible=1), so allreduce hits the fast overlapped path with
+    # zero Metal blits. This avoids at::cat creating private-storage tensors.
+    grad_numel = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    flat_grad_buf = torch.zeros(grad_numel, dtype=torch.float32, device=device)
+
     # Warmup to get stable timing
     warmup_steps = 5
     import time
@@ -349,22 +355,27 @@ def main() -> None:
             loss.backward()
 
         # backward() has returned — MPS encoder is committed and closed.
-        # Safe to allreduce: torch::mps::synchronize() inside MCCL won't conflict.
-        #
-        # Flatten all gradients into one contiguous buffer and allreduce in a single
-        # collective op. This avoids one TCP round-trip per parameter tensor, which
-        # at 30ms+ latency per op would dominate step time for large models.
+        # Single flat allreduce using a pre-allocated MPS buffer that lives
+        # in shared storage (cpu_accessible=1), avoiding the at::cat problem
+        # where the output gets private Metal storage and forces slow blits.
         if verbose and rank == 0 and step < 3:
             print(f"    step {step}: allreduce (flat)...", flush=True)
         grads = [p.grad for p in model.parameters() if p.grad is not None]
         if grads:
-            flat = torch._utils._flatten_dense_tensors(grads)
-            dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-            flat.div_(world_size)
-            for grad, updated in zip(
-                grads, torch._utils._unflatten_dense_tensors(flat, grads)
-            ):
-                grad.copy_(updated)
+            # Pack grads into persistent flat buffer
+            offset = 0
+            for g in grads:
+                flat_grad_buf[offset:offset + g.numel()] = g.flatten()
+                offset += g.numel()
+
+            dist.all_reduce(flat_grad_buf, op=dist.ReduceOp.SUM)
+            flat_grad_buf.div_(world_size)
+
+            # Scatter back
+            offset = 0
+            for g in grads:
+                g.copy_(flat_grad_buf[offset:offset + g.numel()].view_as(g))
+                offset += g.numel()
 
         if verbose and rank == 0 and step < 3:
             print(f"    step {step}: optimizer step...", flush=True)

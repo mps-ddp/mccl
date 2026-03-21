@@ -490,17 +490,14 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
     int rank = getRank();
     int peer = 1 - rank;
     bool cpu_ok = tensor_cpu_accessible(tensor);
-    bool use_cpu = (tensor.scalar_type() == at::kFloat) && cpu_ok;
+    size_t nbytes = tensor_nbytes(tensor);
+    int64_t count = tensor.numel();
+    bool use_fast = (tensor.scalar_type() == at::kFloat) && !compressor_;
 
-    MCCL_INFO("allreduce_two_rank: dtype=%s cpu_accessible=%d use_cpu=%d nbytes=%zu compressor=%d",
-              at::toString(tensor.scalar_type()), (int)cpu_ok, (int)use_cpu,
-              tensor_nbytes(tensor), compressor_ ? 1 : 0);
-
-    if (use_cpu && !compressor_) {
-        MPSBufferView view = extract_mps_buffer(tensor);
+    if (use_fast) {
+        // Fast path for fp32: stage → overlapped send/recv → CPU reduce.
+        // Works for both cpu_accessible and non-cpu_accessible tensors.
         StagingBuffer staged = stage_for_send_nosync(tensor);
-        size_t nbytes = view.nbytes;
-        int64_t count = tensor.numel();
 
         PooledBuffer recv_buf(staging_memory_pool(), nbytes);
 
@@ -511,14 +508,26 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
             "allreduce_two_rank send_recv_overlap failed");
         auto net_t1 = std::chrono::steady_clock::now();
 
-        float* dst = static_cast<float*>(view.cpu_ptr);
-        const float* src = static_cast<const float*>(recv_buf.data());
-
         auto red_t0 = std::chrono::steady_clock::now();
-        if (op == c10d::ReduceOp::AVG) {
-            cpu_accumulate_and_scale(dst, src, count, 0.5f);
+        if (cpu_ok) {
+            MPSBufferView view = extract_mps_buffer(tensor);
+            float* dst = static_cast<float*>(view.cpu_ptr);
+            const float* src = static_cast<const float*>(recv_buf.data());
+            if (op == c10d::ReduceOp::AVG) {
+                cpu_accumulate_and_scale(dst, src, count, 0.5f);
+            } else {
+                cpu_reduce_op(dst, src, count, op);
+            }
         } else {
-            cpu_reduce_op(dst, src, count, op);
+            // Non-shared storage: reduce into staging, then unstage back
+            float* dst = static_cast<float*>(staged.data);
+            const float* src = static_cast<const float*>(recv_buf.data());
+            if (op == c10d::ReduceOp::AVG) {
+                cpu_accumulate_and_scale(dst, src, count, 0.5f);
+            } else {
+                cpu_reduce_op(dst, src, count, op);
+            }
+            unstage_from_recv(tensor, staged.data, nbytes);
         }
         auto red_t1 = std::chrono::steady_clock::now();
 
@@ -527,14 +536,14 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
         double net_ms = std::chrono::duration<double, std::milli>(net_t1 - net_t0).count();
         double red_ms = std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
         double gbps = (nbytes * 2.0 * 8.0) / (net_ms / 1000.0) / 1e9;
-        MCCL_INFO("allreduce_two_rank: %zu bytes, net=%.1fms (%.2f Gbps), reduce=%.1fms",
-                  nbytes, net_ms, gbps, red_ms);
+        MCCL_INFO("allreduce_two_rank: %zu bytes, net=%.1fms (%.2f Gbps), reduce=%.1fms cpu_ok=%d",
+                  nbytes, net_ms, gbps, red_ms, (int)cpu_ok);
         metrics_->record_phase(seq, 0, net_ms, red_ms);
 
         metrics_->record_transport_bytes(nbytes, true);
         metrics_->record_transport_bytes(nbytes, false);
     } else {
-        // f16 or compressed path: existing Metal pipeline
+        // f16/bf16 or compressed path: Metal pipeline
         at::Tensor recv_tensor = torch::empty_like(tensor);
 
         if (rank == 0) {

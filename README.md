@@ -20,13 +20,17 @@ pip install -e .
 import torch.distributed as dist
 import mccl
 
+
+
+
+
 dist.init_process_group(backend="mccl", rank=rank, world_size=world_size)
 # Use standard DDP on MPS tensors
 ```
 
 **Demo:** See distributed training in action over Thunderbolt:
-
-<!-- Drag and drop your mccl-demo.mp4 file into the GitHub README editor to get the assets URL -->
+[
+<!-- Drag and drop your mccl-demo.mp4 file into the GitHub README editor to get the assets URL -->](https://github.com/user-attachments/assets/a20c0581-612f-4381-8e91-bb5b4e376caa)
 
 **Tested:** M1 Max + M4 Max MacBook Pro, Thunderbolt 3, macOS 14–15, PyTorch 2.5+.
 

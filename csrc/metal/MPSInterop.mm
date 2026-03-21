@@ -34,7 +34,7 @@ id<MTLCommandQueue> cached_queue() {
 }
 
 // Staging buffer — reused across calls to avoid repeated allocation.
-// Thread-safety: only called from the progress engine's single thread.
+// Thread-safety: one collective at a time per process (run_sync caller thread).
 struct StagingPool {
     void* ptr = nullptr;
     size_t capacity = 0;
@@ -176,7 +176,7 @@ void mps_event_sync() {
     if (!force_stream_sync && event_sync_available()) {
         uint64_t val = next_event_value();
         commit_mps_and_signal(val);
-        wait_for_mps(val);
+        // Same thread: commit_mps_and_signal already synchronized and set signaledValue.
     } else {
         mps_stream_sync();
     }

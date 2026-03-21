@@ -114,8 +114,7 @@ void commit_mps_and_signal(uint64_t value) {
     // MPS Event API or use a two-stage event handoff if PyTorch exposes hooks.
     torch::mps::synchronize();
     
-    // Signal that MPS work is complete so wait_for_mps() can proceed.
-    // This is just a CPU-side update since we already synchronized.
+    // CPU-side bump for bookkeeping (same-thread wait_for_mps is a no-op).
     s.mps_event.signaledValue = value;
 }
 

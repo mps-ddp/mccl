@@ -19,12 +19,9 @@ struct EngineOp {
     std::function<void(std::exception_ptr)> on_error;
 };
 
-/// Bounded single-thread progress engine.
-///
-/// All collective transport + kernel work runs on this thread,
-/// ensuring ordered execution and preventing per-op thread spawns.
-/// DDP submits ops and gets back a future; the engine drains them
-/// in sequence-number order.
+/// Bounded single-thread progress engine (used for ops that do not need the
+/// PyTorch MPS thread, e.g. barrier). Tensor collectives use ``run_sync`` so
+/// ``torch::mps::synchronize`` runs on the caller thread.
 class ProgressEngine {
 public:
     explicit ProgressEngine(size_t max_queue_depth = 1024);

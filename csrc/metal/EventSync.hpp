@@ -5,19 +5,16 @@
 
 namespace mccl {
 
-/// Lightweight GPU/CPU synchronization built on MTLSharedEvent.
+/// MPS / MCCL coordination helpers (MTLSharedEvent counters + bookkeeping).
 ///
-/// Provides fine-grained dependency tracking between PyTorch's MPS command
-/// queue and MCCL's own command queue, replacing the heavyweight
-/// mps_stream_sync() (which drains the entire MPS pipeline).
+/// PyTorch does not expose a safe way to encode completion on MPS command
+/// buffers from outside the framework, so ``commit_mps_and_signal`` uses
+/// ``torch::mps::synchronize()`` and then bumps ``signaledValue`` on the CPU.
+/// That matches the actual ordering guarantee (full stream drain), not a
+/// non-blocking GPU signal.
 ///
-/// Typical flow for an allreduce:
-///   1. commit_mps_and_signal(seq)  -- flush MPS work, signal when done
-///   2. wait_for_mps(seq)           -- CPU blocks until gradients are ready
-///   3. ... do allreduce (vDSP + network) ...
-///   4. signal_mccl_done(seq)       -- mark reduced gradients as written
-///   5. (next iteration) PyTorch reads gradients -- no sync needed for CPU
-///      path because unified memory writes are immediately visible.
+/// ``signal_mccl_done`` / ``wait_for_mccl`` exist for future shader paths;
+/// collectives today still rely on op completion before returning.
 
 /// Initialize the shared event infrastructure. Called once from
 /// metal_kernels_init() or ProcessGroupMCCL constructor.
@@ -27,17 +24,12 @@ void event_sync_init();
 /// valid MTLDevice).
 bool event_sync_available();
 
-/// Flush PyTorch's MPS command stream and encode a signal with the given
-/// value on the committed command buffer. The signal fires when all
-/// previously-enqueued MPS GPU work completes.
-///
-/// This is non-blocking from the CPU's perspective -- it submits work to
-/// the GPU and returns immediately.
+/// Drain PyTorch's MPS stream (``torch::mps::synchronize``), then set
+/// ``mps_event.signaledValue`` to ``value`` for bookkeeping / future use.
 void commit_mps_and_signal(uint64_t value);
 
-/// Block the calling CPU thread until the shared event reaches >= value.
-/// Uses polling on event.signaledValue with exponential back-off for low
-/// latency without burning a core.
+/// Poll until ``mps_event.signaledValue >= value`` (used when another
+/// producer signals the same event; same-thread use after commit is redundant).
 void wait_for_mps(uint64_t value);
 
 /// Signal from MCCL's side that the reduced gradients have been written.
@@ -45,8 +37,7 @@ void wait_for_mps(uint64_t value);
 /// coherent).
 void signal_mccl_done(uint64_t value);
 
-/// GPU-side signal variant: encodes a signal on MCCL's Metal command
-/// queue so the GPU signals completion after shader-based reductions.
+/// GPU-side signal on MCCL's queue (reserved for shader-heavy paths; unused today).
 void signal_mccl_done_gpu(uint64_t value);
 
 /// Block until MCCL's signal reaches >= value.  Used by the non-f32 path

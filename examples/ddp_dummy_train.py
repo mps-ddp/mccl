@@ -89,38 +89,20 @@ def single_gpu_baseline() -> None:
     device = torch.device("mps")
     torch.manual_seed(42)
     
-    # Same large model as DDP version
-    class LargeMLPTransformer(nn.Module):
-        def __init__(self, input_dim=512, hidden_dim=2048, num_layers=8, num_classes=1000):
-            super().__init__()
-            self.input_proj = nn.Linear(input_dim, hidden_dim)
-            
-            self.layers = nn.ModuleList([
-                nn.Sequential(
-                    nn.LayerNorm(hidden_dim),
-                    nn.Linear(hidden_dim, hidden_dim * 4),
-                    nn.GELU(),
-                    nn.Dropout(0.1),
-                    nn.Linear(hidden_dim * 4, hidden_dim),
-                    nn.Dropout(0.1),
-                ) for _ in range(num_layers)
-            ])
-            
-            self.final_norm = nn.LayerNorm(hidden_dim)
-            self.classifier = nn.Linear(hidden_dim, num_classes)
-            
-        def forward(self, x):
-            x = self.input_proj(x)  # [batch, input_dim] -> [batch, hidden_dim]
-            for layer in self.layers:
-                x = x + layer(x)  # Residual connection
-            x = self.final_norm(x)  # [batch, hidden_dim]
-            return self.classifier(x)  # Direct classification
-
-    model = LargeMLPTransformer(
-        input_dim=256, 
-        hidden_dim=512, 
-        num_layers=4,
-        num_classes=10
+    # Same medium model as DDP version
+    model = nn.Sequential(
+        nn.Linear(256, 1024),
+        nn.ReLU(),
+        nn.Dropout(0.1),
+        nn.Linear(1024, 1024),
+        nn.ReLU(),
+        nn.Dropout(0.1),
+        nn.Linear(1024, 512),
+        nn.ReLU(),
+        nn.Dropout(0.1),
+        nn.Linear(512, 256),
+        nn.ReLU(),
+        nn.Linear(256, 10),
     ).to(device)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.01)
@@ -229,39 +211,20 @@ def main() -> None:
 
     torch.manual_seed(42 + rank)
 
-    # Large transformer-style model that benefits from DDP
-    class LargeMLPTransformer(nn.Module):
-        def __init__(self, input_dim=512, hidden_dim=2048, num_layers=8, num_classes=1000):
-            super().__init__()
-            self.input_proj = nn.Linear(input_dim, hidden_dim)
-            
-            # Stack of large MLP blocks (transformer-style)
-            self.layers = nn.ModuleList([
-                nn.Sequential(
-                    nn.LayerNorm(hidden_dim),
-                    nn.Linear(hidden_dim, hidden_dim * 4),  # FFN expansion
-                    nn.GELU(),
-                    nn.Dropout(0.1),
-                    nn.Linear(hidden_dim * 4, hidden_dim),  # FFN contraction
-                    nn.Dropout(0.1),
-                ) for _ in range(num_layers)
-            ])
-            
-            self.final_norm = nn.LayerNorm(hidden_dim)
-            self.classifier = nn.Linear(hidden_dim, num_classes)
-            
-        def forward(self, x):
-            x = self.input_proj(x)  # [batch, input_dim] -> [batch, hidden_dim]
-            for layer in self.layers:
-                x = x + layer(x)  # Residual connection
-            x = self.final_norm(x)  # [batch, hidden_dim]
-            return self.classifier(x)  # Direct classification
-
-    model = LargeMLPTransformer(
-        input_dim=256,    # Much smaller input
-        hidden_dim=512,   # Reasonable hidden dim
-        num_layers=4,     # Fewer layers  
-        num_classes=10    # Back to 10 classes
+    # Medium-sized model that benefits from DDP without crashing Metal
+    model = nn.Sequential(
+        nn.Linear(256, 1024),
+        nn.ReLU(),
+        nn.Dropout(0.1),
+        nn.Linear(1024, 1024),
+        nn.ReLU(),
+        nn.Dropout(0.1),
+        nn.Linear(1024, 512),
+        nn.ReLU(),
+        nn.Dropout(0.1),
+        nn.Linear(512, 256),
+        nn.ReLU(),
+        nn.Linear(256, 10),
     ).to(device)
     ddp = DDP(model)
 

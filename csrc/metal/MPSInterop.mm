@@ -87,6 +87,17 @@ StagingPool& staging_pool() {
 
 /// Blit from GPU buffer into CPU staging, handling buffers larger than maxBufferLength
 /// by chunking into multiple blit commands with temporary MTLBuffer wrappers.
+void check_command_buffer(id<MTLCommandBuffer> cmd, const char* context) {
+    if (cmd.status == MTLCommandBufferStatusError) {
+        NSError* err = cmd.error;
+        MCCL_ERROR("%s: Metal command buffer error: %s (code %ld)",
+                   context,
+                   err ? [[err localizedDescription] UTF8String] : "unknown",
+                   err ? (long)err.code : -1);
+        MCCL_CHECK(false, std::string(context) + ": Metal command buffer failed");
+    }
+}
+
 void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
                               void* dst, size_t nbytes) {
     StagingPool& pool = staging_pool();
@@ -100,6 +111,7 @@ void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
             [blit endEncoding];
             [cmd commit];
             [cmd waitUntilCompleted];
+            check_command_buffer(cmd, "chunked_blit_to_staging(fast)");
         }
         return;
     }
@@ -107,6 +119,9 @@ void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
     size_t max_chunk = metal_max_buffer_len();
     size_t offset = 0;
     uint8_t* dst_bytes = static_cast<uint8_t*>(dst);
+
+    MCCL_INFO("chunked_blit_to_staging: %zu bytes in chunks of %zu (maxBuf=%zu)",
+              nbytes, max_chunk, max_chunk);
 
     while (offset < nbytes) {
         size_t chunk = std::min(max_chunk, nbytes - offset);
@@ -118,7 +133,9 @@ void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
                 length:aligned_chunk
                 options:MTLResourceStorageModeShared
                 deallocator:nil];
-            MCCL_CHECK(chunk_mtl != nil, "chunked_blit_to_staging: MTLBuffer wrap failed");
+            MCCL_CHECK(chunk_mtl != nil,
+                       "chunked_blit_to_staging: MTLBuffer wrap failed at offset " +
+                       std::to_string(offset) + " chunk=" + std::to_string(aligned_chunk));
 
             id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
             id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
@@ -128,6 +145,7 @@ void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
             [blit endEncoding];
             [cmd commit];
             [cmd waitUntilCompleted];
+            check_command_buffer(cmd, "chunked_blit_to_staging(chunk)");
         }
         offset += chunk;
     }
@@ -147,6 +165,7 @@ void chunked_blit_from_staging(const void* src, size_t nbytes,
             [blit endEncoding];
             [cmd commit];
             [cmd waitUntilCompleted];
+            check_command_buffer(cmd, "chunked_blit_from_staging(fast)");
         }
         return;
     }
@@ -165,7 +184,9 @@ void chunked_blit_from_staging(const void* src, size_t nbytes,
                 length:aligned_chunk
                 options:MTLResourceStorageModeShared
                 deallocator:nil];
-            MCCL_CHECK(chunk_mtl != nil, "chunked_blit_from_staging: MTLBuffer wrap failed");
+            MCCL_CHECK(chunk_mtl != nil,
+                       "chunked_blit_from_staging: MTLBuffer wrap failed at offset " +
+                       std::to_string(offset));
 
             id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
             id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
@@ -175,6 +196,7 @@ void chunked_blit_from_staging(const void* src, size_t nbytes,
             [blit endEncoding];
             [cmd commit];
             [cmd waitUntilCompleted];
+            check_command_buffer(cmd, "chunked_blit_from_staging(chunk)");
         }
         offset += chunk;
     }

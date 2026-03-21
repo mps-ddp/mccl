@@ -41,19 +41,25 @@ MemoryPool::Buffer MemoryPool::acquire(size_t nbytes) {
         return buf;
     }
 
-    // Over-allocate by 25% to reduce future misses
-    size_t alloc_size = nbytes + (nbytes >> 2);
+    // Over-allocate small buffers by 25%; skip for large (>256MB) to avoid waste
+    size_t alloc_size = nbytes;
+    if (nbytes <= (256ULL << 20)) {
+        alloc_size = nbytes + (nbytes >> 2);
+    }
     alloc_size = align_up(alloc_size, alignment_);
 
     void* ptr = nullptr;
-    if (posix_memalign(&ptr, alignment_, alloc_size) != 0 || !ptr) {
+    int rc = posix_memalign(&ptr, alignment_, alloc_size);
+    if (rc != 0 || !ptr) {
+        MCCL_ERROR("MemoryPool: posix_memalign failed: rc=%d alloc_size=%zu errno=%d (%s)",
+                   rc, alloc_size, errno, strerror(errno));
         throw MCCLError("MemoryPool: allocation failed for " +
                         std::to_string(alloc_size) + " bytes");
     }
 
     total_allocated_ += alloc_size;
-    MCCL_DEBUG("MemoryPool: allocated %zu bytes (total=%zu)",
-               alloc_size, total_allocated_);
+    MCCL_INFO("MemoryPool: allocated %zu bytes (requested %zu, total=%zu)",
+              alloc_size, nbytes, total_allocated_);
 
     return Buffer{ptr, alloc_size, nbytes};
 }

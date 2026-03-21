@@ -266,11 +266,17 @@ void Connection::set_blocking() {
 }
 
 ssize_t Connection::try_send(const void* data, size_t len) {
-    if (!alive_ || fd_ < 0) return -1;
+    if (!alive_ || fd_ < 0) {
+        MCCL_ERROR("try_send: connection dead (alive=%d fd=%d peer=%d)",
+                   (int)alive_.load(), fd_, peer_rank_);
+        return -1;
+    }
     ssize_t n = ::send(fd_, data, len, MSG_DONTWAIT);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
         if (errno == EINTR) return 0;
+        MCCL_ERROR("try_send: errno=%d (%s) fd=%d peer=%d len=%zu",
+                   errno, strerror(errno), fd_, peer_rank_, len);
         alive_ = false;
         return -1;
     }
@@ -278,15 +284,22 @@ ssize_t Connection::try_send(const void* data, size_t len) {
 }
 
 ssize_t Connection::try_recv(void* data, size_t len) {
-    if (!alive_ || fd_ < 0) return -1;
+    if (!alive_ || fd_ < 0) {
+        MCCL_ERROR("try_recv: connection dead (alive=%d fd=%d peer=%d)",
+                   (int)alive_.load(), fd_, peer_rank_);
+        return -1;
+    }
     ssize_t n = ::recv(fd_, data, len, MSG_DONTWAIT);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
         if (errno == EINTR) return 0;
+        MCCL_ERROR("try_recv: errno=%d (%s) fd=%d peer=%d len=%zu",
+                   errno, strerror(errno), fd_, peer_rank_, len);
         alive_ = false;
         return -1;
     }
     if (n == 0) {
+        MCCL_ERROR("try_recv: peer closed connection (fd=%d peer=%d)", fd_, peer_rank_);
         alive_ = false;
         return -1;
     }

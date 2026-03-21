@@ -582,6 +582,29 @@ bool TcpTransport::send_recv_overlap(
                            send_data, send_nbytes);
     }
 
+    // For very large payloads (>1GB), fall back to threaded blocking send+recv.
+    // The non-blocking poll loop can hit kernel buffer limits or timing issues
+    // with multi-GB transfers on macOS. The blocking path is proven reliable
+    // (DDP broadcasts use it successfully for the same payload sizes).
+    // We use a background thread for send so both directions proceed concurrently.
+    constexpr size_t OVERLAP_THRESHOLD = 1ULL << 30; // 1 GB
+    if (send_nbytes > OVERLAP_THRESHOLD || recv_nbytes > OVERLAP_THRESHOLD) {
+        MCCL_INFO("send_recv_overlap: payload %zu/%zu exceeds 1GB, using threaded blocking fallback",
+                  send_nbytes, recv_nbytes);
+
+        std::atomic<bool> send_ok{false};
+        std::thread send_thread([&]() {
+            send_ok = send_chunks(send_peer, send_op, send_seq, send_tid,
+                                  send_data, send_nbytes);
+        });
+
+        bool recv_ok = recv_chunks(recv_peer, recv_op, recv_seq, recv_tid,
+                                   recv_data, recv_nbytes);
+        send_thread.join();
+
+        return send_ok.load() && recv_ok;
+    }
+
     // Lock both directions. When send_peer == recv_peer, these are
     // still different mutexes (send_mu vs recv_mu).
     std::lock_guard<std::mutex> send_lock(send_mu_for(send_peer));

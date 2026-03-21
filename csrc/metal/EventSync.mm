@@ -101,21 +101,23 @@ void commit_mps_and_signal(uint64_t value) {
     EventState& s = state();
     MCCL_CHECK(s.initialized, "EventSync not initialized");
 
-    // Synchronize PyTorch's MPS stream to ensure all backward kernels complete.
-    // This is the only safe way to know MPS work is done without interfering
-    // with PyTorch's internal command buffer lifecycle.
+    // Encode a signal on PyTorch's active MPS command buffer then commit it.
+    // dispatch_sync on PyTorch's serial queue guarantees our encoding happens
+    // AFTER all backward/forward work dispatched so far.  commit() submits the
+    // buffer; the MTLSharedEvent fires when the GPU finishes that buffer.
     //
-    // The original event-based design tried to avoid this synchronize by
-    // encoding a signal on PyTorch's command buffer, but that requires either:
-    // (a) committing PyTorch's buffer ourselves (breaks PyTorch's lifecycle), or
-    // (b) leaving the signal uncommitted (never fires).
-    //
-    // For now, we use the heavyweight sync. Future optimization: wire PyTorch's
-    // MPS Event API or use a two-stage event handoff if PyTorch exposes hooks.
-    torch::mps::synchronize();
-    
-    // CPU-side bump for bookkeeping (same-thread wait_for_mps is a no-op).
-    s.mps_event.signaledValue = value;
+    // This replaces the old torch::mps::synchronize() full-stream-drain and is
+    // safe to call mid-backward: dispatch_sync serializes with PyTorch's own
+    // encoding, and commit() just submits -- PyTorch lazily creates a new
+    // command buffer for subsequent ops.
+    dispatch_sync(
+        (dispatch_queue_t)torch::mps::get_dispatch_queue(), ^{
+            id<MTLCommandBuffer> cmd =
+                (id<MTLCommandBuffer>)torch::mps::get_command_buffer();
+            [cmd encodeSignalEvent:s.mps_event value:value];
+            torch::mps::commit();
+        });
+    // Non-blocking: caller waits via wait_for_mps() when it needs the data.
 }
 
 void wait_for_mps(uint64_t value) {

@@ -33,8 +33,11 @@ void mps_stream_sync();
 void mccl_queue_drain();
 
 /// Event-based MPS sync for compute-communication overlap.
-/// Flushes and waits for MPS work, then signals the event so MCCL's
-/// allreduce can proceed while the GPU starts the next forward pass.
+/// Non-blocking: encode signal + commit on PyTorch's MPS command buffer.
+/// Returns the event value to wait on (0 if fell back to blocking sync).
+uint64_t mps_event_sync_nonblocking();
+
+/// Blocking version: encode signal + commit, then wait for GPU completion.
 /// Falls back to plain mps_stream_sync() if event sync is unavailable.
 void mps_event_sync();
 

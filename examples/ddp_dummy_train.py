@@ -255,8 +255,10 @@ def main() -> None:
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
-    # Try to avoid Metal command buffer issues during gradient sync
-    os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+    # MPS memory caching: let PyTorch's allocator cache GPU memory.
+    # The old HIGH_WATERMARK_RATIO=0.0 disabled caching and crippled performance.
+    # Event-based sync (Phase 1) makes allreduce safe during backward, so the
+    # workaround is no longer needed.
 
     if world_size < 2:
         print(
@@ -289,7 +291,8 @@ def main() -> None:
     print(f"[ddp_dummy_train] rank {rank}: allocating model on {device}...", flush=True)
     model = build_dummy_classifier().to(device)
     print(f"[ddp_dummy_train] rank {rank}: wrapping DDP (syncs with other ranks)...", flush=True)
-    ddp = DDP(model, find_unused_parameters=False)
+    bucket_mb = int(os.environ.get("DDP_BUCKET_MB", "25"))
+    ddp = DDP(model, find_unused_parameters=False, bucket_cap_mb=bucket_mb)
     print(f"[ddp_dummy_train] rank {rank}: DDP wrapper ready", flush=True)
 
     optimizer = torch.optim.AdamW(ddp.parameters(), lr=0.0001, weight_decay=0.01)
@@ -308,7 +311,7 @@ def main() -> None:
             f"DDP training | world_size={world_size} device={device}\n"
             f"  Model: {total_params:,} params ({trainable_params:,} trainable)\n"
             f"  Batch: {batch_size} per rank ({batch_size * world_size} global)\n"
-            f"  Steps: {steps}\n"
+            f"  Steps: {steps}  bucket_cap_mb={bucket_mb}\n"
             f"  INPUT_DIM={input_dim} NUM_CLASSES={num_classes}",
             flush=True,
         )
@@ -335,36 +338,17 @@ def main() -> None:
         if verbose and rank == 0 and step < 3:
             print(f"    step {step}: forward pass...", flush=True)
 
-        # Use no_sync() so DDP does NOT fire allreduce hooks inside backward().
-        # DDP's hooks call our MCCL allreduce, which calls torch::mps::synchronize().
-        # On MPS, PyTorch may have an open command encoder while backward is running;
-        # calling synchronize() on that encoder triggers a Metal assertion crash.
-        # By deferring allreduce until after backward() returns (encoder is closed),
-        # we guarantee synchronize() is called at a safe point.
-        with ddp.no_sync():
-            logits = ddp(x)
-            loss = loss_fn(logits, y)
+        # DDP hooks fire bucketed allreduce DURING backward -- each ~25MB
+        # bucket is communicated while the next bucket's gradients are still
+        # being computed.  Event-based sync (Phase 1) makes this safe on MPS:
+        # we encode a signal + commit instead of draining the full MPS stream.
+        logits = ddp(x)
+        loss = loss_fn(logits, y)
 
-            if verbose and rank == 0 and step < 3:
-                print(f"    step {step}: backward pass...", flush=True)
-
-            loss.backward()
-
-        # backward() has returned — MPS encoder is committed and closed.
-        # Flatten all grads into one tensor for a single allreduce. The C++
-        # layer (ensure_shared_storage) handles private→shared promotion if
-        # at::cat produces a non-cpu_accessible buffer.
         if verbose and rank == 0 and step < 3:
-            print(f"    step {step}: allreduce (flat)...", flush=True)
-        grads = [p.grad for p in model.parameters() if p.grad is not None]
-        if grads:
-            flat = torch._utils._flatten_dense_tensors(grads)
-            dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-            flat.div_(world_size)
-            for grad, updated in zip(
-                grads, torch._utils._unflatten_dense_tensors(flat, grads)
-            ):
-                grad.copy_(updated)
+            print(f"    step {step}: backward pass (with bucketed allreduce)...", flush=True)
+
+        loss.backward()
 
         if verbose and rank == 0 and step < 3:
             print(f"    step {step}: optimizer step...", flush=True)

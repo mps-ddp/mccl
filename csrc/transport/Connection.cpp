@@ -50,11 +50,15 @@ void Connection::configure_socket() {
     setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 
-    // Socket buffer sizing: let the kernel auto-tune by default but allow
-    // explicit override via MCCL_SOCK_BUFSIZE for high-bandwidth links
-    // (e.g. Thunderbolt 5) where the default ramp-up is too slow.
-    if (auto* v = std::getenv("MCCL_SOCK_BUFSIZE")) {
-        int bufsize = std::atoi(v);
+    // Default to 16MB socket buffers for high-bandwidth links (Thunderbolt,
+    // 10GbE+).  macOS default (~128KB) is too small and causes TCP ramp-up
+    // delays on multi-GB transfers.  Override with MCCL_SOCK_BUFSIZE=0 to
+    // let the kernel auto-tune, or set a specific size in bytes.
+    {
+        int bufsize = 16 * 1024 * 1024;
+        if (auto* v = std::getenv("MCCL_SOCK_BUFSIZE")) {
+            bufsize = std::atoi(v);
+        }
         if (bufsize > 0) {
             setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
             setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));

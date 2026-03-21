@@ -582,14 +582,12 @@ bool TcpTransport::send_recv_overlap(
                            send_data, send_nbytes);
     }
 
-    // For very large payloads (>1GB), fall back to threaded blocking send+recv.
-    // The non-blocking poll loop can hit kernel buffer limits or timing issues
-    // with multi-GB transfers on macOS. The blocking path is proven reliable
-    // (DDP broadcasts use it successfully for the same payload sizes).
-    // We use a background thread for send so both directions proceed concurrently.
-    constexpr size_t OVERLAP_THRESHOLD = 1ULL << 30; // 1 GB
+    // For very large payloads, fall back to threaded blocking send+recv.
+    // The poll loop can handle multi-GB transfers on macOS but above 8GB we
+    // switch to the proven blocking path with a background send thread.
+    constexpr size_t OVERLAP_THRESHOLD = 1ULL << 33; // 8 GB
     if (send_nbytes > OVERLAP_THRESHOLD || recv_nbytes > OVERLAP_THRESHOLD) {
-        MCCL_INFO("send_recv_overlap: payload %zu/%zu exceeds 1GB, using threaded blocking fallback",
+        MCCL_INFO("send_recv_overlap: payload %zu/%zu exceeds 8GB, using threaded blocking fallback",
                   send_nbytes, recv_nbytes);
 
         std::atomic<bool> send_ok{false};

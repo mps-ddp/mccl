@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <thread>
 
 namespace mccl {
 
@@ -26,25 +27,38 @@ SyncMode global_sync_mode() {
         auto* v = std::getenv("MCCL_SYNC_MODE");
         if (v) {
             std::string s(v);
+            if (s == "full") return SyncMode::FULL;
             if (s == "coalesced" || s == "fast") return SyncMode::COALESCED;
         }
-        return SyncMode::FULL;
+        // Default to coalesced: with event-based sync, one signal+commit per
+        // batch of ops is sufficient.  Set MCCL_SYNC_MODE=full to override.
+        return SyncMode::COALESCED;
     }();
     return mode;
 }
 
 thread_local bool tl_sync_done = false;
 
-inline void sync_mps_for_collective(bool overlap) {
+// Non-blocking: encode signal + commit, return event value (0 = already synced).
+// The engine thread must call wait_for_mps(val) before reading tensor data.
+inline uint64_t sync_mps_nonblocking(bool overlap) {
     if (global_sync_mode() == SyncMode::COALESCED && tl_sync_done) {
-        return;
+        return 0;
     }
+    uint64_t val = 0;
     if (overlap) {
-        mps_event_sync();
+        val = mps_event_sync_nonblocking();
     } else {
         mps_stream_sync();
     }
     tl_sync_done = true;
+    return val;
+}
+
+// Blocking: for callers that don't defer the wait to an engine thread.
+inline void sync_mps_for_collective(bool overlap) {
+    uint64_t val = sync_mps_nonblocking(overlap);
+    if (val > 0) wait_for_mps(val);
 }
 
 inline void reset_sync_state() {
@@ -373,14 +387,15 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     metrics_->op_start(seq, "allreduce", nbytes);
 
     auto sync_t0 = std::chrono::steady_clock::now();
-    sync_mps_for_collective(overlap_comm_);
+    uint64_t sync_val = sync_mps_nonblocking(overlap_comm_);
 
     auto sync_t1 = std::chrono::steady_clock::now();
     double sync_ms = std::chrono::duration<double, std::milli>(sync_t1 - sync_t0).count();
     metrics_->record_phase(seq, sync_ms, 0, 0);
 
     engine_->submit(
-        [this, tensor_copy, seq, ws, nbytes, red_op]() mutable {
+        [this, tensor_copy, seq, ws, nbytes, red_op, sync_val]() mutable {
+            if (sync_val > 0) wait_for_mps(sync_val);
             const char* algo = "unknown";
             if (nbytes <= transport_->config().small_msg_threshold) {
                 algo = "small";
@@ -441,7 +456,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
     metrics_->op_start(seq, "allreduce_coalesced", nbytes);
 
     auto sync_t0 = std::chrono::steady_clock::now();
-    sync_mps_for_collective(overlap_comm_);
+    uint64_t sync_val = sync_mps_nonblocking(overlap_comm_);
     auto sync_t1 = std::chrono::steady_clock::now();
     metrics_->record_phase(seq, std::chrono::duration<double, std::milli>(sync_t1 - sync_t0).count(), 0, 0);
 
@@ -450,7 +465,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
     auto flat_copy = flat;
 
     engine_->submit(
-        [this, flat_copy, tensors_copy, seq, ws, nbytes, red_op]() mutable {
+        [this, flat_copy, tensors_copy, seq, ws, nbytes, red_op, sync_val]() mutable {
+            if (sync_val > 0) wait_for_mps(sync_val);
             if (ws == 2) {
                 allreduce_two_rank(flat_copy, seq, red_op);
             } else {
@@ -496,50 +512,133 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
     bool use_fast = (tensor.scalar_type() == at::kFloat) && !compressor_;
 
     if (use_fast) {
-        // Fast path for fp32: stage → overlapped send/recv → CPU reduce.
-        // Works for both cpu_accessible and non-cpu_accessible tensors.
         StagingBuffer staged = stage_for_send_nosync(tensor);
 
-        PooledBuffer recv_buf(staging_memory_pool(), nbytes);
+        constexpr size_t RS_AG_THRESHOLD = 8 * 1024 * 1024;  // 8 MB
+        constexpr size_t REDUCE_CHUNK = 2 * 1024 * 1024;   // 2 MB
 
-        auto net_t0 = std::chrono::steady_clock::now();
-        MCCL_CHECK(transport_->send_recv_overlap(
-            peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes,
-            peer, OpType::ALLREDUCE, seq, 0, recv_buf.data(), nbytes),
-            "allreduce_two_rank send_recv_overlap failed");
-        auto net_t1 = std::chrono::steady_clock::now();
-
-        auto red_t0 = std::chrono::steady_clock::now();
-        if (cpu_ok) {
+        if (nbytes >= RS_AG_THRESHOLD && cpu_ok) {
+            // Reduce-scatter + allgather: each rank reduces only its half, then
+            // they exchange the reduced halves.  Halves reduction work and
+            // overlaps recv with reduce using chunked pipelining.
             MPSBufferView view = extract_mps_buffer(tensor);
-            float* dst = static_cast<float*>(view.cpu_ptr);
-            const float* src = static_cast<const float*>(recv_buf.data());
-            if (op == c10d::ReduceOp::AVG) {
-                cpu_accumulate_and_scale(dst, src, count, 0.5f);
-            } else {
-                cpu_reduce_op(dst, src, count, op);
+            float* base = static_cast<float*>(view.cpu_ptr);
+
+            size_t half = nbytes / 2;
+            size_t my_off  = rank * half;
+            size_t peer_off = peer * half;
+            int64_t half_count = static_cast<int64_t>(half / sizeof(float));
+
+            size_t nchunks = (half + REDUCE_CHUNK - 1) / REDUCE_CHUNK;
+            PooledBuffer recv_buf(staging_memory_pool(), REDUCE_CHUNK);
+
+            auto net_t0 = std::chrono::steady_clock::now();
+            double red_ms_accum = 0;
+
+            // ── Phase 1: reduce-scatter ──
+            // Send peer's half, recv my half in chunks, reduce each chunk.
+            std::atomic<bool> send_ok{false};
+            std::thread send_thread([&]() {
+                bool ok = true;
+                for (size_t c = 0; c < nchunks && ok; ++c) {
+                    size_t off = c * REDUCE_CHUNK;
+                    size_t len = std::min(REDUCE_CHUNK, half - off);
+                    uint32_t tid = static_cast<uint32_t>(c + 1);
+                    ok = transport_->send_chunks(
+                        peer, OpType::ALLREDUCE, seq, tid,
+                        static_cast<const uint8_t*>(staged.data) + peer_off + off, len);
+                }
+                send_ok.store(ok, std::memory_order_release);
+            });
+
+            for (size_t c = 0; c < nchunks; ++c) {
+                size_t off = c * REDUCE_CHUNK;
+                size_t len = std::min(REDUCE_CHUNK, half - off);
+                int64_t chunk_count = static_cast<int64_t>(len / sizeof(float));
+                uint32_t tid = static_cast<uint32_t>(c + 1);
+
+                MCCL_CHECK(transport_->recv_chunks(
+                    peer, OpType::ALLREDUCE, seq, tid,
+                    recv_buf.data(), len),
+                    "allreduce_two_rank RS recv chunk failed");
+
+                auto rc0 = std::chrono::steady_clock::now();
+                float* chunk_dst = base + (my_off + off) / sizeof(float);
+                const float* chunk_src = static_cast<const float*>(recv_buf.data());
+                if (op == c10d::ReduceOp::AVG) {
+                    cpu_accumulate_and_scale(chunk_dst, chunk_src, chunk_count, 0.5f);
+                } else {
+                    cpu_reduce_op(chunk_dst, chunk_src, chunk_count, op);
+                }
+                auto rc1 = std::chrono::steady_clock::now();
+                red_ms_accum += std::chrono::duration<double, std::milli>(rc1 - rc0).count();
             }
+
+            send_thread.join();
+            MCCL_CHECK(send_ok.load(std::memory_order_acquire),
+                       "allreduce_two_rank RS send failed");
+
+            // ── Phase 2: allgather ──
+            // Exchange reduced halves so both ranks have the full result.
+            uint32_t ag_base_tid = static_cast<uint32_t>(nchunks + 1);
+            MCCL_CHECK(transport_->send_recv_overlap(
+                peer, OpType::ALLREDUCE, seq, ag_base_tid,
+                static_cast<const uint8_t*>(view.cpu_ptr) + my_off, half,
+                peer, OpType::ALLREDUCE, seq, ag_base_tid,
+                static_cast<uint8_t*>(view.cpu_ptr) + peer_off, half),
+                "allreduce_two_rank AG send_recv_overlap failed");
+
+            auto net_t1 = std::chrono::steady_clock::now();
+            if (overlap_comm_) signal_mccl_done(next_event_value());
+
+            double net_ms = std::chrono::duration<double, std::milli>(net_t1 - net_t0).count();
+            double gbps = (nbytes * 2.0 * 8.0) / (net_ms / 1000.0) / 1e9;
+            MCCL_INFO("allreduce_two_rank(RS+AG): %zu bytes (%zu RS chunks), "
+                      "wall=%.1fms (%.2f Gbps), reduce=%.1fms",
+                      nbytes, nchunks, net_ms, gbps, red_ms_accum);
+            metrics_->record_phase(seq, 0, net_ms, red_ms_accum);
         } else {
-            // Non-shared storage: reduce into staging, then unstage back
-            float* dst = static_cast<float*>(staged.data);
-            const float* src = static_cast<const float*>(recv_buf.data());
-            if (op == c10d::ReduceOp::AVG) {
-                cpu_accumulate_and_scale(dst, src, count, 0.5f);
+            // Original path: full send_recv_overlap then reduce.
+            PooledBuffer recv_buf(staging_memory_pool(), nbytes);
+
+            auto net_t0 = std::chrono::steady_clock::now();
+            MCCL_CHECK(transport_->send_recv_overlap(
+                peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes,
+                peer, OpType::ALLREDUCE, seq, 0, recv_buf.data(), nbytes),
+                "allreduce_two_rank send_recv_overlap failed");
+            auto net_t1 = std::chrono::steady_clock::now();
+
+            auto red_t0 = std::chrono::steady_clock::now();
+            if (cpu_ok) {
+                MPSBufferView view = extract_mps_buffer(tensor);
+                float* dst = static_cast<float*>(view.cpu_ptr);
+                const float* src = static_cast<const float*>(recv_buf.data());
+                if (op == c10d::ReduceOp::AVG) {
+                    cpu_accumulate_and_scale(dst, src, count, 0.5f);
+                } else {
+                    cpu_reduce_op(dst, src, count, op);
+                }
             } else {
-                cpu_reduce_op(dst, src, count, op);
+                float* dst = static_cast<float*>(staged.data);
+                const float* src = static_cast<const float*>(recv_buf.data());
+                if (op == c10d::ReduceOp::AVG) {
+                    cpu_accumulate_and_scale(dst, src, count, 0.5f);
+                } else {
+                    cpu_reduce_op(dst, src, count, op);
+                }
+                unstage_from_recv(tensor, staged.data, nbytes);
             }
-            unstage_from_recv(tensor, staged.data, nbytes);
+            auto red_t1 = std::chrono::steady_clock::now();
+
+            if (overlap_comm_) signal_mccl_done(next_event_value());
+
+            double net_ms = std::chrono::duration<double, std::milli>(net_t1 - net_t0).count();
+            double red_ms = std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
+            double gbps = (nbytes * 2.0 * 8.0) / (net_ms / 1000.0) / 1e9;
+            MCCL_INFO("allreduce_two_rank: %zu bytes, net=%.1fms (%.2f Gbps), reduce=%.1fms cpu_ok=%d",
+                      nbytes, net_ms, gbps, red_ms, (int)cpu_ok);
+            metrics_->record_phase(seq, 0, net_ms, red_ms);
         }
-        auto red_t1 = std::chrono::steady_clock::now();
-
-        if (overlap_comm_) signal_mccl_done(next_event_value());
-
-        double net_ms = std::chrono::duration<double, std::milli>(net_t1 - net_t0).count();
-        double red_ms = std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
-        double gbps = (nbytes * 2.0 * 8.0) / (net_ms / 1000.0) / 1e9;
-        MCCL_INFO("allreduce_two_rank: %zu bytes, net=%.1fms (%.2f Gbps), reduce=%.1fms cpu_ok=%d",
-                  nbytes, net_ms, gbps, red_ms, (int)cpu_ok);
-        metrics_->record_phase(seq, 0, net_ms, red_ms);
 
         metrics_->record_transport_bytes(nbytes, true);
         metrics_->record_transport_bytes(nbytes, false);
@@ -809,10 +908,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
     watchdog_->watch(seq, "broadcast");
     metrics_->op_start(seq, "broadcast", nbytes);
 
-    sync_mps_for_collective(overlap_comm_);
+    uint64_t sync_val_bc = sync_mps_nonblocking(overlap_comm_);
 
     engine_->submit(
-        [this, tensor_copy, root, seq, rank, ws]() mutable {
+        [this, tensor_copy, root, seq, rank, ws, sync_val_bc]() mutable {
+            if (sync_val_bc > 0) wait_for_mps(sync_val_bc);
             if (rank == root) {
                 StagingBuffer staged = stage_for_send_nosync(tensor_copy);
                 for (int peer = 0; peer < ws; peer++) {
@@ -934,10 +1034,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
     watchdog_->watch(seq, "allgather");
     metrics_->op_start(seq, "allgather", nbytes * ws);
 
-    sync_mps_for_collective(overlap_comm_);
+    uint64_t sync_val_ag = sync_mps_nonblocking(overlap_comm_);
 
     engine_->submit(
-        [this, input_copy, outputs_copy, seq, rank, ws, nbytes]() mutable {
+        [this, input_copy, outputs_copy, seq, rank, ws, nbytes, sync_val_ag]() mutable {
+            if (sync_val_ag > 0) wait_for_mps(sync_val_ag);
             bool use_cpu = (input_copy.scalar_type() == at::kFloat) && tensor_cpu_accessible(input_copy);
 
             if (use_cpu) {
@@ -1045,10 +1146,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
     watchdog_->watch(seq, "reduce_scatter");
     metrics_->op_start(seq, "reduce_scatter", nbytes * ws);
 
-    sync_mps_for_collective(overlap_comm_);
+    uint64_t sync_val_rs = sync_mps_nonblocking(overlap_comm_);
 
     engine_->submit(
-        [this, output_copy, inputs_copy, seq, rank, ws, nbytes, rs_op]() mutable {
+        [this, output_copy, inputs_copy, seq, rank, ws, nbytes, rs_op, sync_val_rs]() mutable {
+            if (sync_val_rs > 0) wait_for_mps(sync_val_rs);
             int left = (rank - 1 + ws) % ws;
             int right = (rank + 1) % ws;
             bool use_cpu = (inputs_copy[0].scalar_type() == at::kFloat) && tensor_cpu_accessible(inputs_copy[0]);
@@ -1145,10 +1247,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
     watchdog_->watch(seq, "send");
     metrics_->op_start(seq, "send", nbytes);
 
-    sync_mps_for_collective(overlap_comm_);
+    uint64_t sync_val_s = sync_mps_nonblocking(overlap_comm_);
 
     engine_->submit(
-        [this, tensor, dstRank, seq, tag, nbytes]() mutable {
+        [this, tensor, dstRank, seq, tag, nbytes, sync_val_s]() mutable {
+            if (sync_val_s > 0) wait_for_mps(sync_val_s);
             StagingBuffer staged = stage_for_send_nosync(tensor);
             MCCL_CHECK(transport_->send_chunks(dstRank, OpType::SEND, seq,
                                                static_cast<uint32_t>(tag),

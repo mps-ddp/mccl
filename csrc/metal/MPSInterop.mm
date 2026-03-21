@@ -321,7 +321,7 @@ void mps_sync() {
     mccl_queue_drain();
 }
 
-void mps_event_sync() {
+uint64_t mps_event_sync_nonblocking() {
     static const bool force_stream_sync = [] {
         auto* v = std::getenv("MCCL_EVENT_SYNC");
         if (v && (std::string(v) == "0" || std::string(v) == "false" ||
@@ -336,9 +336,17 @@ void mps_event_sync() {
     if (!force_stream_sync && event_sync_available()) {
         uint64_t val = next_event_value();
         commit_mps_and_signal(val);
-        // Same thread: commit_mps_and_signal already synchronized and set signaledValue.
+        return val;
     } else {
         mps_stream_sync();
+        return 0;
+    }
+}
+
+void mps_event_sync() {
+    uint64_t val = mps_event_sync_nonblocking();
+    if (val > 0) {
+        wait_for_mps(val);
     }
 }
 

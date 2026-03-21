@@ -3,7 +3,9 @@
 #include "common/Logging.hpp"
 
 #include <Accelerate/Accelerate.h>
+#include <dispatch/dispatch.h>
 #include <vector>
+#include <algorithm>
 
 namespace mccl {
 
@@ -61,36 +63,93 @@ void cpu_accumulate_and_scale_via_float(T* dst, const T* src,
     narrow_from_float(lhs.data(), dst, count);
 }
 
+constexpr int64_t MT_THRESHOLD = 1024 * 1024;  // 1M floats = 4MB
+constexpr int     MT_MAX_JOBS  = 8;
+
+int mt_jobs(int64_t count) {
+    if (count < MT_THRESHOLD) return 1;
+    return std::min(static_cast<int>(count / MT_THRESHOLD), MT_MAX_JOBS);
+}
+
+using BinaryVDSPFn = void(*)(const float*, vDSP_Stride, const float*, vDSP_Stride,
+                              float*, vDSP_Stride, vDSP_Length);
+
+void parallel_binary(float* dst, const float* src, int64_t count, BinaryVDSPFn fn) {
+    int jobs = mt_jobs(count);
+    if (jobs <= 1) {
+        fn(dst, 1, src, 1, dst, 1, static_cast<vDSP_Length>(count));
+        return;
+    }
+    int64_t chunk = (count + jobs - 1) / jobs;
+    dispatch_apply(static_cast<size_t>(jobs),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                   ^(size_t i) {
+        int64_t start = static_cast<int64_t>(i) * chunk;
+        int64_t end = std::min(start + chunk, count);
+        if (start < end) {
+            fn(dst + start, 1, src + start, 1, dst + start, 1,
+               static_cast<vDSP_Length>(end - start));
+        }
+    });
+}
+
 } // anonymous namespace
 
 void cpu_accumulate(float* dst, const float* src, int64_t count) {
-    vDSP_vadd(dst, 1, src, 1, dst, 1, static_cast<vDSP_Length>(count));
+    parallel_binary(dst, src, count, vDSP_vadd);
 }
 
 void cpu_scale_inplace(float* buf, int64_t count, float scale) {
-    vDSP_vsmul(buf, 1, &scale, buf, 1, static_cast<vDSP_Length>(count));
+    int jobs = mt_jobs(count);
+    if (jobs <= 1) {
+        vDSP_vsmul(buf, 1, &scale, buf, 1, static_cast<vDSP_Length>(count));
+        return;
+    }
+    int64_t chunk = (count + jobs - 1) / jobs;
+    dispatch_apply(static_cast<size_t>(jobs),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                   ^(size_t i) {
+        int64_t start = static_cast<int64_t>(i) * chunk;
+        int64_t end = std::min(start + chunk, count);
+        if (start < end) {
+            vDSP_vsmul(buf + start, 1, &scale, buf + start, 1,
+                       static_cast<vDSP_Length>(end - start));
+        }
+    });
 }
 
 void cpu_accumulate_and_scale(float* dst, const float* src,
                               int64_t count, float scale) {
-    // vDSP_vasm requires non-aliasing pointers for __A, __B, and __D.
-    // dst is both __A (first addend) and __D (output), which violates that
-    // contract and produces undefined results.  Use two separate vDSP calls
-    // instead: vDSP_vadd and vDSP_vsmul both permit in-place (dst == output).
-    vDSP_vadd(dst, 1, src, 1, dst, 1, static_cast<vDSP_Length>(count));
-    vDSP_vsmul(dst, 1, &scale, dst, 1, static_cast<vDSP_Length>(count));
+    int jobs = mt_jobs(count);
+    if (jobs <= 1) {
+        vDSP_vadd(dst, 1, src, 1, dst, 1, static_cast<vDSP_Length>(count));
+        vDSP_vsmul(dst, 1, &scale, dst, 1, static_cast<vDSP_Length>(count));
+        return;
+    }
+    int64_t chunk = (count + jobs - 1) / jobs;
+    dispatch_apply(static_cast<size_t>(jobs),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                   ^(size_t i) {
+        int64_t start = static_cast<int64_t>(i) * chunk;
+        int64_t end = std::min(start + chunk, count);
+        if (start < end) {
+            vDSP_Length len = static_cast<vDSP_Length>(end - start);
+            vDSP_vadd(dst + start, 1, src + start, 1, dst + start, 1, len);
+            vDSP_vsmul(dst + start, 1, &scale, dst + start, 1, len);
+        }
+    });
 }
 
 void cpu_elementwise_min(float* dst, const float* src, int64_t count) {
-    vDSP_vmin(dst, 1, src, 1, dst, 1, static_cast<vDSP_Length>(count));
+    parallel_binary(dst, src, count, vDSP_vmin);
 }
 
 void cpu_elementwise_max(float* dst, const float* src, int64_t count) {
-    vDSP_vmax(dst, 1, src, 1, dst, 1, static_cast<vDSP_Length>(count));
+    parallel_binary(dst, src, count, vDSP_vmax);
 }
 
 void cpu_elementwise_product(float* dst, const float* src, int64_t count) {
-    vDSP_vmul(dst, 1, src, 1, dst, 1, static_cast<vDSP_Length>(count));
+    parallel_binary(dst, src, count, vDSP_vmul);
 }
 
 void cpu_reduce_op_half(c10::Half* dst, const c10::Half* src, int64_t count,

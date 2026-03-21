@@ -118,16 +118,16 @@ def single_gpu_baseline() -> None:
 
     model = LargeMLPTransformer(
         input_dim=512, 
-        hidden_dim=2048, 
-        num_layers=12,
-        num_classes=1000
+        hidden_dim=1024, 
+        num_layers=6,
+        num_classes=100
     ).to(device)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.01)
     loss_fn = nn.CrossEntropyLoss()
     
-    steps = int(os.environ.get("TRAIN_STEPS", "50"))
-    batch_size = int(os.environ.get("BATCH_SIZE", "32"))
+    steps = int(os.environ.get("TRAIN_STEPS", "30"))
+    batch_size = int(os.environ.get("BATCH_SIZE", "64"))
     
     total_params = sum(p.numel() for p in model.parameters())
     print(
@@ -145,7 +145,7 @@ def single_gpu_baseline() -> None:
     for step in range(warmup_steps + steps):
         torch.manual_seed(1000 + step)
         x = torch.randn(batch_size, 512, device=device)
-        y = torch.randint(0, 1000, (batch_size,), device=device)
+        y = torch.randint(0, 100, (batch_size,), device=device)
         
         start_time = time.perf_counter()
         
@@ -259,17 +259,17 @@ def main() -> None:
 
     model = LargeMLPTransformer(
         input_dim=512, 
-        hidden_dim=2048, 
-        num_layers=12,  # Deep model
-        num_classes=1000
+        hidden_dim=1024,  # Smaller hidden dim
+        num_layers=6,     # Fewer layers  
+        num_classes=100   # Fewer classes
     ).to(device)
     ddp = DDP(model)
 
     optimizer = torch.optim.AdamW(ddp.parameters(), lr=0.0001, weight_decay=0.01)
     loss_fn = nn.CrossEntropyLoss()
 
-    steps = int(os.environ.get("TRAIN_STEPS", "50"))  # Fewer steps since each is expensive
-    batch_size = int(os.environ.get("BATCH_SIZE", "32"))  # Smaller batch due to memory
+    steps = int(os.environ.get("TRAIN_STEPS", "30"))  # Reasonable for testing
+    batch_size = int(os.environ.get("BATCH_SIZE", "64"))  # Back to larger batch
     input_dim = 512
 
     # Model stats
@@ -296,7 +296,7 @@ def main() -> None:
         # Different data per rank (simulates data sharding)
         torch.manual_seed(1000 + step * world_size + rank)
         x = torch.randn(batch_size, input_dim, device=device)
-        y = torch.randint(0, 1000, (batch_size,), device=device)  # 1000-class classification
+        y = torch.randint(0, 100, (batch_size,), device=device)  # 100-class classification
 
         start_time = time.perf_counter()
         

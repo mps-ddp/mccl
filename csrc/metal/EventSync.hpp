@@ -7,11 +7,11 @@ namespace mccl {
 
 /// MPS / MCCL coordination helpers (MTLSharedEvent counters + bookkeeping).
 ///
-/// PyTorch does not expose a safe way to encode completion on MPS command
-/// buffers from outside the framework, so ``commit_mps_and_signal`` uses
-/// ``torch::mps::synchronize()`` and then bumps ``signaledValue`` on the CPU.
-/// That matches the actual ordering guarantee (full stream drain), not a
-/// non-blocking GPU signal.
+/// ``commit_mps_and_signal`` encodes ``encodeSignalEvent`` on PyTorch's active
+/// MPS command buffer (via ``torch::mps::get_dispatch_queue`` /
+/// ``get_command_buffer``), then ``commit()``; ``wait_for_mps`` polls until the
+/// GPU reaches that signal. This replaces a full ``torch::mps::synchronize()``
+/// drain while still ordering MCCL reads after GPU-produced tensor data.
 ///
 /// ``signal_mccl_done`` / ``wait_for_mccl`` exist for future shader paths;
 /// collectives today still rely on op completion before returning.
@@ -24,8 +24,8 @@ void event_sync_init();
 /// valid MTLDevice).
 bool event_sync_available();
 
-/// Drain PyTorch's MPS stream (``torch::mps::synchronize``), then set
-/// ``mps_event.signaledValue`` to ``value`` for bookkeeping / future use.
+/// Encode ``value`` on PyTorch's MPS command buffer and commit; GPU completion
+/// is observed via ``wait_for_mps``.
 void commit_mps_and_signal(uint64_t value);
 
 /// Poll until ``mps_event.signaledValue >= value`` (used when another

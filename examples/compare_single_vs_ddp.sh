@@ -9,6 +9,9 @@ export PYTHONUNBUFFERED=1
 # Shared knobs — override before calling this script if you want longer runs
 export TRAIN_STEPS="${TRAIN_STEPS:-30}"
 export BATCH_SIZE="${BATCH_SIZE:-4}"
+# Fair baseline vs local 2-rank DDP: same **global** batch (per_rank × 2).
+# Override explicitly for multi-node (e.g. BASELINE_BATCH_SIZE=$((BATCH_SIZE*2))).
+export BASELINE_BATCH_SIZE="${BASELINE_BATCH_SIZE:-$((BATCH_SIZE * 2))}"
 
 # DDP: many allreduce buckets per backward — each needs a GPU barrier. FULL is required.
 # Explicit default so a stale shell MCCL_SYNC_MODE=coalesced cannot break multi-bucket runs.
@@ -35,4 +38,5 @@ torchrun --nproc_per_node=2 --nnodes=1 \
   "$ROOT/examples/ddp_dummy_train.py"
 
 echo ""
-echo "Done. Compare 'Avg step time' / throughput above."
+echo "Done. Compare 'Avg step time' / throughput and MCCL phase metrics above."
+echo "Multi-node checklist / bucket sweeps: docs/MULTINODE.md"

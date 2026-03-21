@@ -52,7 +52,16 @@ If MPS runs out of memory, lower ``BATCH_SIZE`` (e.g. 2) or reduce ``MODEL_HIDDE
 For a quick smoke test: ``MODEL_DEPTH=2 MODEL_HIDDEN=512 BATCH_SIZE=8``.
 
 Optional env (see MCCL docs): ``MCCL_LISTEN_ADDR``, ``MCCL_PORT_BASE``, ``MCCL_TRANSPORT``.
-Training env: ``TRAIN_STEPS`` (default 30), ``BATCH_SIZE`` (default 4 per rank).
+Training env: ``TRAIN_STEPS`` (default 30), ``BATCH_SIZE`` (default 4 per rank),
+``DDP_BUCKET_MB`` (default 25; try **50–200** for 2-node to cut TCP round-trips),
+``TRAIN_AUTOCAST_FP16=1`` for ``torch.autocast`` fp16 forward+loss (smaller/faster on MPS),
+``MCCL_COMPRESSION=fp16`` when supported (halves cross-host bytes).
+
+**Multi-node guide**: ``docs/MULTINODE.md`` (firewall, listen addr, baseline matching).
+
+**Fair baseline vs DDP**: set ``BASELINE_BATCH_SIZE`` to the **global** batch
+(``BATCH_SIZE * WORLD_SIZE`` from your DDP run), e.g. ``BASELINE_BATCH_SIZE=8``
+for 4 per rank × 2 nodes.
 
 **Why it looks like a "hang"**
 
@@ -140,13 +149,15 @@ def single_gpu_baseline() -> None:
 
     steps = int(os.environ.get("TRAIN_STEPS", "30"))
     batch_size = int(os.environ.get("BATCH_SIZE", "4"))
+    if os.environ.get("BASELINE_BATCH_SIZE"):
+        batch_size = int(os.environ["BASELINE_BATCH_SIZE"])
     input_dim, num_classes, _, _ = _model_dims_from_env()
 
     total_params = sum(p.numel() for p in model.parameters())
     print(
         f"Single GPU baseline | device={device}\n"
         f"  Model: {total_params:,} params\n"
-        f"  Batch: {batch_size}\n"
+        f"  Batch: {batch_size} (set BASELINE_BATCH_SIZE=global_batch to match DDP)\n"
         f"  Steps: {steps}\n"
         f"  INPUT_DIM={input_dim} NUM_CLASSES={num_classes} "
         f"(MODEL_HIDDEN/MODEL_DEPTH from env)",
@@ -291,8 +302,14 @@ def main() -> None:
     print(f"[ddp_dummy_train] rank {rank}: allocating model on {device}...", flush=True)
     model = build_dummy_classifier().to(device)
     print(f"[ddp_dummy_train] rank {rank}: wrapping DDP (syncs with other ranks)...", flush=True)
+    # Multi-node: larger buckets (e.g. 75–200) reduce allreduce count and RTT cost.
     bucket_mb = int(os.environ.get("DDP_BUCKET_MB", "25"))
     ddp = DDP(model, find_unused_parameters=False, bucket_cap_mb=bucket_mb)
+    use_autocast = os.environ.get("TRAIN_AUTOCAST_FP16", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     print(f"[ddp_dummy_train] rank {rank}: DDP wrapper ready", flush=True)
 
     optimizer = torch.optim.AdamW(ddp.parameters(), lr=0.0001, weight_decay=0.01)
@@ -311,7 +328,8 @@ def main() -> None:
             f"DDP training | world_size={world_size} device={device}\n"
             f"  Model: {total_params:,} params ({trainable_params:,} trainable)\n"
             f"  Batch: {batch_size} per rank ({batch_size * world_size} global)\n"
-            f"  Steps: {steps}  bucket_cap_mb={bucket_mb}\n"
+            f"  Steps: {steps}  bucket_cap_mb={bucket_mb}"
+            f"{'  autocast_fp16' if use_autocast else ''}\n"
             f"  INPUT_DIM={input_dim} NUM_CLASSES={num_classes}",
             flush=True,
         )
@@ -342,8 +360,13 @@ def main() -> None:
         # bucket is communicated while the next bucket's gradients are still
         # being computed.  Event-based sync (Phase 1) makes this safe on MPS:
         # we encode a signal + commit instead of draining the full MPS stream.
-        logits = ddp(x)
-        loss = loss_fn(logits, y)
+        if use_autocast:
+            with torch.autocast(device_type="mps", dtype=torch.float16):
+                logits = ddp(x)
+                loss = loss_fn(logits, y)
+        else:
+            logits = ddp(x)
+            loss = loss_fn(logits, y)
 
         if verbose and rank == 0 and step < 3:
             print(f"    step {step}: backward pass (with bucketed allreduce)...", flush=True)

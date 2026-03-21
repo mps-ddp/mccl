@@ -134,6 +134,8 @@ Typical causes:
 2. **`MCCL_PORT_BASE` equals `MASTER_PORT`** — PyTorch’s TCP rendezvous uses `MASTER_PORT` on the master host; MCCL rank 0 listens on `MCCL_PORT_BASE + 0`. They must be different ports (defaults use `29600` vs `29500`, or set `MCCL_PORT_BASE=$((MASTER_PORT+100))` on all nodes).
 3. **Firewall / wrong IP** — Peers must reach `MASTER_ADDR:MASTER_PORT` and each published MCCL endpoint; open `MCCL_PORT_BASE` through `MCCL_PORT_BASE + world_size - 1` if needed.
 
+**Full multi-node checklist, fair baseline vs DDP, and perf tuning** (`DDP_BUCKET_MB`, sockets, compression): see [docs/MULTINODE.md](docs/MULTINODE.md).
+
 ## RDMA over Thunderbolt 5
 
 MCCL supports RDMA transport for ultra-low-latency collective communication over Thunderbolt 5 connections between Apple Silicon nodes. When available, RDMA bypasses the TCP/IP stack entirely for sub-10µs latency and ~80 Gbps bandwidth.

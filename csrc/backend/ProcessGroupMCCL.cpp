@@ -384,21 +384,38 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     size_t nbytes = tensor_nbytes(tensor);
 
     c10d::ReduceOp::RedOpType red_op = opts.reduceOp;
+    const bool defer_mps_sync_to_engine = opts.asyncOp;
 
     register_work(seq, work);
     watchdog_->watch(seq, "allreduce");
     metrics_->op_start(seq, "allreduce", nbytes);
 
     auto sync_t0 = std::chrono::steady_clock::now();
-    uint64_t sync_val = sync_mps_nonblocking(overlap_comm_);
-
+    uint64_t sync_val = 0;
+    if (!defer_mps_sync_to_engine) {
+        sync_val = sync_mps_nonblocking(overlap_comm_);
+    }
     auto sync_t1 = std::chrono::steady_clock::now();
     double sync_ms = std::chrono::duration<double, std::milli>(sync_t1 - sync_t0).count();
     metrics_->record_phase(seq, sync_ms, 0, 0);
 
+    if (defer_mps_sync_to_engine) {
+        MCCL_DEBUG("allreduce seq=%u: asyncOp=true, MPS sync deferred to ProgressEngine", seq);
+    }
+
     engine_->submit(
-        [this, tensor_copy, seq, ws, nbytes, red_op, sync_val]() mutable {
-            if (sync_val > 0) wait_for_mps(sync_val);
+        [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
+            if (defer_mps_sync_to_engine) {
+                if (overlap_comm_) {
+                    uint64_t v = next_event_value();
+                    commit_mps_and_signal(v);
+                    wait_for_mps(v);
+                } else {
+                    mps_stream_sync();
+                }
+            } else if (sync_val > 0) {
+                wait_for_mps(sync_val);
+            }
             const char* algo = "unknown";
             if (nbytes <= transport_->config().small_msg_threshold) {
                 algo = "small";

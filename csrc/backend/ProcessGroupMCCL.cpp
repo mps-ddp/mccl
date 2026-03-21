@@ -133,13 +133,19 @@ ProcessGroupMCCL::ProcessGroupMCCL(
 }
 
 ProcessGroupMCCL::~ProcessGroupMCCL() {
-    MCCL_INFO("ProcessGroupMCCL rank=%d shutting down", getRank());
-    clear_active_pg_if(this);
-    metrics_->log_summary();
-    if (health_) health_->stop();
-    if (watchdog_) watchdog_->stop();
-    if (engine_) engine_->stop();
-    if (transport_) transport_->shutdown();
+    try {
+        MCCL_INFO("ProcessGroupMCCL rank=%d shutting down", getRank());
+        clear_active_pg_if(this);
+        metrics_->log_summary();
+        if (health_) health_->stop();
+        if (watchdog_) watchdog_->stop();
+        if (engine_) engine_->stop();
+        if (transport_) transport_->shutdown();
+    } catch (const std::exception& e) {
+        MCCL_DEBUG("Exception during shutdown (suppressed): %s", e.what());
+    } catch (...) {
+        MCCL_DEBUG("Unknown exception during shutdown (suppressed)");
+    }
 }
 
 void ProcessGroupMCCL::init_transport() {
@@ -168,7 +174,7 @@ void ProcessGroupMCCL::init_transport() {
 
 void ProcessGroupMCCL::register_work(uint32_t seq, c10::intrusive_ptr<WorkMCCL> work) {
     std::lock_guard<std::mutex> lock(work_registry_mu_);
-    work_registry_[seq] = c10::weak_intrusive_ptr<WorkMCCL>(work);
+    work_registry_.insert_or_assign(seq, c10::weak_intrusive_ptr<WorkMCCL>(work));
 }
 
 void ProcessGroupMCCL::unregister_work(uint32_t seq) {

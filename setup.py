@@ -14,13 +14,18 @@ from setuptools.command.build_ext import build_ext
 
 
 def _torch_include_dirs():
+    import sysconfig
     import torch
-    return torch.utils.cpp_extension.include_paths()
+    from torch.utils.cpp_extension import include_paths
+    torch_root = os.path.join(os.path.dirname(torch.__file__), "include")
+    distributed_inc = os.path.join(torch_root, "torch", "csrc", "distributed")
+    python_inc = sysconfig.get_path("include")
+    return include_paths() + [distributed_inc, python_inc]
 
 
 def _torch_library_dirs():
-    import torch
-    return torch.utils.cpp_extension.library_paths()
+    from torch.utils.cpp_extension import library_paths
+    return library_paths()
 
 
 class MCCLBuildExt(build_ext):
@@ -97,8 +102,10 @@ class MCCLBuildExt(build_ext):
             f"-L{torch_lib}",
             "-ltorch",
             "-ltorch_cpu",
+            "-ltorch_python",
             "-lc10",
             f"-Wl,-rpath,{torch_lib}",
+            "-undefined", "dynamic_lookup",
         ]
 
         self._link_shared_object(objects, ext)
@@ -133,7 +140,26 @@ class MCCLBuildExt(build_ext):
         self.announce(f"Linking {ext_path}", level=2)
         subprocess.check_call(cmd)
 
+        self._fixup_rpath(ext_path)
         self._compile_metallib(os.path.dirname(ext_path))
+
+    @staticmethod
+    def _fixup_rpath(ext_path):
+        """Replace the build-time torch rpath with a relative one that works at runtime."""
+        import torch
+        runtime_torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+        result = subprocess.run(
+            ["otool", "-l", ext_path], capture_output=True, text=True
+        )
+        for i, line in enumerate(result.stdout.splitlines()):
+            if "path" in line and "torch" in line and "pip-build-env" in line:
+                stale = line.strip().split()[1]
+                subprocess.check_call([
+                    "install_name_tool", "-delete_rpath", stale, ext_path
+                ])
+        subprocess.run([
+            "install_name_tool", "-add_rpath", runtime_torch_lib, ext_path
+        ], capture_output=True)
 
     @staticmethod
     def _detect_metal_std():
@@ -149,6 +175,17 @@ class MCCLBuildExt(build_ext):
         shader_src = "csrc/metal/shaders.metal"
         if not os.path.exists(shader_src):
             self.announce("shaders.metal not found, skipping metallib", level=2)
+            return
+
+        try:
+            subprocess.check_output(
+                ["xcrun", "--find", "metal"], text=True, stderr=subprocess.STDOUT
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            self.warn(
+                "Metal shader compiler not found (requires full Xcode install). "
+                "Skipping metallib precompilation; shaders will be compiled at runtime."
+            )
             return
 
         air_path = os.path.join(self.build_temp, "mccl_shaders.air")
@@ -185,6 +222,7 @@ CPP_SOURCES = [
     "csrc/backend/ProcessGroupMCCL.cpp",
     "csrc/backend/WorkMCCL.cpp",
     "csrc/backend/Registration.cpp",
+    "csrc/backend/MPSDispatch.cpp",
     "csrc/transport/TcpTransport.cpp",
     "csrc/transport/Connection.cpp",
     "csrc/runtime/ProgressEngine.cpp",

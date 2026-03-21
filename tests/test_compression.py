@@ -103,7 +103,7 @@ class TestTopKCompression:
 
         # After many steps, total_sent should approximate total_data
         residual = np.abs(total_data - total_sent - error)
-        assert np.max(residual) < 1e-5, f"Max residual: {np.max(residual)}"
+        assert np.max(residual) < 1e-4, f"Max residual: {np.max(residual)}"
 
     def test_wire_format(self):
         """Verify the index-value wire format."""

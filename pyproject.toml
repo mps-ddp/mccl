@@ -25,3 +25,8 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["mccl*"]
+
+[tool.pytest.ini_options]
+addopts = "--tb=short --capture=no --log-cli-level=WARNING"
+log_file = "test_failures.log"
+log_file_level = "DEBUG"

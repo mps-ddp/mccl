@@ -51,6 +51,7 @@ _platform_ok = _check_platform()
 
 if _platform_ok:
     try:
+        import torch.distributed  # registers c10d base types in pybind11
         from mccl._C import _register_backend
         _register_backend()
         _backend_registered = True

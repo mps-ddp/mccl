@@ -1,5 +1,6 @@
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+#include <torch/csrc/utils/pybind.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/chrono.h>
 #include <pybind11/stl.h>
@@ -9,6 +10,7 @@
 #include "compression/Compression.hpp"
 #include "runtime/Metrics.hpp"
 #include "metal/MetalKernels.hpp"
+#include "metal/MPSInterop.hpp"
 #include "metal/AccelerateOps.hpp"
 #include "common/Logging.hpp"
 #include "common/Version.hpp"
@@ -139,6 +141,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("_metal_accumulate_chunk",
           [](at::Tensor dst, const at::Tensor& src) {
               mccl::metal_kernels_init();
+              mccl::mps_stream_sync();
               mccl::metal_accumulate_chunk(dst, src);
               mccl::metal_sync();
               return dst;
@@ -148,6 +151,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("_metal_elementwise_min",
           [](at::Tensor dst, const at::Tensor& src) {
               mccl::metal_kernels_init();
+              mccl::mps_stream_sync();
               mccl::metal_elementwise_min(dst, src);
               mccl::metal_sync();
               return dst;
@@ -157,6 +161,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("_metal_elementwise_max",
           [](at::Tensor dst, const at::Tensor& src) {
               mccl::metal_kernels_init();
+              mccl::mps_stream_sync();
               mccl::metal_elementwise_max(dst, src);
               mccl::metal_sync();
               return dst;
@@ -166,6 +171,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("_metal_elementwise_product",
           [](at::Tensor dst, const at::Tensor& src) {
               mccl::metal_kernels_init();
+              mccl::mps_stream_sync();
               mccl::metal_elementwise_product(dst, src);
               mccl::metal_sync();
               return dst;
@@ -175,6 +181,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("_metal_scale_inplace",
           [](at::Tensor buf, double scale) {
               mccl::metal_kernels_init();
+              mccl::mps_stream_sync();
               mccl::metal_scale_inplace(buf, scale);
               mccl::metal_sync();
               return buf;
@@ -184,6 +191,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("_metal_accumulate_and_scale",
           [](at::Tensor dst, const at::Tensor& src, double scale) {
               mccl::metal_kernels_init();
+              mccl::mps_stream_sync();
               mccl::metal_accumulate_and_scale(dst, src, scale);
               mccl::metal_sync();
               return dst;

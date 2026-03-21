@@ -179,53 +179,63 @@ void TcpTransport::connect_all(const std::vector<std::string>& endpoints) {
     MCCL_CHECK(static_cast<int>(endpoints.size()) == world_size_,
                "endpoints size mismatch");
 
-    // Phase 1: Outbound connections to all higher ranks.
-    for (int peer = rank_ + 1; peer < world_size_; peer++) {
-        auto colon = endpoints[peer].find(':');
-        MCCL_CHECK(colon != std::string::npos,
-                   "Invalid endpoint format: " + endpoints[peer]);
-        std::string host = endpoints[peer].substr(0, colon);
-        uint16_t port = static_cast<uint16_t>(
-            std::atoi(endpoints[peer].substr(colon + 1).c_str()));
+    // Run outbound connects and inbound accepts concurrently to avoid
+    // deadlock when world_size >= 3. Without concurrency, rank 0 blocks
+    // on its outbound handshake with rank 1, while rank 1 blocks on its
+    // outbound to rank 2, and rank 2 waits for inbound from rank 0.
 
-        MCCL_INFO("Rank %d: connecting to rank %d at %s:%u",
-                  rank_, peer, host.c_str(), port);
+    std::exception_ptr outbound_error;
 
-        bool connected = false;
-        for (int attempt = 0; attempt < 30; attempt++) {
-            if (peers_[peer].connect(host, port, config_.connect_timeout)) {
-                connected = true;
-                break;
+    std::thread outbound_thread([&]() {
+        try {
+            for (int peer = rank_ + 1; peer < world_size_; peer++) {
+                auto colon = endpoints[peer].find(':');
+                MCCL_CHECK(colon != std::string::npos,
+                           "Invalid endpoint format: " + endpoints[peer]);
+                std::string host = endpoints[peer].substr(0, colon);
+                uint16_t port = static_cast<uint16_t>(
+                    std::atoi(endpoints[peer].substr(colon + 1).c_str()));
+
+                MCCL_INFO("Rank %d: connecting to rank %d at %s:%u",
+                          rank_, peer, host.c_str(), port);
+
+                bool connected = false;
+                for (int attempt = 0; attempt < 30; attempt++) {
+                    if (peers_[peer].connect(host, port, config_.connect_timeout)) {
+                        connected = true;
+                        break;
+                    }
+                    MCCL_WARN("Rank %d: connect to rank %d attempt %d failed, retrying...",
+                              rank_, peer, attempt + 1);
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+                MCCL_CHECK(connected, "Failed to connect to rank " + std::to_string(peer));
+                peers_[peer].set_peer_rank(peer);
+
+                HandshakePayload hs{};
+                hs.protocol_version = MCCL_PROTOCOL_VERSION;
+                hs.rank = rank_;
+                hs.world_size = world_size_;
+                gethostname(hs.hostname, sizeof(hs.hostname));
+
+                uint8_t buf[HandshakePayload::WIRE_SIZE];
+                hs.encode(buf);
+                MCCL_CHECK(peers_[peer].send_all(buf, sizeof(buf)),
+                           "Handshake send failed");
+
+                uint8_t ack_buf[HandshakePayload::WIRE_SIZE];
+                MCCL_CHECK(peers_[peer].recv_all(ack_buf, sizeof(ack_buf)),
+                           "Handshake ACK recv failed");
+                HandshakePayload ack = HandshakePayload::decode(ack_buf);
+                MCCL_CHECK(ack.protocol_version == MCCL_PROTOCOL_VERSION,
+                           "Handshake ACK protocol version mismatch");
             }
-            MCCL_WARN("Rank %d: connect to rank %d attempt %d failed, retrying...",
-                      rank_, peer, attempt + 1);
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+        } catch (...) {
+            outbound_error = std::current_exception();
         }
-        MCCL_CHECK(connected, "Failed to connect to rank " + std::to_string(peer));
-        peers_[peer].set_peer_rank(peer);
+    });
 
-        HandshakePayload hs{};
-        hs.protocol_version = MCCL_PROTOCOL_VERSION;
-        hs.rank = rank_;
-        hs.world_size = world_size_;
-        gethostname(hs.hostname, sizeof(hs.hostname));
-
-        uint8_t buf[HandshakePayload::WIRE_SIZE];
-        hs.encode(buf);
-        MCCL_CHECK(peers_[peer].send_all(buf, sizeof(buf)),
-                   "Handshake send failed");
-
-        uint8_t ack_buf[HandshakePayload::WIRE_SIZE];
-        MCCL_CHECK(peers_[peer].recv_all(ack_buf, sizeof(ack_buf)),
-                   "Handshake ACK recv failed");
-        HandshakePayload ack = HandshakePayload::decode(ack_buf);
-        MCCL_CHECK(ack.protocol_version == MCCL_PROTOCOL_VERSION,
-                   "Handshake ACK protocol version mismatch");
-    }
-
-    // Phase 2: Accept inbound connections from all lower ranks.
-    // Accept in any order, then dispatch to the correct peer slot based
-    // on the handshake rank (fixes accept-order race for ws >= 3).
+    // Accept inbound connections from all lower ranks concurrently.
     int num_inbound = rank_;
     std::vector<Connection> pending(num_inbound);
 
@@ -265,6 +275,9 @@ void TcpTransport::connect_all(const std::vector<std::string>& endpoints) {
         MCCL_CHECK(peers_[peer].send_all(ack_buf, sizeof(ack_buf)),
                    "Handshake ACK send failed");
     }
+
+    outbound_thread.join();
+    if (outbound_error) std::rethrow_exception(outbound_error);
 
     MCCL_INFO("Rank %d: all %d peers connected (bidirectional handshake complete)",
               rank_, world_size_ - 1);

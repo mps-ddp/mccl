@@ -11,10 +11,10 @@
 #include "common/Logging.hpp"
 #include "common/TensorChecks.hpp"
 
-// PyTorch MPS internal — getMTLBufferStorage is the blessed extraction path.
-// Version-pinned; if PyTorch changes the symbol, the build breaks loudly.
 namespace at::mps {
-    id<MTLBuffer> getMTLBufferStorage(const at::Tensor& tensor);
+    static inline id<MTLBuffer> getMTLBufferStorage(const at::Tensor& tensor) {
+        return __builtin_bit_cast(id<MTLBuffer>, tensor.storage().data());
+    }
 }
 
 namespace mccl {
@@ -89,8 +89,37 @@ void* get_mccl_command_queue() {
     return (__bridge void*)cached_queue();
 }
 
+MPSBufferView wrap_cpu_tensor_as_mps_buffer(const at::Tensor& tensor) {
+    MCCL_CHECK(tensor.is_cpu(), "wrap_cpu_tensor_as_mps_buffer requires CPU tensor");
+    MCCL_CHECK(tensor.is_contiguous(), "CPU tensor must be contiguous");
+    
+    void* data_ptr = tensor.data_ptr();
+    size_t nbytes = tensor_nbytes(tensor);
+    
+    id<MTLDevice> device = cached_device();
+    id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:data_ptr
+                                                      length:nbytes
+                                                     options:MTLResourceStorageModeShared
+                                                 deallocator:nil];
+    MCCL_CHECK(buffer != nil, "Failed to wrap CPU tensor as MTLBuffer");
+    
+    MCCL_TRACE("wrap_cpu_tensor: data_ptr=%p nbytes=%zu", data_ptr, nbytes);
+    
+    return MPSBufferView{
+        .mtl_buffer     = (__bridge void*)buffer,
+        .byte_offset    = 0,
+        .nbytes         = nbytes,
+        .cpu_accessible = true,
+        .cpu_ptr        = data_ptr,
+    };
+}
+
 MPSBufferView extract_mps_buffer(const at::Tensor& tensor) {
     check_single_tensor(tensor);
+
+    if (tensor.is_cpu()) {
+        return wrap_cpu_tensor_as_mps_buffer(tensor);
+    }
 
     id<MTLBuffer> buffer = at::mps::getMTLBufferStorage(tensor);
     MCCL_CHECK(buffer != nil, "getMTLBufferStorage returned nil");

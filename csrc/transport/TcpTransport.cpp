@@ -13,6 +13,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <poll.h>
 
 namespace mccl {
@@ -67,6 +68,90 @@ std::string detect_thunderbolt_bridge() {
     }
 
     return best_addr;
+}
+
+/// Resolve the IPv4 address of a hostname or dotted-quad string.
+/// Returns host-order uint32, or 0 on failure.
+uint32_t resolve_ipv4(const char* host) {
+    struct in_addr addr{};
+    if (inet_pton(AF_INET, host, &addr) == 1)
+        return ntohl(addr.s_addr);
+
+    struct addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, nullptr, &hints, &res) != 0 || !res)
+        return 0;
+
+    auto* sin = reinterpret_cast<struct sockaddr_in*>(res->ai_addr);
+    uint32_t ip = ntohl(sin->sin_addr.s_addr);
+    freeaddrinfo(res);
+    return ip;
+}
+
+/// Pick the best local IPv4 address to publish as our MCCL endpoint.
+///
+/// Strategy: prefer the interface whose subnet contains MASTER_ADDR (already
+/// known reachable between all nodes). Falls back to the first non-loopback
+/// interface if no subnet match is found.
+///
+/// out_ifname receives the chosen interface name; out_subnet_match is true
+/// when the result was chosen because it shares a subnet with MASTER_ADDR.
+std::string resolve_best_local_addr(std::string& out_ifname, bool& out_subnet_match) {
+    out_subnet_match = false;
+
+    const char* master_env = std::getenv("MASTER_ADDR");
+    uint32_t master_ip = master_env ? resolve_ipv4(master_env) : 0;
+
+    struct ifaddrs* iflist = nullptr;
+    if (getifaddrs(&iflist) != 0) return "";
+
+    std::string subnet_match_addr;
+    std::string subnet_match_ifname;
+    std::string fallback_addr;
+    std::string fallback_ifname;
+
+    for (struct ifaddrs* ifa = iflist; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (!(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_RUNNING)) continue;
+        if (ifa->ifa_flags & IFF_LOOPBACK) continue;
+
+        auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+        uint32_t local_ip = ntohl(sin->sin_addr.s_addr);
+
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &sin->sin_addr, ip_str, sizeof(ip_str));
+        std::string name(ifa->ifa_name);
+
+        if (fallback_addr.empty()) {
+            fallback_addr = ip_str;
+            fallback_ifname = name;
+        }
+
+        if (master_ip != 0 && ifa->ifa_netmask) {
+            auto* mask_sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_netmask);
+            uint32_t mask = ntohl(mask_sin->sin_addr.s_addr);
+
+            if ((local_ip & mask) == (master_ip & mask)) {
+                bool is_link_local = ((local_ip >> 16) == 0xA9FE);
+                if (subnet_match_addr.empty() || !is_link_local) {
+                    subnet_match_addr = ip_str;
+                    subnet_match_ifname = name;
+                }
+            }
+        }
+    }
+
+    freeifaddrs(iflist);
+
+    if (!subnet_match_addr.empty()) {
+        out_ifname = subnet_match_ifname;
+        out_subnet_match = true;
+        return subnet_match_addr;
+    }
+
+    out_ifname = fallback_ifname;
+    return fallback_addr;
 }
 
 } // anonymous namespace
@@ -152,24 +237,17 @@ std::string TcpTransport::listen_endpoint() const {
 
     // 0.0.0.0 is valid for binding (accept from any interface) but cannot
     // be published to remote ranks — they'd connect to themselves.
-    // Resolve to the first non-loopback IPv4 address on this machine.
+    // Prefer the interface on the same subnet as MASTER_ADDR so multi-node
+    // works without manual MCCL_LISTEN_ADDR.
     if (addr == "0.0.0.0") {
-        struct ifaddrs* iflist = nullptr;
-        if (getifaddrs(&iflist) == 0) {
-            for (struct ifaddrs* ifa = iflist; ifa; ifa = ifa->ifa_next) {
-                if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
-                if (!(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_RUNNING)) continue;
-                if (ifa->ifa_flags & IFF_LOOPBACK) continue;
-
-                auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
-                char ip[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
-                addr = ip;
-                MCCL_INFO("Rank %d: resolved listen address 0.0.0.0 → %s (%s)",
-                          rank_, ip, ifa->ifa_name);
-                break;
-            }
-            freeifaddrs(iflist);
+        std::string ifname;
+        bool subnet_match = false;
+        std::string resolved = resolve_best_local_addr(ifname, subnet_match);
+        if (!resolved.empty()) {
+            addr = resolved;
+            MCCL_INFO("Rank %d: resolved listen address 0.0.0.0 → %s (%s, %s)",
+                       rank_, addr.c_str(), ifname.c_str(),
+                       subnet_match ? "subnet matches MASTER_ADDR" : "fallback — no subnet match for MASTER_ADDR");
         }
     }
 

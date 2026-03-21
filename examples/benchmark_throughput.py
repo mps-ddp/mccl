@@ -114,13 +114,22 @@ def main() -> None:
     bl_tput = float(bl["throughput_samples_per_sec"])
     ddp_tput = float(ddp["throughput_samples_per_sec"])
     ratio = bl_tput / ddp_tput if ddp_tput > 0 else float("inf")
+    ddp_frac = (ddp_tput / bl_tput * 100.0) if bl_tput > 0 else 0.0
+
+    if bl["global_batch_size"] != ddp["global_batch_size"]:
+        print(
+            "\nwarning: global_batch differs between JSON files — "
+            "throughput comparison is not apples-to-apples.",
+            file=sys.stderr,
+        )
 
     print("\n=== Throughput comparison ===")
     print(f"  baseline ({bl['mode']}):  {bl_tput:,.1f} samples/s  "
           f"(global_batch={bl['global_batch_size']}, world={bl['world_size']})")
     print(f"  ddp      ({ddp['mode']}):  {ddp_tput:,.1f} samples/s  "
           f"(global_batch={ddp['global_batch_size']}, world={ddp['world_size']})")
-    print(f"  baseline / ddp throughput ratio: {ratio:.2f}x")
+    print(f"  baseline / ddp throughput ratio: {ratio:.2f}x  "
+          f"(DDP achieves ~{ddp_frac:.0f}% of baseline samples/s)")
     print(f"  params (baseline): {bl['total_params']:,}  (ddp): {ddp['total_params']:,}")
 
     try:
@@ -133,34 +142,72 @@ def main() -> None:
 
         steps_bl = np.arange(len(bl_times))
         steps_ddp = np.arange(len(ddp_times))
-        axes[0].plot(steps_bl, bl_times * 1000.0, label="baseline (MPS)", alpha=0.85)
-        axes[0].plot(steps_ddp, ddp_times * 1000.0, label="DDP (MCCL)", alpha=0.85)
+        bl_mean_ms = float(np.mean(bl_times) * 1000.0)
+        ddp_mean_ms = float(np.mean(ddp_times) * 1000.0)
+        axes[0].plot(
+            steps_bl,
+            bl_times * 1000.0,
+            label=f"baseline (MPS), mean {bl_mean_ms:.1f} ms/step",
+            alpha=0.85,
+            linewidth=1.2,
+        )
+        axes[0].plot(
+            steps_ddp,
+            ddp_times * 1000.0,
+            label=f"DDP (MCCL), mean {ddp_mean_ms:.1f} ms/step",
+            alpha=0.85,
+            linewidth=1.2,
+        )
+        axes[0].axhline(bl_mean_ms, color="C0", linestyle=":", alpha=0.5)
+        axes[0].axhline(ddp_mean_ms, color="C1", linestyle=":", alpha=0.5)
         axes[0].set_ylabel("Step time (ms)")
-        axes[0].set_title("Per-step wall time")
-        axes[0].legend()
+        axes[0].set_title("Per-step wall time (matched workload JSONs)")
+        axes[0].legend(loc="upper right", fontsize=9)
         axes[0].grid(True, alpha=0.3)
 
-        axes[1].plot(steps_bl, bl_loss, label="baseline loss", alpha=0.85)
-        axes[1].plot(steps_ddp, ddp_loss, label="ddp loss", alpha=0.85)
-        axes[1].set_xlabel("Training step (after warmup, zero-based in file)")
+        axes[1].plot(steps_bl, bl_loss, label="baseline loss", alpha=0.85, linewidth=1.2)
+        axes[1].plot(steps_ddp, ddp_loss, label="ddp loss", alpha=0.85, linewidth=1.2)
+        axes[1].set_xlabel("Training step (after warmup, zero-based in JSON)")
         axes[1].set_ylabel("Loss")
-        axes[1].legend()
+        axes[1].legend(loc="upper right", fontsize=9)
         axes[1].grid(True, alpha=0.3)
 
+        nparams = int(bl["total_params"])
+        gbatch = int(bl["global_batch_size"])
+        fig.suptitle(
+            f"MCCL benchmark  |  global_batch={gbatch}  |  ~{nparams / 1e6:.1f}M params  |  "
+            f"baseline/DDP throughput = {ratio:.2f}×",
+            fontsize=11,
+            y=1.02,
+        )
         fig.tight_layout()
         out_png = Path(f"{args.output}.png")
         fig.savefig(out_png, dpi=150)
         plt.close(fig)
         print(f"wrote {out_png.resolve()}")
 
-        fig2, ax2 = plt.subplots(figsize=(6, 4))
+        fig2, ax2 = plt.subplots(figsize=(7, 4.5))
         names = ["baseline\n(MPS)", "DDP\n(MCCL)"]
         vals = [bl_tput, ddp_tput]
         colors = ["#2ecc71", "#3498db"]
-        ax2.bar(names, vals, color=colors)
+        bars = ax2.bar(names, vals, color=colors, width=0.55)
         ax2.set_ylabel("Throughput (samples / sec)")
-        ax2.set_title("Average throughput (from JSON)")
+        ax2.set_title(
+            f"Average throughput  |  global_batch={gbatch}  |  baseline/DDP = {ratio:.2f}×",
+        )
         ax2.grid(True, axis="y", alpha=0.3)
+        ymax = max(vals) * 1.18 if vals else 1.0
+        ax2.set_ylim(0, ymax)
+        for bar, v in zip(bars, vals, strict=True):
+            ax2.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + ymax * 0.02,
+                f"{v:.1f}",
+                ha="center",
+                va="bottom",
+                fontsize=10,
+                fontweight="medium",
+            )
         fig2.tight_layout()
         out_bar = Path(f"{args.output}_bars.png")
         fig2.savefig(out_bar, dpi=150)

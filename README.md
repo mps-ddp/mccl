@@ -4,7 +4,7 @@
 
 ## Performance Reality
 
-**Current performance:** Expect **~10x slower** than single-GPU training in most cases. This is not expected to be a performance boost with the current implementation.
+**Current performance:** With **small models**, expect on the order of **~10× slower** than single-GPU training — communication dominates. With **larger networks** (e.g. the conv + attention example in `examples/ddp_dummy_train.py`), **2-rank DDP** often lands around **~2.5–3× lower throughput** than a **fair single-MPS baseline** at the **same global batch** (e.g. ~96M params, global batch 8: ~60 vs ~23 samples/s in one run — use `examples/benchmark_throughput.py` to reproduce on your hardware). This is still not a net speedup versus one fast GPU for most workloads today.
 
 **Future potential:** Performance could be significantly improved with additional work on RDMA over Thunderbolt 5, better collective routing algorithms from PyTorch, or other transport optimizations.
 
@@ -79,6 +79,23 @@ MCCL is a `torch.distributed` backend for **DDP** and **collectives** on **MPS t
 ```bash
 bash scripts/benchmark_matrix.sh
 ```
+
+**Training throughput (MPS baseline vs MCCL DDP):** run the example with `--save-stats` on each setup, then compare:
+
+```bash
+python examples/ddp_dummy_train.py --baseline --save-stats baseline_stats.json
+torchrun --nproc_per_node=2 --nnodes=1 --master_addr=127.0.0.1 --master_port=29500 \
+  examples/ddp_dummy_train.py --save-stats ddp_stats.json
+python examples/benchmark_throughput.py --baseline baseline_stats.json --ddp ddp_stats.json -o my_bench
+```
+
+Produces `my_bench.npz` (NumPy arrays) and plots (`my_bench.png`, `my_bench_bars.png`) if `matplotlib` is installed.
+
+Example output (~96M-param model, matched global batch, 500 train steps after warmup — regenerate on your hardware):
+
+![Per-step time and loss: single MPS vs 2-rank MCCL DDP](bench.png)
+
+![Average throughput (samples/s)](bench_bars.png)
 
 See [examples/ddp_dummy_train.py](examples/ddp_dummy_train.py) for env vars and [RESULTS.md](RESULTS.md) to add your numbers.
 

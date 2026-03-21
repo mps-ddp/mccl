@@ -89,22 +89,45 @@ def single_gpu_baseline() -> None:
     device = torch.device("mps")
     torch.manual_seed(42)
     
-    # Same model as DDP version
-    model = nn.Sequential(
-        nn.Linear(128, 512),
-        nn.ReLU(),
-        nn.Linear(512, 256),
-        nn.ReLU(),
-        nn.Linear(256, 128),
-        nn.ReLU(),
-        nn.Linear(128, 10),
+    # Same large model as DDP version
+    class LargeMLPTransformer(nn.Module):
+        def __init__(self, input_dim=512, hidden_dim=2048, num_layers=8, num_classes=1000):
+            super().__init__()
+            self.input_proj = nn.Linear(input_dim, hidden_dim)
+            
+            self.layers = nn.ModuleList([
+                nn.Sequential(
+                    nn.LayerNorm(hidden_dim),
+                    nn.Linear(hidden_dim, hidden_dim * 4),
+                    nn.GELU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(hidden_dim * 4, hidden_dim),
+                    nn.Dropout(0.1),
+                ) for _ in range(num_layers)
+            ])
+            
+            self.final_norm = nn.LayerNorm(hidden_dim)
+            self.classifier = nn.Linear(hidden_dim, num_classes)
+            
+        def forward(self, x):
+            x = self.input_proj(x)
+            for layer in self.layers:
+                x = x + layer(x)
+            x = self.final_norm(x)
+            return self.classifier(x.mean(dim=1))
+
+    model = LargeMLPTransformer(
+        input_dim=512, 
+        hidden_dim=2048, 
+        num_layers=12,
+        num_classes=1000
     ).to(device)
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.01)
     loss_fn = nn.CrossEntropyLoss()
     
-    steps = int(os.environ.get("TRAIN_STEPS", "100"))
-    batch_size = int(os.environ.get("BATCH_SIZE", "64"))
+    steps = int(os.environ.get("TRAIN_STEPS", "50"))
+    batch_size = int(os.environ.get("BATCH_SIZE", "32"))
     
     total_params = sum(p.numel() for p in model.parameters())
     print(
@@ -121,8 +144,8 @@ def single_gpu_baseline() -> None:
     
     for step in range(warmup_steps + steps):
         torch.manual_seed(1000 + step)
-        x = torch.randn(batch_size, 128, device=device)
-        y = torch.randint(0, 10, (batch_size,), device=device)
+        x = torch.randn(batch_size, 512, device=device)
+        y = torch.randint(0, 1000, (batch_size,), device=device)
         
         start_time = time.perf_counter()
         
@@ -138,7 +161,7 @@ def single_gpu_baseline() -> None:
             step_times.append(step_time)
             losses.append(loss.item())
             
-        if step % 10 == 0 or step == warmup_steps + steps - 1:
+        if step % 5 == 0 or step == warmup_steps + steps - 1:
             status = "warmup" if step < warmup_steps else "train"
             print(f"  {status} step {step:4d}  loss={loss.item():.6f}  time={step_time:.3f}s", flush=True)
     
@@ -206,24 +229,48 @@ def main() -> None:
 
     torch.manual_seed(42 + rank)
 
-    # Bigger model for meaningful compute and gradient sync
-    model = nn.Sequential(
-        nn.Linear(128, 512),
-        nn.ReLU(),
-        nn.Linear(512, 256),
-        nn.ReLU(),
-        nn.Linear(256, 128),
-        nn.ReLU(),
-        nn.Linear(128, 10),  # Classification-style output
+    # Large transformer-style model that benefits from DDP
+    class LargeMLPTransformer(nn.Module):
+        def __init__(self, input_dim=512, hidden_dim=2048, num_layers=8, num_classes=1000):
+            super().__init__()
+            self.input_proj = nn.Linear(input_dim, hidden_dim)
+            
+            # Stack of large MLP blocks (transformer-style)
+            self.layers = nn.ModuleList([
+                nn.Sequential(
+                    nn.LayerNorm(hidden_dim),
+                    nn.Linear(hidden_dim, hidden_dim * 4),  # FFN expansion
+                    nn.GELU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(hidden_dim * 4, hidden_dim),  # FFN contraction
+                    nn.Dropout(0.1),
+                ) for _ in range(num_layers)
+            ])
+            
+            self.final_norm = nn.LayerNorm(hidden_dim)
+            self.classifier = nn.Linear(hidden_dim, num_classes)
+            
+        def forward(self, x):
+            x = self.input_proj(x)
+            for layer in self.layers:
+                x = x + layer(x)  # Residual connection
+            x = self.final_norm(x)
+            return self.classifier(x.mean(dim=1))  # Global average pooling
+
+    model = LargeMLPTransformer(
+        input_dim=512, 
+        hidden_dim=2048, 
+        num_layers=12,  # Deep model
+        num_classes=1000
     ).to(device)
     ddp = DDP(model)
 
-    optimizer = torch.optim.AdamW(ddp.parameters(), lr=0.001, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(ddp.parameters(), lr=0.0001, weight_decay=0.01)
     loss_fn = nn.CrossEntropyLoss()
 
-    steps = int(os.environ.get("TRAIN_STEPS", "100"))
-    batch_size = int(os.environ.get("BATCH_SIZE", "64"))
-    input_dim = 128
+    steps = int(os.environ.get("TRAIN_STEPS", "50"))  # Fewer steps since each is expensive
+    batch_size = int(os.environ.get("BATCH_SIZE", "32"))  # Smaller batch due to memory
+    input_dim = 512
 
     # Model stats
     total_params = sum(p.numel() for p in model.parameters())
@@ -249,7 +296,7 @@ def main() -> None:
         # Different data per rank (simulates data sharding)
         torch.manual_seed(1000 + step * world_size + rank)
         x = torch.randn(batch_size, input_dim, device=device)
-        y = torch.randint(0, 10, (batch_size,), device=device)  # Classification targets
+        y = torch.randint(0, 1000, (batch_size,), device=device)  # 1000-class classification
 
         start_time = time.perf_counter()
         
@@ -266,7 +313,7 @@ def main() -> None:
             step_times.append(step_time)
             losses.append(loss.item())
 
-        if rank == 0 and (step % 10 == 0 or step == warmup_steps + steps - 1):
+        if rank == 0 and (step % 5 == 0 or step == warmup_steps + steps - 1):
             status = "warmup" if step < warmup_steps else "train"
             print(f"  {status} step {step:4d}  loss={loss.item():.6f}  time={step_time:.3f}s", flush=True)
 

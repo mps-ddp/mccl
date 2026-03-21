@@ -236,6 +236,15 @@ def main() -> None:
         f"MCCL_LISTEN_ADDR={os.environ.get('MCCL_LISTEN_ADDR', '(unset)')}",
         flush=True,
     )
+    master_addr = os.environ.get("MASTER_ADDR", "")
+    if master_addr and master_addr not in ("127.0.0.1", "localhost", "::1"):
+        if "MCCL_LISTEN_ADDR" not in os.environ:
+            print(
+                "[ddp_dummy_train] hint: multi-node? set MCCL_LISTEN_ADDR on **each** machine to "
+                "that machine's own IP on the peer link (not MASTER_ADDR). "
+                "Open firewall for MCCL_PORT_BASE..+world_size-1.",
+                flush=True,
+            )
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -271,8 +280,12 @@ def main() -> None:
 
     torch.manual_seed(42 + rank)
 
+    # DDP() runs cross-rank collectives; if one rank is slow/OOM/stuck, others block here.
+    print(f"[ddp_dummy_train] rank {rank}: allocating model on {device}...", flush=True)
     model = build_dummy_classifier().to(device)
+    print(f"[ddp_dummy_train] rank {rank}: wrapping DDP (syncs with other ranks)...", flush=True)
     ddp = DDP(model, find_unused_parameters=False)
+    print(f"[ddp_dummy_train] rank {rank}: DDP wrapper ready", flush=True)
 
     optimizer = torch.optim.AdamW(ddp.parameters(), lr=0.0001, weight_decay=0.01)
     loss_fn = nn.CrossEntropyLoss()

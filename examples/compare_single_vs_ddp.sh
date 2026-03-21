@@ -17,12 +17,9 @@ export BASELINE_BATCH_SIZE="${BASELINE_BATCH_SIZE:-$((BATCH_SIZE * 2))}"
 # Explicit default so a stale shell MCCL_SYNC_MODE=coalesced cannot break multi-bucket runs.
 export MCCL_SYNC_MODE="${MCCL_SYNC_MODE:-full}"
 
-# ~1B-param default (see ddp_dummy_train.py); quick smoke test, e.g.:
-#   MODEL_DEPTH=2 MODEL_HIDDEN=512 BATCH_SIZE=8 bash examples/compare_single_vs_ddp.sh
-export INPUT_DIM="${INPUT_DIM:-2048}"
-export NUM_CLASSES="${NUM_CLASSES:-128}"
-export MODEL_HIDDEN="${MODEL_HIDDEN:-8192}"
-export MODEL_DEPTH="${MODEL_DEPTH:-16}"
+# Model dims: ddp_dummy_train.py defaults to a small MLP (no env needed).
+# For ~1B-param stress: MCCL_STRESS_MODEL=1 bash examples/compare_single_vs_ddp.sh
+# Or set INPUT_DIM, MODEL_HIDDEN, MODEL_DEPTH, NUM_CLASSES explicitly.
 
 echo "=========================================="
 echo "  Single-GPU baseline (no allreduce)"

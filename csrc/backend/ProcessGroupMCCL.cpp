@@ -343,7 +343,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     watchdog_->watch(seq, "allreduce");
     metrics_->op_start(seq, "allreduce", nbytes);
 
-    engine_->run_sync(
+    // MPS sync must run on the PyTorch thread; transport runs on ProgressEngine.
+    sync_mps_for_collective(overlap_comm_);
+
+    engine_->submit(
         [this, tensor_copy, seq, ws, nbytes, red_op]() mutable {
             if (nbytes <= transport_->config().small_msg_threshold) {
                 allreduce_small(tensor_copy, seq, red_op);
@@ -379,8 +382,6 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
     bool use_cpu = (tensor.scalar_type() == at::kFloat) && tensor_cpu_accessible(tensor);
 
     if (use_cpu && !compressor_) {
-        sync_mps_for_collective(overlap_comm_);
-
         MPSBufferView view = extract_mps_buffer(tensor);
         StagingBuffer staged = stage_for_send_nosync(tensor);
         size_t nbytes = view.nbytes;
@@ -439,8 +440,6 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
 
     int left = (rank - 1 + ws) % ws;
     int right = (rank + 1) % ws;
-
-    sync_mps_for_collective(overlap_comm_);
 
     at::Tensor flat = tensor.flatten();
     std::vector<at::Tensor> chunks;
@@ -567,7 +566,6 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
         return;
     }
 
-    sync_mps_for_collective(overlap_comm_);
     size_t nbytes = tensor_nbytes(tensor);
 
     bool use_cpu = (tensor.scalar_type() == at::kFloat) && !compressor_ && tensor_cpu_accessible(tensor);
@@ -675,10 +673,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
     watchdog_->watch(seq, "broadcast");
     metrics_->op_start(seq, "broadcast", nbytes);
 
-    engine_->run_sync(
-        [this, tensor_copy, root, seq, rank, ws]() mutable {
-            sync_mps_for_collective(overlap_comm_);
+    sync_mps_for_collective(overlap_comm_);
 
+    engine_->submit(
+        [this, tensor_copy, root, seq, rank, ws]() mutable {
             if (rank == root) {
                 StagingBuffer staged = stage_for_send_nosync(tensor_copy);
                 for (int peer = 0; peer < ws; peer++) {
@@ -792,10 +790,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
     watchdog_->watch(seq, "allgather");
     metrics_->op_start(seq, "allgather", nbytes * ws);
 
-    engine_->run_sync(
-        [this, input_copy, outputs_copy, seq, rank, ws, nbytes]() mutable {
-            sync_mps_for_collective(overlap_comm_);
+    sync_mps_for_collective(overlap_comm_);
 
+    engine_->submit(
+        [this, input_copy, outputs_copy, seq, rank, ws, nbytes]() mutable {
             bool use_cpu = (input_copy.scalar_type() == at::kFloat) && tensor_cpu_accessible(input_copy);
 
             if (use_cpu) {
@@ -897,10 +895,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
     watchdog_->watch(seq, "reduce_scatter");
     metrics_->op_start(seq, "reduce_scatter", nbytes * ws);
 
-    engine_->run_sync(
-        [this, output_copy, inputs_copy, seq, rank, ws, nbytes, rs_op]() mutable {
-            sync_mps_for_collective(overlap_comm_);
+    sync_mps_for_collective(overlap_comm_);
 
+    engine_->submit(
+        [this, output_copy, inputs_copy, seq, rank, ws, nbytes, rs_op]() mutable {
             int left = (rank - 1 + ws) % ws;
             int right = (rank + 1) % ws;
             bool use_cpu = (inputs_copy[0].scalar_type() == at::kFloat) && tensor_cpu_accessible(inputs_copy[0]);
@@ -997,9 +995,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
     watchdog_->watch(seq, "send");
     metrics_->op_start(seq, "send", nbytes);
 
-    engine_->run_sync(
+    sync_mps_for_collective(overlap_comm_);
+
+    engine_->submit(
         [this, tensor, dstRank, seq, tag, nbytes]() mutable {
-            sync_mps_for_collective(overlap_comm_);
             StagingBuffer staged = stage_for_send_nosync(tensor);
             MCCL_CHECK(transport_->send_chunks(dstRank, OpType::SEND, seq,
                                                static_cast<uint32_t>(tag),
@@ -1049,7 +1048,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
     watchdog_->watch(seq, "recv");
     metrics_->op_start(seq, "recv", nbytes);
 
-    engine_->run_sync(
+    engine_->submit(
         [this, tensor, srcRank, seq, tag, nbytes]() mutable {
             PooledBuffer recv_buf(staging_memory_pool(), nbytes);
             MCCL_CHECK(transport_->recv_chunks(srcRank, OpType::RECV, seq,

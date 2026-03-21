@@ -34,7 +34,7 @@ id<MTLCommandQueue> cached_queue() {
 }
 
 // Staging buffer — reused across calls to avoid repeated allocation.
-// Thread-safety: one collective at a time per process (run_sync caller thread).
+// Thread-safety: one collective at a time per process (ProgressEngine serializes I/O).
 struct StagingPool {
     void* ptr = nullptr;
     size_t capacity = 0;

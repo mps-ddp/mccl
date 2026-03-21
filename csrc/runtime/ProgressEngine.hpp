@@ -19,9 +19,8 @@ struct EngineOp {
     std::function<void(std::exception_ptr)> on_error;
 };
 
-/// Bounded single-thread progress engine (used for ops that do not need the
-/// PyTorch MPS thread, e.g. barrier). Tensor collectives use ``run_sync`` so
-/// ``torch::mps::synchronize`` runs on the caller thread.
+/// Bounded single-thread progress engine. Tensor collectives call MPS sync on the
+/// caller thread, then ``submit`` transport work here (e.g. barrier, allreduce I/O).
 class ProgressEngine {
 public:
     explicit ProgressEngine(size_t max_queue_depth = 1024);
@@ -38,14 +37,6 @@ public:
     uint32_t submit(std::function<void()> execute,
                     std::function<void()> on_complete,
                     std::function<void(std::exception_ptr)> on_error);
-
-    /// Run execute + on_complete (or on_error) on the calling thread.
-    /// Used for ops that call torch::mps::synchronize(): MPS is not safe to
-    /// synchronize from the engine worker thread while the main thread owns
-    /// the stream/command-buffer lifecycle.
-    void run_sync(std::function<void()> execute,
-                  std::function<void()> on_complete,
-                  std::function<void(std::exception_ptr)> on_error);
 
     /// Drain the queue and stop the engine thread.
     void stop();

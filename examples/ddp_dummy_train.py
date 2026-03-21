@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Minimal DDP training on dummy data using MCCL + MPS.
+Minimal DDP training on a **learnable synthetic task** (Gaussian inputs, fixed linear
+labeler) using MCCL + MPS.
 
 Run with torch.distributed.run (``torchrun``). MCCL must be importable on every node.
 
@@ -82,10 +83,14 @@ for 4 per rank × 2 nodes.
    ``MCCL_PORT_BASE`` … ``MCCL_PORT_BASE+1`` (e.g. 29600–29601 if ``MCCL_PORT_BASE=29600``).
 
 Debug: ``export TORCH_DISTRIBUTED_DEBUG=DETAIL`` and ``export PYTHONUNBUFFERED=1``.
+
+**Stats for plots:** ``--save-stats PATH.json`` writes step times and throughput; pair with
+``examples/benchmark_throughput.py`` for ``.npz`` / charts.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -116,6 +121,65 @@ def _model_dims_from_env() -> tuple[int, int, int, int]:
         hidden = int(os.environ.get("MODEL_HIDDEN", "1024"))
         depth = int(os.environ.get("MODEL_DEPTH", "4"))
     return input_dim, num_classes, hidden, depth
+
+
+class SyntheticDataset:
+    """Learnable synthetic labels: sample ``x ~ N(0, 1)``, then ``y = argmax(x @ W^T + b)``.
+
+    ``W`` and ``b`` are fixed (same on every rank) so the task is consistent for DDP.
+    Per-step RNG uses ``1000 + step * world_size + rank`` so each rank sees different ``x``.
+    """
+
+    def __init__(self, input_dim: int, num_classes: int, seed: int = 424242) -> None:
+        g = torch.Generator()
+        g.manual_seed(seed)
+        self.W = torch.randn(num_classes, input_dim, generator=g)
+        self.b = torch.randn(num_classes, generator=g)
+        self.input_dim = input_dim
+        self.num_classes = num_classes
+
+    def get_batch(
+        self,
+        batch_size: int,
+        device: torch.device,
+        step: int,
+        rank: int,
+        world_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        torch.manual_seed(1000 + step * world_size + rank)
+        x = torch.randn(batch_size, self.input_dim, device=device)
+        W = self.W.to(device=device, dtype=x.dtype)
+        b = self.b.to(device=device, dtype=x.dtype)
+        with torch.no_grad():
+            logits = x @ W.T + b
+            y = logits.argmax(dim=-1)
+        return x, y
+
+
+def _write_training_stats(
+    path: str,
+    mode: str,
+    step_times: list[float],
+    losses: list[float],
+    batch_size: int,
+    world_size: int,
+    total_params: int,
+) -> None:
+    avg_time = sum(step_times) / len(step_times) if step_times else 0.0
+    throughput = (batch_size * world_size) / avg_time if avg_time > 0 else 0.0
+    payload = {
+        "mode": mode,
+        "step_times": step_times,
+        "losses": losses,
+        "avg_step_time_s": avg_time,
+        "throughput_samples_per_sec": throughput,
+        "batch_size_per_rank": batch_size,
+        "world_size": world_size,
+        "global_batch_size": batch_size * world_size,
+        "total_params": total_params,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
 
 
 class MultiHeadAttention(nn.Module):
@@ -326,20 +390,8 @@ def build_dummy_classifier() -> nn.Module:
     if depth < 1:
         raise ValueError("MODEL_DEPTH must be >= 1")
     
-    # Use heavy model by default, simple MLP if requested
-    if os.environ.get("MCCL_SIMPLE_MODEL", "").lower() in ("1", "true", "yes"):
-        # Original simple MLP
-        layers: list[nn.Module] = []
-        in_f = input_dim
-        for _ in range(depth):
-            layers.append(nn.Linear(in_f, hidden))
-            layers.append(nn.ReLU())
-            in_f = hidden
-        layers.append(nn.Linear(in_f, num_classes))
-        return nn.Sequential(*layers)
-    else:
-        # Heavy model with conv + attention + MLP
-        return HeavyDummyModel(input_dim, num_classes, hidden, depth)
+    # Always use the heavy model - removed MCCL_SIMPLE_MODEL check for consistency
+    return HeavyDummyModel(input_dim, num_classes, hidden, depth)
 
 
 def _setup_mccl_env() -> None:
@@ -362,7 +414,7 @@ def _apply_thunderbolt_profile_training_defaults() -> None:
     os.environ.setdefault("MCCL_OVERLAP_COMM", "1")
 
 
-def single_gpu_baseline() -> None:
+def single_gpu_baseline(save_stats: str | None = None) -> None:
     """Run single GPU training for comparison (same model + hparams as DDP path)."""
     import time
 
@@ -379,6 +431,7 @@ def single_gpu_baseline() -> None:
     if os.environ.get("BASELINE_BATCH_SIZE"):
         batch_size = int(os.environ["BASELINE_BATCH_SIZE"])
     input_dim, num_classes, _, _ = _model_dims_from_env()
+    dataset = SyntheticDataset(input_dim, num_classes)
 
     total_params = sum(p.numel() for p in model.parameters())
     st = os.environ.get("MCCL_STRESS_MODEL", "").lower() in ("1", "true", "yes")
@@ -397,9 +450,7 @@ def single_gpu_baseline() -> None:
     losses = []
 
     for step in range(warmup_steps + steps):
-        torch.manual_seed(1000 + step)
-        x = torch.randn(batch_size, input_dim, device=device)
-        y = torch.randint(0, num_classes, (batch_size,), device=device)
+        x, y = dataset.get_batch(batch_size, device, step, rank=0, world_size=1)
 
         start_time = time.perf_counter()
 
@@ -436,6 +487,18 @@ def single_gpu_baseline() -> None:
             flush=True,
         )
 
+    if save_stats and step_times:
+        _write_training_stats(
+            save_stats,
+            "baseline",
+            step_times,
+            losses,
+            batch_size,
+            world_size=1,
+            total_params=total_params,
+        )
+        print(f"[ddp_dummy_train] wrote stats to {save_stats}", flush=True)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -446,13 +509,19 @@ def main() -> None:
         action="store_true",
         help="Single-process MPS run (no torchrun); same model/env as DDP for fair comparison.",
     )
+    parser.add_argument(
+        "--save-stats",
+        metavar="PATH",
+        default=None,
+        help="Write timing/loss JSON for examples/benchmark_throughput.py (rank 0 only for DDP).",
+    )
     args = parser.parse_args()
 
     if args.baseline or os.environ.get("SINGLE_GPU"):
         if not torch.backends.mps.is_available():
             print("MPS is not available; this example expects Apple Silicon + MPS.", file=sys.stderr)
             sys.exit(1)
-        single_gpu_baseline()
+        single_gpu_baseline(save_stats=args.save_stats)
         return
 
     if "RANK" not in os.environ:
@@ -526,11 +595,15 @@ def main() -> None:
     )
     print(f"[ddp_dummy_train] rank {rank}: init_process_group done", flush=True)
 
-    torch.manual_seed(42 + rank)
+    # CRITICAL: Use same seed for model initialization across all ranks
+    torch.manual_seed(42)
 
     # DDP() runs cross-rank collectives; if one rank is slow/OOM/stuck, others block here.
     print(f"[ddp_dummy_train] rank {rank}: allocating model on {device}...", flush=True)
     model = build_dummy_classifier().to(device)
+    
+    # Now set different seed per rank for data generation
+    torch.manual_seed(42 + rank)
     print(f"[ddp_dummy_train] rank {rank}: wrapping DDP (syncs with other ranks)...", flush=True)
     # Multi-node: larger buckets (e.g. 75–200) reduce allreduce count and RTT cost.
     bucket_mb = int(os.environ.get("DDP_BUCKET_MB", "25"))
@@ -548,6 +621,7 @@ def main() -> None:
     steps = int(os.environ.get("TRAIN_STEPS", "200"))
     batch_size = int(os.environ.get("BATCH_SIZE", "4"))
     input_dim, num_classes, _, _ = _model_dims_from_env()
+    dataset = SyntheticDataset(input_dim, num_classes)
 
     # Model stats
     total_params = sum(p.numel() for p in model.parameters())
@@ -576,10 +650,8 @@ def main() -> None:
     verbose = os.environ.get("DDP_DUMMY_VERBOSE", "")
 
     for step in range(warmup_steps + steps):
-        # Different data per rank (simulates data sharding)
-        torch.manual_seed(1000 + step * world_size + rank)
-        x = torch.randn(batch_size, input_dim, device=device)
-        y = torch.randint(0, num_classes, (batch_size,), device=device)
+        # Different x per rank; same linear labeler W,b on all ranks (learnable task)
+        x, y = dataset.get_batch(batch_size, device, step, rank, world_size)
 
         start_time = time.perf_counter()
 
@@ -660,6 +732,18 @@ def main() -> None:
                 f"  Throughput: {batch_size * world_size / avg_time:.1f} samples/sec",
                 flush=True,
             )
+
+        if args.save_stats and rank == 0 and step_times:
+            _write_training_stats(
+                args.save_stats,
+                "ddp",
+                step_times,
+                losses,
+                batch_size,
+                world_size,
+                total_params,
+            )
+            print(f"[ddp_dummy_train] wrote stats to {args.save_stats}", flush=True)
 
     # Sanity: parameters stay synced
     head = next(model.parameters()).detach().flatten()[:8].to(device)

@@ -10,9 +10,23 @@
 
 ## Quick start
 
-**Prerequisites:** PyTorch must be installed before installing MCCL. This has been tested with PyTorch nightlies and the latest stable version 2.10.0.
+**Prerequisites:**
+- **macOS with Apple Silicon** (arm64) - Intel Macs are not supported
+- **Xcode Command Line Tools** - Install with `xcode-select --install`
+- **PyTorch** - Must be installed first. Tested with PyTorch nightlies and stable version 2.10.0
+- **Python 3.11+**
+
+**Optional for Metal shader precompilation:**
+- **Full Xcode** (not just command line tools) - Enables `.metallib` precompilation for better performance
 
 ```bash
+# Install Xcode Command Line Tools (required)
+xcode-select --install
+
+# Install PyTorch first
+pip install torch
+
+# Then install MCCL
 pip install -e .
 ```
 

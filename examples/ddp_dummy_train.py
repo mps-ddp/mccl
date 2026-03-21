@@ -48,6 +48,11 @@ Override with env:
 - ``MODEL_HIDDEN`` (default 8192) — width of hidden blocks
 - ``MODEL_DEPTH`` (default 16) — number of ``Linear+ReLU`` hidden blocks
 
+**Smaller model (network / 2-node sanity check)** — ``MCCL_SMALL_MODEL=1`` uses a **few‑M‑param**
+MLP defaults (``INPUT_DIM=512``, ``NUM_CLASSES=64``, ``MODEL_HIDDEN=1024``, ``MODEL_DEPTH=4``)
+unless you override those vars explicitly. Use this to see **shorter steps** and isolate **TCP
+overhead** vs compute; the default large model is still the **stress** profile.
+
 If MPS runs out of memory, lower ``BATCH_SIZE`` (e.g. 2) or reduce ``MODEL_HIDDEN`` / ``MODEL_DEPTH``.
 For a quick smoke test: ``MODEL_DEPTH=2 MODEL_HIDDEN=512 BATCH_SIZE=8``.
 
@@ -100,12 +105,23 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 def _model_dims_from_env() -> tuple[int, int, int, int]:
-    # Defaults ~1B params — large enough that compute dominates communication,
-    # making DDP worthwhile over Thunderbolt links.
-    input_dim = int(os.environ.get("INPUT_DIM", "2048"))
-    num_classes = int(os.environ.get("NUM_CLASSES", "128"))
-    hidden = int(os.environ.get("MODEL_HIDDEN", "8192"))
-    depth = int(os.environ.get("MODEL_DEPTH", "16"))
+    """Return INPUT_DIM, NUM_CLASSES, MODEL_HIDDEN, MODEL_DEPTH from env.
+
+    Default is ~1B-param stress model. ``MCCL_SMALL_MODEL=1`` selects small defaults
+    (few M params) for faster steps and isolating multi-node comm — override any dim
+    explicitly with INPUT_DIM / NUM_CLASSES / MODEL_HIDDEN / MODEL_DEPTH.
+    """
+    small = os.environ.get("MCCL_SMALL_MODEL", "").lower() in ("1", "true", "yes")
+    if small:
+        input_dim = int(os.environ.get("INPUT_DIM", "512"))
+        num_classes = int(os.environ.get("NUM_CLASSES", "64"))
+        hidden = int(os.environ.get("MODEL_HIDDEN", "1024"))
+        depth = int(os.environ.get("MODEL_DEPTH", "4"))
+    else:
+        input_dim = int(os.environ.get("INPUT_DIM", "2048"))
+        num_classes = int(os.environ.get("NUM_CLASSES", "128"))
+        hidden = int(os.environ.get("MODEL_HIDDEN", "8192"))
+        depth = int(os.environ.get("MODEL_DEPTH", "16"))
     return input_dim, num_classes, hidden, depth
 
 
@@ -163,9 +179,10 @@ def single_gpu_baseline() -> None:
     input_dim, num_classes, _, _ = _model_dims_from_env()
 
     total_params = sum(p.numel() for p in model.parameters())
+    sm = os.environ.get("MCCL_SMALL_MODEL", "").lower() in ("1", "true", "yes")
     print(
         f"Single GPU baseline | device={device}\n"
-        f"  Model: {total_params:,} params\n"
+        f"  Model: {total_params:,} params{'  MCCL_SMALL_MODEL' if sm else ''}\n"
         f"  Batch: {batch_size} (set BASELINE_BATCH_SIZE=global_batch to match DDP)\n"
         f"  Steps: {steps}\n"
         f"  INPUT_DIM={input_dim} NUM_CLASSES={num_classes} "
@@ -334,10 +351,12 @@ def main() -> None:
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+    small_flag = os.environ.get("MCCL_SMALL_MODEL", "").lower() in ("1", "true", "yes")
     if rank == 0:
         print(
             f"DDP training | world_size={world_size} device={device}\n"
-            f"  Model: {total_params:,} params ({trainable_params:,} trainable)\n"
+            f"  Model: {total_params:,} params ({trainable_params:,} trainable)"
+            f"{'  MCCL_SMALL_MODEL' if small_flag else ''}\n"
             f"  Batch: {batch_size} per rank ({batch_size * world_size} global)\n"
             f"  Steps: {steps}  bucket_cap_mb={bucket_mb}"
             f"{'  autocast_fp16' if use_autocast else ''}\n"

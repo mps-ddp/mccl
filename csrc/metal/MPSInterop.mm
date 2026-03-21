@@ -4,6 +4,7 @@
 #import <torch/mps.h>
 
 #include <cstdlib>
+#include <algorithm>
 
 #include "metal/MPSInterop.hpp"
 #include "metal/EventSync.hpp"
@@ -33,6 +34,13 @@ id<MTLCommandQueue> cached_queue() {
     return q;
 }
 
+size_t metal_max_buffer_len() {
+    static size_t max_len = static_cast<size_t>([cached_device() maxBufferLength]);
+    return max_len;
+}
+
+constexpr size_t PAGE = 16384;
+
 // Staging buffer — reused across calls to avoid repeated allocation.
 // Thread-safety: one collective at a time per process (ProgressEngine serializes I/O).
 struct StagingPool {
@@ -46,17 +54,21 @@ struct StagingPool {
             free(ptr);
             ptr = nullptr;
 
-            size_t page = 16384;
-            capacity = ((nbytes + (nbytes >> 2)) + page - 1) & ~(page - 1);
-            int rc = posix_memalign(&ptr, page, capacity);
+            capacity = (nbytes + PAGE - 1) & ~(PAGE - 1);
+            int rc = posix_memalign(&ptr, PAGE, capacity);
             MCCL_CHECK(rc == 0 && ptr != nullptr, "Staging buffer allocation failed");
 
-            // Pre-create the MTLBuffer wrapper once (avoids per-call churn)
-            mtl_wrapper = [device newBufferWithBytesNoCopy:ptr
-                                                   length:capacity
-                                                  options:MTLResourceStorageModeShared
-                                              deallocator:nil];
-            MCCL_CHECK(mtl_wrapper != nil, "Staging MTLBuffer creation failed");
+            size_t max_buf = metal_max_buffer_len();
+            if (capacity <= max_buf) {
+                mtl_wrapper = [device newBufferWithBytesNoCopy:ptr
+                                                       length:capacity
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:nil];
+                MCCL_CHECK(mtl_wrapper != nil, "Staging MTLBuffer creation failed");
+            } else {
+                MCCL_INFO("Staging pool %zu bytes exceeds maxBufferLength %zu; using chunked blits",
+                          capacity, max_buf);
+            }
             MCCL_DEBUG("Staging pool resized to %zu bytes (page-aligned)", capacity);
         }
         return ptr;
@@ -71,6 +83,101 @@ struct StagingPool {
 StagingPool& staging_pool() {
     static StagingPool pool;
     return pool;
+}
+
+/// Blit from GPU buffer into CPU staging, handling buffers larger than maxBufferLength
+/// by chunking into multiple blit commands with temporary MTLBuffer wrappers.
+void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
+                              void* dst, size_t nbytes) {
+    StagingPool& pool = staging_pool();
+    if (pool.mtl_wrapper && nbytes <= pool.capacity) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+            [blit copyFromBuffer:src_buf sourceOffset:src_offset
+                        toBuffer:pool.mtl_wrapper destinationOffset:0
+                            size:nbytes];
+            [blit endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+        return;
+    }
+
+    size_t max_chunk = metal_max_buffer_len();
+    size_t offset = 0;
+    uint8_t* dst_bytes = static_cast<uint8_t*>(dst);
+
+    while (offset < nbytes) {
+        size_t chunk = std::min(max_chunk, nbytes - offset);
+        size_t aligned_chunk = (chunk + PAGE - 1) & ~(PAGE - 1);
+
+        @autoreleasepool {
+            id<MTLBuffer> chunk_mtl = [cached_device()
+                newBufferWithBytesNoCopy:dst_bytes + offset
+                length:aligned_chunk
+                options:MTLResourceStorageModeShared
+                deallocator:nil];
+            MCCL_CHECK(chunk_mtl != nil, "chunked_blit_to_staging: MTLBuffer wrap failed");
+
+            id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+            [blit copyFromBuffer:src_buf sourceOffset:src_offset + offset
+                        toBuffer:chunk_mtl destinationOffset:0
+                            size:chunk];
+            [blit endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+        offset += chunk;
+    }
+}
+
+/// Blit from CPU staging into GPU buffer, chunked for large buffers.
+void chunked_blit_from_staging(const void* src, size_t nbytes,
+                                id<MTLBuffer> dst_buf, size_t dst_offset) {
+    StagingPool& pool = staging_pool();
+    if (src == pool.ptr && pool.mtl_wrapper && nbytes <= pool.capacity) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+            [blit copyFromBuffer:pool.mtl_wrapper sourceOffset:0
+                        toBuffer:dst_buf destinationOffset:dst_offset
+                            size:nbytes];
+            [blit endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+        return;
+    }
+
+    size_t max_chunk = metal_max_buffer_len();
+    size_t offset = 0;
+    const uint8_t* src_bytes = static_cast<const uint8_t*>(src);
+
+    while (offset < nbytes) {
+        size_t chunk = std::min(max_chunk, nbytes - offset);
+        size_t aligned_chunk = (chunk + PAGE - 1) & ~(PAGE - 1);
+
+        @autoreleasepool {
+            id<MTLBuffer> chunk_mtl = [cached_device()
+                newBufferWithBytesNoCopy:const_cast<uint8_t*>(src_bytes + offset)
+                length:aligned_chunk
+                options:MTLResourceStorageModeShared
+                deallocator:nil];
+            MCCL_CHECK(chunk_mtl != nil, "chunked_blit_from_staging: MTLBuffer wrap failed");
+
+            id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+            [blit copyFromBuffer:chunk_mtl sourceOffset:0
+                        toBuffer:dst_buf destinationOffset:dst_offset + offset
+                            size:chunk];
+            [blit endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+        offset += chunk;
+    }
 }
 
 } // anonymous namespace
@@ -90,8 +197,6 @@ at::Tensor ensure_shared_storage(const at::Tensor& tensor) {
     id<MTLBuffer> src_buf = at::mps::getMTLBufferStorage(tensor);
     size_t src_offset = static_cast<size_t>(tensor.storage_offset()) * tensor.element_size();
 
-    // Allocate page-aligned buffer and wrap as shared MTLBuffer (same as StagingPool).
-    constexpr size_t PAGE = 16384;
     size_t alloc_size = (nbytes + PAGE - 1) & ~(PAGE - 1);
 
     void* ptr = nullptr;
@@ -99,27 +204,10 @@ at::Tensor ensure_shared_storage(const at::Tensor& tensor) {
     MCCL_CHECK(rc == 0 && ptr != nullptr,
                "ensure_shared_storage: posix_memalign failed for " + std::to_string(alloc_size) + " bytes");
 
-    id<MTLBuffer> dst_mtl = [cached_device()
-        newBufferWithBytesNoCopy:ptr
-        length:alloc_size
-        options:MTLResourceStorageModeShared
-        deallocator:nil];
-    MCCL_CHECK(dst_mtl != nil, "ensure_shared_storage: MTLBuffer wrap failed");
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
-        id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-        [blit copyFromBuffer:src_buf sourceOffset:src_offset
-                    toBuffer:dst_mtl destinationOffset:0
-                        size:nbytes];
-        [blit endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
-    }
+    chunked_blit_to_staging(src_buf, src_offset, ptr, nbytes);
 
     MCCL_DEBUG("ensure_shared_storage: blit %zu bytes from private to shared", nbytes);
 
-    // Wrap the page-aligned buffer as a CPU tensor with a custom deleter.
     auto deleter = [](void* p) { free(p); };
     auto storage = c10::Storage(
         c10::Storage::use_byte_size_t(),
@@ -235,7 +323,6 @@ void mps_event_sync() {
 StagingBuffer stage_for_send(const at::Tensor& tensor) {
     check_single_tensor(tensor);
 
-    // Flush PyTorch MPS stream and drain any pending MCCL compute work
     mps_stream_sync();
     mccl_queue_drain();
 
@@ -246,25 +333,12 @@ StagingBuffer stage_for_send(const at::Tensor& tensor) {
         return StagingBuffer{view.cpu_ptr, view.nbytes};
     }
 
-    // Fallback: blit to staging buffer
     MCCL_DEBUG("stage_for_send: blit fallback for %zu bytes", view.nbytes);
 
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
     StagingPool& pool = staging_pool();
     void* staging = pool.ensure(view.nbytes, cached_device());
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
-        id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-        [blit copyFromBuffer:src_buf
-                sourceOffset:view.byte_offset
-                    toBuffer:pool.mtl_wrapper
-           destinationOffset:0
-                        size:view.nbytes];
-        [blit endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
-    }
+    chunked_blit_to_staging(src_buf, view.byte_offset, staging, view.nbytes);
 
     return StagingBuffer{staging, view.nbytes};
 }
@@ -279,25 +353,12 @@ StagingBuffer stage_for_send_nosync(const at::Tensor& tensor) {
         return StagingBuffer{view.cpu_ptr, view.nbytes};
     }
 
-    // Fallback: blit to staging buffer (still needs queue sync for the blit itself)
     MCCL_DEBUG("stage_for_send_nosync: blit fallback for %zu bytes", view.nbytes);
 
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
     StagingPool& pool = staging_pool();
     void* staging = pool.ensure(view.nbytes, cached_device());
-
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
-        id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-        [blit copyFromBuffer:src_buf
-                sourceOffset:view.byte_offset
-                    toBuffer:pool.mtl_wrapper
-           destinationOffset:0
-                        size:view.nbytes];
-        [blit endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
-    }
+    chunked_blit_to_staging(src_buf, view.byte_offset, staging, view.nbytes);
 
     return StagingBuffer{staging, view.nbytes};
 }
@@ -315,50 +376,20 @@ void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes)
         return;
     }
 
-    // Fallback: blit from staging into GPU buffer
     MCCL_DEBUG("unstage_from_recv: blit fallback for %zu bytes", nbytes);
 
     id<MTLBuffer> dst_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
 
-    // For unstage, we need to wrap the source pointer.
-    // Use the staging pool if the pointer is our pool, otherwise wrap fresh.
+    // Ensure staging pool has the data (may need to copy if src isn't the pool)
     StagingPool& pool = staging_pool();
-    id<MTLBuffer> src_mtl = nil;
-
-    if (src == pool.ptr && pool.mtl_wrapper && nbytes <= pool.capacity) {
-        src_mtl = pool.mtl_wrapper;
-    } else {
-        // Page-align check: newBufferWithBytesNoCopy requires page-aligned ptr
-        // If not page-aligned, do a plain memcpy to the staging pool first
-        uintptr_t addr = reinterpret_cast<uintptr_t>(src);
-        if ((addr & 0x3FFF) != 0) {
-            void* aligned = pool.ensure(nbytes, cached_device());
-            memcpy(aligned, src, nbytes);
-            src_mtl = pool.mtl_wrapper;
-        } else {
-            size_t page = 16384;
-            size_t aligned_len = (nbytes + page - 1) & ~(page - 1);
-            src_mtl = [cached_device()
-                newBufferWithBytesNoCopy:const_cast<void*>(src)
-                length:aligned_len
-                options:MTLResourceStorageModeShared
-                deallocator:nil];
-            MCCL_CHECK(src_mtl != nil, "newBufferWithBytesNoCopy failed for unstage buffer");
-        }
+    const void* blit_src = src;
+    if (src != pool.ptr) {
+        void* staging = pool.ensure(nbytes, cached_device());
+        memcpy(staging, src, nbytes);
+        blit_src = staging;
     }
 
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
-        id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-        [blit copyFromBuffer:src_mtl
-                sourceOffset:0
-                    toBuffer:dst_buf
-           destinationOffset:view.byte_offset
-                        size:nbytes];
-        [blit endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
-    }
+    chunked_blit_from_staging(blit_src, nbytes, dst_buf, view.byte_offset);
 }
 
 } // namespace mccl

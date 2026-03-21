@@ -61,6 +61,12 @@ void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes)
 /// Performs a lightweight runtime check (no sync, no copy).
 bool tensor_cpu_accessible(const at::Tensor& tensor);
 
+/// If the tensor uses private Metal storage, copy it into a new tensor
+/// backed by shared (cpu_accessible) storage and return that. If already
+/// shared, returns the original tensor with no copy. Caller must have
+/// already synced MPS before calling (data must be committed to the buffer).
+at::Tensor ensure_shared_storage(const at::Tensor& tensor);
+
 /// Get the default MTLDevice as void* (id<MTLDevice>).
 void* get_mtl_device();
 

@@ -81,6 +81,63 @@ bool tensor_cpu_accessible(const at::Tensor& tensor) {
     return buffer != nil && buffer.storageMode == MTLStorageModeShared;
 }
 
+at::Tensor ensure_shared_storage(const at::Tensor& tensor) {
+    if (tensor.is_cpu() || tensor_cpu_accessible(tensor)) {
+        return tensor;
+    }
+
+    // Private storage: create a CPU tensor (shared/unified memory) and blit into it.
+    // CPU tensors use page-aligned malloc which is compatible with Metal shared buffers.
+    at::Tensor shared = torch::empty(tensor.sizes(), tensor.options().device(at::kCPU));
+    size_t nbytes = static_cast<size_t>(tensor.numel()) * tensor.element_size();
+
+    id<MTLBuffer> src_buf = at::mps::getMTLBufferStorage(tensor);
+    size_t src_offset = static_cast<size_t>(tensor.storage_offset()) * tensor.element_size();
+
+    void* dst_ptr = shared.data_ptr();
+    size_t page = 16384;
+    size_t aligned_len = (nbytes + page - 1) & ~(page - 1);
+
+    id<MTLBuffer> dst_mtl = [cached_device()
+        newBufferWithBytesNoCopy:dst_ptr
+        length:aligned_len
+        options:MTLResourceStorageModeShared
+        deallocator:nil];
+
+    if (!dst_mtl) {
+        // Alignment issue — fall back to staging pool
+        StagingPool& pool = staging_pool();
+        void* staging = pool.ensure(nbytes, cached_device());
+
+        @autoreleasepool {
+            id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+            [blit copyFromBuffer:src_buf sourceOffset:src_offset
+                        toBuffer:pool.mtl_wrapper destinationOffset:0
+                            size:nbytes];
+            [blit endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+        memcpy(dst_ptr, staging, nbytes);
+        return shared;
+    }
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+        [blit copyFromBuffer:src_buf sourceOffset:src_offset
+                    toBuffer:dst_mtl destinationOffset:0
+                        size:nbytes];
+        [blit endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+
+    MCCL_DEBUG("ensure_shared_storage: blit %zu bytes from private to shared", nbytes);
+    return shared;
+}
+
 void* get_mtl_device() {
     return (__bridge void*)cached_device();
 }

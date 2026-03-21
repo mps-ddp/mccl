@@ -374,24 +374,41 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
 
     auto sync_t0 = std::chrono::steady_clock::now();
     sync_mps_for_collective(overlap_comm_);
+
+    // Convert private-storage tensors to shared storage so the fast CPU path
+    // fires (overlapped TCP + AMX reduce, zero blits during allreduce).
+    // This blit happens once here; all subsequent access is zero-copy.
+    at::Tensor shared_tensor = ensure_shared_storage(tensor_copy);
+    bool promoted = !tensor_cpu_accessible(tensor_copy) && tensor_cpu_accessible(shared_tensor);
+
     auto sync_t1 = std::chrono::steady_clock::now();
     double sync_ms = std::chrono::duration<double, std::milli>(sync_t1 - sync_t0).count();
     metrics_->record_phase(seq, sync_ms, 0, 0);
 
+    // Capture the original tensor so we can copy back after allreduce if promoted
+    auto orig_tensor = tensor_copy;
+
     engine_->submit(
-        [this, tensor_copy, seq, ws, nbytes, red_op]() mutable {
+        [this, shared_tensor, orig_tensor, promoted, seq, ws, nbytes, red_op]() mutable {
             const char* algo = "unknown";
             if (nbytes <= transport_->config().small_msg_threshold) {
                 algo = "small";
-                allreduce_small(tensor_copy, seq, red_op);
+                allreduce_small(shared_tensor, seq, red_op);
             } else if (ws == 2) {
                 algo = "two_rank";
-                allreduce_two_rank(tensor_copy, seq, red_op);
+                allreduce_two_rank(shared_tensor, seq, red_op);
             } else {
                 algo = "ring";
-                allreduce_ring(tensor_copy, seq, red_op);
+                allreduce_ring(shared_tensor, seq, red_op);
             }
-            MCCL_INFO("allreduce seq=%u: algo=%s nbytes=%zu", seq, algo, nbytes);
+
+            // Copy reduced result back to original MPS tensor if we promoted
+            if (promoted) {
+                unstage_from_recv(orig_tensor, shared_tensor.data_ptr(),
+                                  static_cast<size_t>(shared_tensor.numel()) * shared_tensor.element_size());
+            }
+
+            MCCL_INFO("allreduce seq=%u: algo=%s nbytes=%zu promoted=%d", seq, algo, nbytes, (int)promoted);
         },
         [this, work_ptr, seq]() {
             unregister_work(seq);

@@ -162,7 +162,18 @@ void mps_sync() {
 }
 
 void mps_event_sync() {
-    if (event_sync_available()) {
+    static const bool force_stream_sync = [] {
+        auto* v = std::getenv("MCCL_EVENT_SYNC");
+        if (v && (std::string(v) == "0" || std::string(v) == "false" ||
+                  std::string(v) == "no")) {
+            MCCL_WARN("MCCL_EVENT_SYNC=0: MTLSharedEvent path disabled, "
+                       "falling back to mps_stream_sync");
+            return true;
+        }
+        return false;
+    }();
+
+    if (!force_stream_sync && event_sync_available()) {
         uint64_t val = next_event_value();
         commit_mps_and_signal(val);
         wait_for_mps(val);

@@ -102,21 +102,28 @@ void commit_mps_and_signal(uint64_t value) {
     MCCL_CHECK(s.initialized, "EventSync not initialized");
 
     @autoreleasepool {
-        // Encode a GPU-side signal on the current MPS command buffer, then
-        // flush it non-blocking.  This lets the MPS dispatch queue accept new
-        // work (e.g. the next DDP bucket's backward kernels) immediately,
-        // while we spin-wait for the signal in wait_for_mps().
+        // The entire sequence — flush active encoder, get a fresh command
+        // buffer, encode the signal, and commit the signal buffer — must
+        // happen atomically on PyTorch's MPS dispatch queue.  If any step
+        // runs outside the queue, another thread (e.g. autograd encoding
+        // backward kernels) can start a new encoder between our encode and
+        // commit, triggering Metal's "commit command buffer with uncommitted
+        // encoder" assertion.
         dispatch_queue_t queue =
             (dispatch_queue_t)torch::mps::get_dispatch_queue();
         __block id<MTLSharedEvent> event = s.mps_event;
         __block uint64_t val = value;
         dispatch_sync(queue, ^{
             torch::mps::commit();
+
             id<MTLCommandBuffer> cmd =
                 (id<MTLCommandBuffer>)torch::mps::get_command_buffer();
+            MCCL_CHECK(cmd != nil,
+                       "get_command_buffer() returned nil in commit_mps_and_signal");
             [cmd encodeSignalEvent:event value:val];
+
+            torch::mps::commit();
         });
-        torch::mps::commit();
     }
 }
 

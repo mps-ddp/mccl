@@ -122,6 +122,14 @@ ProcessGroupMCCL::ProcessGroupMCCL(
         MCCL_INFO("  gpu_threshold       = %s", gt ? gt : "4096");
     }
     MCCL_INFO("  overlap_comm        = %s", overlap_comm_ ? "on" : "off");
+    {
+        const char* es = std::getenv("MCCL_EVENT_SYNC");
+        bool es_off = es && (std::string(es) == "0" || std::string(es) == "false" ||
+                             std::string(es) == "no");
+        MCCL_INFO("  event_sync          = %s",
+                   es_off ? "off (env)" :
+                   event_sync_available() ? "on" : "off (unavailable)");
+    }
     MCCL_INFO("  compression         = %s", compressor_ ? compressor_->name().c_str() : "none");
     if (compressor_ && comp_mode == CompressionMode::TOPK) {
         MCCL_INFO("  topk_ratio          = %.4f", topk_ratio);

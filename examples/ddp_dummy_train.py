@@ -39,19 +39,20 @@ Machine B::
         --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \\
         examples/ddp_dummy_train.py
 
-**Model size** — defaults target **~100M+ parameters** so each step does enough matmul that
-communication is not the whole story (multi-node / multi-GPU DDP is more meaningful at this scale).
+**Model size** — defaults target **~1B parameters** so forward/backward takes ~1-2s per step,
+making DDP communication overhead a smaller fraction and distributed training worthwhile.
 Override with env:
 
 - ``INPUT_DIM`` (default 2048)
 - ``NUM_CLASSES`` (default 128)
-- ``MODEL_HIDDEN`` (default 4096) — width of hidden blocks
-- ``MODEL_DEPTH`` (default 8) — number of ``Linear+ReLU`` hidden blocks
+- ``MODEL_HIDDEN`` (default 8192) — width of hidden blocks
+- ``MODEL_DEPTH`` (default 16) — number of ``Linear+ReLU`` hidden blocks
 
-If MPS runs out of memory, lower ``BATCH_SIZE`` (e.g. 8–16) or reduce ``MODEL_HIDDEN`` / ``MODEL_DEPTH``.
+If MPS runs out of memory, lower ``BATCH_SIZE`` (e.g. 2) or reduce ``MODEL_HIDDEN`` / ``MODEL_DEPTH``.
+For a quick smoke test: ``MODEL_DEPTH=2 MODEL_HIDDEN=512 BATCH_SIZE=8``.
 
 Optional env (see MCCL docs): ``MCCL_LISTEN_ADDR``, ``MCCL_PORT_BASE``, ``MCCL_TRANSPORT``.
-Training env: ``TRAIN_STEPS`` (default 30), ``BATCH_SIZE`` (default 16 per rank).
+Training env: ``TRAIN_STEPS`` (default 30), ``BATCH_SIZE`` (default 4 per rank).
 
 **Why it looks like a "hang"**
 
@@ -89,11 +90,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 def _model_dims_from_env() -> tuple[int, int, int, int]:
-    # Defaults ~126M params — heavy enough that DDP/comm overhead is a smaller slice of step time.
+    # Defaults ~1B params — large enough that compute dominates communication,
+    # making DDP worthwhile over Thunderbolt links.
     input_dim = int(os.environ.get("INPUT_DIM", "2048"))
     num_classes = int(os.environ.get("NUM_CLASSES", "128"))
-    hidden = int(os.environ.get("MODEL_HIDDEN", "4096"))
-    depth = int(os.environ.get("MODEL_DEPTH", "8"))
+    hidden = int(os.environ.get("MODEL_HIDDEN", "8192"))
+    depth = int(os.environ.get("MODEL_DEPTH", "16"))
     return input_dim, num_classes, hidden, depth
 
 
@@ -137,7 +139,7 @@ def single_gpu_baseline() -> None:
     loss_fn = nn.CrossEntropyLoss()
 
     steps = int(os.environ.get("TRAIN_STEPS", "30"))
-    batch_size = int(os.environ.get("BATCH_SIZE", "16"))
+    batch_size = int(os.environ.get("BATCH_SIZE", "4"))
     input_dim, num_classes, _, _ = _model_dims_from_env()
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -294,7 +296,7 @@ def main() -> None:
     loss_fn = nn.CrossEntropyLoss()
 
     steps = int(os.environ.get("TRAIN_STEPS", "30"))
-    batch_size = int(os.environ.get("BATCH_SIZE", "16"))
+    batch_size = int(os.environ.get("BATCH_SIZE", "4"))
     input_dim, num_classes, _, _ = _model_dims_from_env()
 
     # Model stats

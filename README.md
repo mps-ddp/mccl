@@ -4,7 +4,7 @@
 
 ## Performance Reality
 
-**Current performance:** With **small models**, expect on the order of **~10× slower** than single-GPU training — communication dominates. With **larger networks** (e.g. the conv + attention example in `examples/ddp_dummy_train.py`), **2-rank DDP** often lands around **~2.5–3× lower throughput** than a **fair single-MPS baseline** at the **same global batch** (e.g. ~96M params, global batch 8: ~60 vs ~23 samples/s in one run — use `examples/benchmark_throughput.py` to reproduce on your hardware). This is still not a net speedup versus one fast GPU for most workloads today.
+**Current performance:** **2-rank DDP** is usually **slower** than training on **one** MPS device at the **same global batch** — communication and sync eat time. On **larger networks** (e.g. the conv + attention example in `examples/ddp_dummy_train.py`), a fair baseline vs DDP comparison often shows on the order of **~2.5–3× lower DDP throughput** (e.g. ~96M params, global batch 8: ~60 vs ~23 samples/s in one run — use `examples/benchmark_throughput.py` to reproduce). With **tiny** models, the gap can be **much larger** because compute is cheap and the network stack dominates. This is still not a net speedup versus one fast GPU for most workloads today.
 
 **Future potential:** Performance could be significantly improved with additional work on RDMA over Thunderbolt 5, better collective routing algorithms from PyTorch, or other transport optimizations.
 

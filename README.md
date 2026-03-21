@@ -40,7 +40,7 @@ dist.init_process_group(backend="mccl", rank=rank, world_size=world_size)
 
 https://github.com/user-attachments/assets/21865149-b077-4b65-93cc-f9e319ff0328
 
-
+**Note:** While the demo shows Thunderbolt, MCCL also works over Ethernet and Wi-Fi networks, though transport speeds will be significantly slower than Thunderbolt connections.
 
 **Tested:** M1 Max + M4 Max MacBook Pro, Thunderbolt 3, macOS 14–15, PyTorch 2.5+.
 

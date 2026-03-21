@@ -24,12 +24,7 @@ dist.init_process_group(backend="mccl", rank=rank, world_size=world_size)
 # Use standard DDP on MPS tensors
 ```
 
-**Demo:** See distributed training in action over Thunderbolt:
-
-<video width="800" controls>
-  <source src="https://raw.githubusercontent.com/mps-ddp/mccl/master/mccl-demo.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+**Demo:** [📹 Watch distributed training across two Macs](https://github.com/mps-ddp/mccl/raw/master/mccl-demo.mp4) - see MCCL in action over Thunderbolt
 
 **Tested:** M1 Max + M4 Max MacBook Pro, Thunderbolt 3, macOS 14–15, PyTorch 2.5+.
 

@@ -58,6 +58,10 @@ void Connection::configure_socket() {
         int bufsize = 16 * 1024 * 1024;
         if (auto* v = std::getenv("MCCL_SOCK_BUFSIZE")) {
             bufsize = std::atoi(v);
+        } else {
+            const char* prof = std::getenv("MCCL_LINK_PROFILE");
+            if (prof && std::strcmp(prof, "thunderbolt") == 0)
+                bufsize = 32 * 1024 * 1024;
         }
         if (bufsize > 0) {
             setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));

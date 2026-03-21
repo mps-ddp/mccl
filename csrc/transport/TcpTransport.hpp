@@ -19,7 +19,7 @@ struct TransportConfig {
     std::string listen_addr = "0.0.0.0";
     uint16_t port_base = 29600;
     std::string ifname;              // MCCL_IFNAME — advisory interface hint
-    size_t chunk_bytes = 4 * 1024 * 1024;  // 4 MB default chunk
+    size_t chunk_bytes = 4 * 1024 * 1024;  // 4 MB default; >=16 MB if MCCL_LINK_PROFILE=thunderbolt and MCCL_CHUNK_BYTES unset
     size_t small_msg_threshold = 65536;     // 64 KB
     std::chrono::milliseconds connect_timeout{30000};
     std::chrono::milliseconds heartbeat_interval{5000};

@@ -99,6 +99,7 @@ Python config takes priority when `mccl.init()` is called before `init_process_g
 | `MCCL_TRANSPORT` | `transport` | `auto` | Transport mode: `auto`, `tcp`, `rdma` |
 | `MCCL_LOG_LEVEL` | `log_level` | `WARN` | TRACE, DEBUG, INFO, WARN, ERROR, FATAL, OFF |
 | `MCCL_LISTEN_ADDR` | `listen_addr` | auto-detect | Bind address (auto-detects Thunderbolt bridge) |
+| `MCCL_LINK_PROFILE` | — | (unset) | Set to `thunderbolt` for production TCP defaults on TB links: larger default socket buffers and chunk size (see `Connection.cpp`, `TcpTransport.cpp`) |
 | `MCCL_PORT_BASE` | `port_base` | `29600` | Base port (rank N listens on port_base + N). **Must differ from `MASTER_PORT`** (PyTorch’s TCP store uses `MASTER_PORT` on the master; default `29600` avoids colliding with typical `MASTER_PORT=29500`). |
 | `MCCL_IFNAME` | `ifname` | (auto) | Advisory network interface hint |
 | `MCCL_CHUNK_BYTES` | `chunk_bytes` | `4194304` | Chunk size for CRC-enabled transport |

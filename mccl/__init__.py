@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from mccl.version import __version__, COMPATIBILITY_MATRIX
 from mccl.config import MCCLConfig
+from mccl.tuning import apply_thunderbolt_production_defaults
 
 import platform
 import warnings
@@ -154,4 +155,5 @@ __all__ = [
     "get_metrics",
     "log_metrics",
     "reset_metrics",
+    "apply_thunderbolt_production_defaults",
 ]

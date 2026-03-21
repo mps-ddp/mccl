@@ -24,7 +24,8 @@ namespace {
 /// Returns the IP address string if found, empty string otherwise.
 /// Looks for interfaces named "bridge*" or "en*" with link-local 169.254.x.x
 /// addresses, which is the typical Thunderbolt bridge configuration on macOS.
-std::string detect_thunderbolt_bridge() {
+/// If ``out_ifname`` is non-null, writes the chosen interface name.
+std::string detect_thunderbolt_bridge(std::string* out_ifname = nullptr) {
     struct ifaddrs* iflist = nullptr;
     if (getifaddrs(&iflist) != 0) return "";
 
@@ -65,6 +66,7 @@ std::string detect_thunderbolt_bridge() {
     if (!best_addr.empty()) {
         MCCL_INFO("Auto-detected Thunderbolt bridge: %s on %s",
                   best_addr.c_str(), best_ifname.c_str());
+        if (out_ifname) *out_ifname = best_ifname;
     }
 
     return best_addr;
@@ -102,6 +104,21 @@ std::string resolve_best_local_addr(std::string& out_ifname, bool& out_subnet_ma
 
     const char* master_env = std::getenv("MASTER_ADDR");
     uint32_t master_ip = master_env ? resolve_ipv4(master_env) : 0;
+
+    // MASTER_ADDR on 169.254.x.x (typical Thunderbolt IP between two Macs):
+    // always publish the TB bridge address so a multi-homed machine does not
+    // advertise Wi‑Fi/LAN to peers that only route via the bridge.
+    if (master_ip != 0 && ((master_ip >> 16) == 0xA9FE)) {
+        std::string tb_if;
+        std::string tb_addr = detect_thunderbolt_bridge(&tb_if);
+        if (!tb_addr.empty()) {
+            out_ifname = tb_if;
+            out_subnet_match = true;
+            MCCL_INFO("Link-local MASTER_ADDR: publishing Thunderbolt endpoint %s on %s",
+                      tb_addr.c_str(), tb_if.c_str());
+            return tb_addr;
+        }
+    }
 
     struct ifaddrs* iflist = nullptr;
     if (getifaddrs(&iflist) != 0) return "";
@@ -159,6 +176,8 @@ std::string resolve_best_local_addr(std::string& out_ifname, bool& out_subnet_ma
 TransportConfig TransportConfig::from_env() {
     TransportConfig cfg;
 
+    const bool chunk_bytes_explicit = (std::getenv("MCCL_CHUNK_BYTES") != nullptr);
+
     if (auto* v = std::getenv("MCCL_TRANSPORT"))     cfg.transport = v;
     if (auto* v = std::getenv("MCCL_LISTEN_ADDR"))   cfg.listen_addr = v;
     if (auto* v = std::getenv("MCCL_PORT_BASE"))     cfg.port_base = static_cast<uint16_t>(std::atoi(v));
@@ -182,6 +201,18 @@ TransportConfig TransportConfig::from_env() {
 
     cfg.chunk_bytes = std::max(cfg.chunk_bytes, size_t(4096));
     cfg.small_msg_threshold = std::max(cfg.small_msg_threshold, size_t(256));
+
+    // Production-oriented defaults for direct Thunderbolt IP (high bandwidth,
+    // multi-GB messages). Opt-in via MCCL_LINK_PROFILE=thunderbolt.
+    if (!chunk_bytes_explicit) {
+        const char* prof = std::getenv("MCCL_LINK_PROFILE");
+        if (prof && std::string(prof) == "thunderbolt") {
+            cfg.chunk_bytes = std::max(cfg.chunk_bytes, size_t(16) * 1024 * 1024);
+            MCCL_INFO("MCCL_LINK_PROFILE=thunderbolt: using chunk_bytes=%zu (set "
+                      "MCCL_CHUNK_BYTES to override)",
+                      cfg.chunk_bytes);
+        }
+    }
 
     return cfg;
 }

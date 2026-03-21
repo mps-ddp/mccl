@@ -51,9 +51,10 @@ Override with env:
 If MPS runs out of memory, lower ``BATCH_SIZE`` (e.g. 2) or reduce ``MODEL_HIDDEN`` / ``MODEL_DEPTH``.
 For a quick smoke test: ``MODEL_DEPTH=2 MODEL_HIDDEN=512 BATCH_SIZE=8``.
 
-Optional env (see MCCL docs): ``MCCL_LISTEN_ADDR``, ``MCCL_PORT_BASE``, ``MCCL_TRANSPORT``.
+Optional env (see MCCL docs): ``MCCL_LISTEN_ADDR``, ``MCCL_PORT_BASE``, ``MCCL_TRANSPORT``,
+``MCCL_LINK_PROFILE=thunderbolt`` (production TCP tuning on Thunderbolt IP — see ``scripts/thunderbolt_prod.sh``).
 Training env: ``TRAIN_STEPS`` (default 30), ``BATCH_SIZE`` (default 4 per rank),
-``DDP_BUCKET_MB`` (default 25; try **50–200** for 2-node to cut TCP round-trips),
+``DDP_BUCKET_MB`` (default 25; **512** if ``MCCL_LINK_PROFILE=thunderbolt`` and unset; else try **50–200+** for 2-node),
 ``TRAIN_AUTOCAST_FP16=1`` for ``torch.autocast`` fp16 forward+loss (smaller/faster on MPS),
 ``MCCL_COMPRESSION=fp16`` when supported (halves cross-host bytes).
 
@@ -133,6 +134,14 @@ def _setup_mccl_env() -> None:
     master = os.environ.get("MASTER_ADDR", "")
     if master in ("127.0.0.1", "localhost", "::1") and "MCCL_LISTEN_ADDR" not in os.environ:
         os.environ["MCCL_LISTEN_ADDR"] = "127.0.0.1"
+
+
+def _apply_thunderbolt_profile_training_defaults() -> None:
+    """When MCCL_LINK_PROFILE=thunderbolt, apply DDP-friendly defaults if unset."""
+    if os.environ.get("MCCL_LINK_PROFILE", "").lower() != "thunderbolt":
+        return
+    os.environ.setdefault("DDP_BUCKET_MB", "512")
+    os.environ.setdefault("MCCL_OVERLAP_COMM", "1")
 
 
 def single_gpu_baseline() -> None:
@@ -247,9 +256,11 @@ def main() -> None:
     )
 
     _setup_mccl_env()
+    _apply_thunderbolt_profile_training_defaults()
     print(
         f"[ddp_dummy_train] MCCL_PORT_BASE={os.environ.get('MCCL_PORT_BASE')} "
-        f"MCCL_LISTEN_ADDR={os.environ.get('MCCL_LISTEN_ADDR', '(unset)')}",
+        f"MCCL_LISTEN_ADDR={os.environ.get('MCCL_LISTEN_ADDR', '(unset)')} "
+        f"MCCL_LINK_PROFILE={os.environ.get('MCCL_LINK_PROFILE', '(unset)')}",
         flush=True,
     )
     master_addr = os.environ.get("MASTER_ADDR", "")

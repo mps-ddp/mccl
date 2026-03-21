@@ -101,30 +101,22 @@ void commit_mps_and_signal(uint64_t value) {
     EventState& s = state();
     MCCL_CHECK(s.initialized, "EventSync not initialized");
 
-    @autoreleasepool {
-        // The entire sequence — flush active encoder, get a fresh command
-        // buffer, encode the signal, and commit the signal buffer — must
-        // happen atomically on PyTorch's MPS dispatch queue.  If any step
-        // runs outside the queue, another thread (e.g. autograd encoding
-        // backward kernels) can start a new encoder between our encode and
-        // commit, triggering Metal's "commit command buffer with uncommitted
-        // encoder" assertion.
-        dispatch_queue_t queue =
-            (dispatch_queue_t)torch::mps::get_dispatch_queue();
-        __block id<MTLSharedEvent> event = s.mps_event;
-        __block uint64_t val = value;
-        dispatch_sync(queue, ^{
-            torch::mps::commit();
-
-            id<MTLCommandBuffer> cmd =
-                (id<MTLCommandBuffer>)torch::mps::get_command_buffer();
-            MCCL_CHECK(cmd != nil,
-                       "get_command_buffer() returned nil in commit_mps_and_signal");
-            [cmd encodeSignalEvent:event value:val];
-
-            torch::mps::commit();
-        });
-    }
+    // Synchronize PyTorch's MPS stream to ensure all backward kernels complete.
+    // This is the only safe way to know MPS work is done without interfering
+    // with PyTorch's internal command buffer lifecycle.
+    //
+    // The original event-based design tried to avoid this synchronize by
+    // encoding a signal on PyTorch's command buffer, but that requires either:
+    // (a) committing PyTorch's buffer ourselves (breaks PyTorch's lifecycle), or
+    // (b) leaving the signal uncommitted (never fires).
+    //
+    // For now, we use the heavyweight sync. Future optimization: wire PyTorch's
+    // MPS Event API or use a two-stage event handoff if PyTorch exposes hooks.
+    torch::mps::synchronize();
+    
+    // Signal that MPS work is complete so wait_for_mps() can proceed.
+    // This is just a CPU-side update since we already synchronized.
+    s.mps_event.signaledValue = value;
 }
 
 void wait_for_mps(uint64_t value) {

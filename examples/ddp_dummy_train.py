@@ -248,7 +248,9 @@ class HeavyDummyModel(nn.Module):
         ]
         
         # Build conv layers and track final channel count
-        actual_conv_layers = conv_layer_configs[:min(depth, 5)]
+        # Ensure deterministic number of layers across all ranks
+        num_conv_layers = min(depth, len(conv_layer_configs))
+        actual_conv_layers = conv_layer_configs[:num_conv_layers]
         self.conv_layers = nn.ModuleList([
             ConvBlock(in_ch, out_ch, use_large_kernels=True)
             for i, (in_ch, out_ch) in enumerate(actual_conv_layers)
@@ -276,15 +278,18 @@ class HeavyDummyModel(nn.Module):
         # Fixed sequence length for simplicity
         self.seq_len = 16  # Fixed sequence length
         self.pos_encoding = nn.Parameter(torch.randn(self.seq_len, hidden))
+        # Ensure deterministic number of attention layers
+        num_attention_layers = min(depth, 4)
         self.attention_layers = nn.ModuleList([
             MultiHeadAttention(hidden, n_heads=8)
-            for _ in range(min(depth, 4))  # Limit attention layers
+            for _ in range(num_attention_layers)
         ])
         
-        # Final MLP layers
+        # Final MLP layers - ensure deterministic depth
+        num_mlp_layers = max(1, depth - num_conv_layers - num_attention_layers)
         mlp_layers = []
         in_f = hidden
-        for _ in range(max(1, depth - 4)):  # Remaining depth for MLP
+        for _ in range(num_mlp_layers):
             mlp_layers.extend([
                 nn.Linear(in_f, hidden),
                 nn.LayerNorm(hidden),

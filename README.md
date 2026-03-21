@@ -1,67 +1,106 @@
 # MCCL
 
-**Collective communication for PyTorch Distributed on Apple Silicon (MPS).**
-
-MCCL implements a custom `torch.distributed` backend (`backend="mccl"`) so you can run **DDP** and **collectives** on **MPS tensors** across processes—one Mac or several. It uses Apple Silicon **unified memory** where possible: float32 reductions often go through **Accelerate / vDSP** on CPU-visible shared buffers while Metal stays available for compute; fp16/bf16 paths use **Metal** shaders. The default transport is **overlapped TCP**; **RDMA** is optional when the OS and hardware support it.
-
-### New here?
-
-| Goal | Where to start |
-|------|----------------|
-| **Clone, build, run a smoke test** | [Quick start](#quick-start) → `examples/ddp_dummy_train.py` |
-| **Understand the codebase** | [docs/DEVELOPING.md](docs/DEVELOPING.md) |
-| **Run tests** | [TESTING.md](TESTING.md) |
-| **Version / platform matrix** | [COMPATIBILITY.md](COMPATIBILITY.md) |
-
-### Is this “novel” or never done before?
-
-**Not in the abstract.** Distributed training, ring allreduce, and TCP collectives are well-studied; NVIDIA’s **NCCL** and PyTorch’s **Gloo** are the familiar stacks on Linux/CUDA/CPU.
-
-What **is** specific here: PyTorch’s **MPS** path historically did not ship a **production multi-process collective library** comparable to NCCL. MCCL is an **engineering project** that plugs that gap: a **native ProcessGroup for `DeviceType::MPS`**, with transports and reduction paths tuned for **Apple Silicon unified memory**. So the *idea* of distributed training is old; the *integration*—this backend + Metal/Accelerate + optional Apple RDMA—is what this repository provides. Don’t treat it as a research claim of world-first algorithms; treat it as **infrastructure** for Mac clusters.
-
-## Architecture
-
-- **AMX/Accelerate reductions (f32)**: Element-wise operations (SUM, MIN, MAX, PRODUCT, AVG) use vDSP functions that leverage the AMX coprocessor. Because MPS tensors use `MTLStorageModeShared`, the CPU reads gradient data at the same physical addresses as the GPU without a blit on the send path. Received data is written directly into the tensor's shared-memory buffer (one `memcpy` from the network buffer). The GPU remains fully available for the next forward pass during reduction.
-
-- **Metal compute fallback (f16)**: Half-precision tensors use vectorized Metal shaders (float4/half4 per thread) dispatched through a dedicated command queue. 14 precompiled pipeline states cover all reduce operations.
-
-- **Overlapped transport**: Each ring step sends to the right neighbor and receives from the left neighbor simultaneously via a `poll()`-based state machine on the progress engine thread. TCP is full-duplex, so even 2-rank clusters benefit. No extra threads, no context switches.
-
-- **Ring allreduce**: Bandwidth-optimal reduce-scatter + allgather with algorithm dispatch: tree-gather for small messages, direct exchange for 2 ranks, ring for 3+ ranks.
-
-- **Production infrastructure**: Single-thread progress engine, per-collective watchdog, passive TCP liveness monitor, lock-free metrics with p50/p99 latency tracking, 64-byte aligned memory pool, ABORT protocol for coordinated failure.
-
-## Supported collectives
-
-allreduce, broadcast, barrier, allgather, reduce_scatter, send, recv
+**Distributed PyTorch across Apple Silicon Macs using MPS.**
 
 ## Quick start
 
-**Prerequisites:** macOS on **Apple Silicon**, Python **3.11+**, Xcode command-line tools, **PyTorch 2.5+** with MPS.
-
 ```bash
-git clone …   # your fork or upstream URL
-cd mccl
-pip install torch
-pip install -e ".[dev]"
+pip install -e .
 ```
 
-**Smoke test (single GPU, no distributed launcher):**
+```python
+import torch.distributed as dist
+import mccl
+
+dist.init_process_group(backend="mccl", rank=rank, world_size=world_size)
+# Use standard DDP on MPS tensors
+```
+
+**Tested:** M1 Max + M4 Max MacBook Pro, Thunderbolt 3, macOS 14–15, PyTorch 2.5+.
+
+## When this makes sense
+
+| Makes sense | Probably skip |
+|-------------|----------------|
+| Multi-Mac setup, model big enough that **compute** per step is the main cost | **Small models:** one GPU + grad accumulation usually wins (sync isn't free) |
+| Playing with Apple Silicon clusters | Expecting **datacenter NCCL** numbers over two laptops |
+| Experimenting with distributed training | Assuming "distributed = automatically faster" |
+
+## Performance (honest numbers)
+
+From `examples/ddp_dummy_train.py`, same **global batch 8** where it matters:
+
+| Profile | Single Mac (`--baseline`) | 2 ranks DDP (local `torchrun`) | |
+|---------|---------------------------|----------------------------------|--|
+| Default small (~4M params) | ~3 ms/step | ~14 ms/step | Multi-node is **slower** here — normal. |
+| Larger models | multi-second / step | tuning-dependent | Link speed + **DDP bucket size** matter; see [docs/MULTINODE.md](docs/MULTINODE.md). |
+
+**TL;DR:** Physics is physics. Small net = sync eats the step. Big net = link + buckets matter. Add your machine to [RESULTS.md](RESULTS.md) if you want.
+
+**Quick perf comparison (baseline vs DDP):**
+
+```bash
+bash scripts/benchmark_matrix.sh
+```
+
+See [examples/ddp_dummy_train.py](examples/ddp_dummy_train.py) for env vars (`DDP_BUCKET_MB`, `BATCH_SIZE`, etc.).
+
+## What this is
+
+MCCL is a `torch.distributed` backend for **DDP** and **collectives** on **MPS tensors**. Uses TCP over Thunderbolt/Ethernet by default; optional RDMA when available.
+
+**How it's built:** Unified memory where it helps; f32 reductions through **Accelerate / vDSP** on CPU-visible buffers; fp16/bf16 can use **Metal**; overlapped TCP transport on progress thread.
+
+**Not novel:** Allreduce over TCP, rings, etc. are old (NCCL, Gloo). This fills the gap for PyTorch **MPS** multi-process collectives.
+
+**Why build this?** To explore if multi-Mac training was feasible and understand how PyTorch backends work under the hood. Turns out it's a lot of plumbing but pretty satisfying when two MacBooks actually sync gradients over a Thunderbolt cable.
+
+## Setup guides
+
+| Goal | Where |
+|------|--------|
+| Two Macs + Thunderbolt | [docs/THUNDERBOLT_SETUP.md](docs/THUNDERBOLT_SETUP.md) |
+| Tuning, firewall, buckets | [docs/MULTINODE.md](docs/MULTINODE.md) |
+| Code layout | [docs/DEVELOPING.md](docs/DEVELOPING.md) |
+| Tests | [TESTING.md](TESTING.md) |
+| Versions | [COMPATIBILITY.md](COMPATIBILITY.md) |
+| Community timings | [RESULTS.md](RESULTS.md) |
+| Launch / demo notes | [docs/LAUNCH.md](docs/LAUNCH.md) |
+
+## Performance expectations
+
+**Small models:** DDP often **loses** to one GPU for wall-clock per step — fixed collective overhead vs tiny compute. Not a bug.
+
+**Large models:** Communication is a **smaller slice** of the step; tuning (`DDP_BUCKET_MB`, `MCCL_COMPRESSION`, link choice) matters. Still not InfiniBand.
+
+**YMMV:** TB3 vs Ethernet vs Wi‑Fi, PyTorch version, bucket size — see [RESULTS.md](RESULTS.md) for a place to dump numbers.
+
+## What we haven't tested
+
+- More than **2** nodes in one run  
+- **Thunderbolt 5 + RDMA** end-to-end (development hardware was TB3 + TCP)  
+- Every Mac SKU (Studio, mini, mixed generations)  
+- Real production jobs beyond the example script  
+- Huge models (10B+)  
+
+If you run it on something else, **PR a row to [RESULTS.md](RESULTS.md)** or open an issue with `mccl.get_metrics()` + setup.
+
+## Examples
+
+**Smoke test (single GPU, no launcher):**
 
 ```bash
 python examples/ddp_dummy_train.py --baseline
 ```
 
-**Local two-process DDP on one Mac:**
+**Two processes, one Mac:**
 
 ```bash
 torchrun --nproc_per_node=2 --nnodes=1 --master_addr=127.0.0.1 --master_port=29500 \
   examples/ddp_dummy_train.py
 ```
 
-See [examples/ddp_dummy_train.py](examples/ddp_dummy_train.py) for env vars (model size, steps, ports).
-
-**Application code (minimal):**
+**Full app code:**
 
 ```python
 import torch
@@ -89,6 +128,10 @@ dist.init_process_group(backend="mccl", rank=rank, world_size=world_size)
 model = DDP(MyModel().to("mps"))
 ```
 
+## Supported collectives
+
+allreduce, broadcast, barrier, allgather, reduce_scatter, send, recv
+
 ## Configuration
 
 All settings can be controlled via the Python `MCCLConfig` API **or** environment variables.
@@ -99,8 +142,8 @@ Python config takes priority when `mccl.init()` is called before `init_process_g
 | `MCCL_TRANSPORT` | `transport` | `auto` | Transport mode: `auto`, `tcp`, `rdma` |
 | `MCCL_LOG_LEVEL` | `log_level` | `WARN` | TRACE, DEBUG, INFO, WARN, ERROR, FATAL, OFF |
 | `MCCL_LISTEN_ADDR` | `listen_addr` | auto-detect | Bind address (auto-detects Thunderbolt bridge) |
-| `MCCL_LINK_PROFILE` | — | (unset) | Set to `thunderbolt` for production TCP defaults on TB links: larger default socket buffers and chunk size (see `Connection.cpp`, `TcpTransport.cpp`) |
-| `MCCL_PORT_BASE` | `port_base` | `29600` | Base port (rank N listens on port_base + N). **Must differ from `MASTER_PORT`** (PyTorch’s TCP store uses `MASTER_PORT` on the master; default `29600` avoids colliding with typical `MASTER_PORT=29500`). |
+| `MCCL_LINK_PROFILE` | — | (unset) | `thunderbolt` → larger default socket buffers + chunk size (see `Connection.cpp`, `TcpTransport.cpp`) |
+| `MCCL_PORT_BASE` | `port_base` | `29600` | Base port (rank N listens on port_base + N). **Must differ from `MASTER_PORT`**. |
 | `MCCL_IFNAME` | `ifname` | (auto) | Advisory network interface hint |
 | `MCCL_CHUNK_BYTES` | `chunk_bytes` | `4194304` | Chunk size for CRC-enabled transport |
 | `MCCL_SMALL_MSG_THRESHOLD` | `small_msg_threshold` | `65536` | Bytes below which allreduce uses gather-reduce |
@@ -132,10 +175,10 @@ The C++ backend also logs the full resolved config at INFO level on every rank a
 Typical causes:
 
 1. **Not all ranks running** — `torchrun` / elastic block until every node joins; killing the master yields `DistNetworkError` / recv 0 bytes (expected).
-2. **`MCCL_PORT_BASE` equals `MASTER_PORT`** — PyTorch’s TCP rendezvous uses `MASTER_PORT` on the master host; MCCL rank 0 listens on `MCCL_PORT_BASE + 0`. They must be different ports (defaults use `29600` vs `29500`, or set `MCCL_PORT_BASE=$((MASTER_PORT+100))` on all nodes).
+2. **`MCCL_PORT_BASE` equals `MASTER_PORT`** — PyTorch's TCP rendezvous uses `MASTER_PORT` on the master host; MCCL rank 0 listens on `MCCL_PORT_BASE + 0`. They must be different ports (defaults use `29600` vs `29500`, or set `MCCL_PORT_BASE=$((MASTER_PORT+100))` on all nodes).
 3. **Firewall / wrong IP** — Peers must reach `MASTER_ADDR:MASTER_PORT` and each published MCCL endpoint; open `MCCL_PORT_BASE` through `MCCL_PORT_BASE + world_size - 1` if needed.
 
-**Full multi-node checklist, fair baseline vs DDP, and perf tuning** (`DDP_BUCKET_MB`, sockets, compression): see [docs/MULTINODE.md](docs/MULTINODE.md).
+**Checklist + tuning:** [docs/MULTINODE.md](docs/MULTINODE.md). **Thunderbolt 2-Mac wiring:** [docs/THUNDERBOLT_SETUP.md](docs/THUNDERBOLT_SETUP.md).
 
 ## RDMA over Thunderbolt 5
 
@@ -191,13 +234,17 @@ MCCL supports RDMA transport for ultra-low-latency collective communication over
 - **Falls back to TCP**: Check `MCCL_LOG_LEVEL=INFO` output for detailed RDMA init diagnostics
 - **MR registration failures**: Apple limits ~100 memory regions per device; reduce world size or buffer count
 
-## Performance characteristics
+## How it works
 
-For f32 allreduce on Apple Silicon:
+- **Accelerate / vDSP (f32):** Element-wise ops (SUM, MIN, MAX, PRODUCT, AVG) on shared MPS buffers; CPU sees the same memory as the GPU for staging. Receive path typically one `memcpy` from the socket buffer into the tensor.
 
-- **Reduction**: AMX via `vDSP_vadd` at memory bandwidth (~100+ GB/s on M4). Zero Metal kernel launch overhead. Send path reads directly from the tensor's CPU-accessible shared-memory pointer (zero-copy). Receive path writes into the same pointer (one memcpy from the network staging buffer).
-- **Transport**: Overlapped send+recv halves per-step network time vs serial. macOS TCP auto-tuning enabled (no fixed buffer sizes).
-- **Sync**: Single `torch::mps::synchronize()` per collective. No GPU sync at the end for f32 path.
+- **Metal (fp16/bf16):** Vectorized shaders on a dedicated queue where that path is used.
+
+- **Overlapped TCP:** `poll()`-driven send/recv overlap on the progress engine; full-duplex helps even with 2 ranks.
+
+- **Algorithms:** Small messages, 2-rank direct path, ring for 3+; reduce-scatter + allgather style allreduce.
+
+- **Ops stuff:** Progress engine, watchdog, TCP keepalive-ish behavior, metrics, pooled buffers, ABORT path for failures.
 
 ## Compatibility
 

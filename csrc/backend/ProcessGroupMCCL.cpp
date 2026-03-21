@@ -380,13 +380,18 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
 
     engine_->submit(
         [this, tensor_copy, seq, ws, nbytes, red_op]() mutable {
+            const char* algo = "unknown";
             if (nbytes <= transport_->config().small_msg_threshold) {
+                algo = "small";
                 allreduce_small(tensor_copy, seq, red_op);
             } else if (ws == 2) {
+                algo = "two_rank";
                 allreduce_two_rank(tensor_copy, seq, red_op);
             } else {
+                algo = "ring";
                 allreduce_ring(tensor_copy, seq, red_op);
             }
+            MCCL_INFO("allreduce seq=%u: algo=%s nbytes=%zu", seq, algo, nbytes);
         },
         [this, work_ptr, seq]() {
             unregister_work(seq);
@@ -484,7 +489,12 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
                                            c10d::ReduceOp::RedOpType op) {
     int rank = getRank();
     int peer = 1 - rank;
-    bool use_cpu = (tensor.scalar_type() == at::kFloat) && tensor_cpu_accessible(tensor);
+    bool cpu_ok = tensor_cpu_accessible(tensor);
+    bool use_cpu = (tensor.scalar_type() == at::kFloat) && cpu_ok;
+
+    MCCL_INFO("allreduce_two_rank: dtype=%s cpu_accessible=%d use_cpu=%d nbytes=%zu compressor=%d",
+              at::toString(tensor.scalar_type()), (int)cpu_ok, (int)use_cpu,
+              tensor_nbytes(tensor), compressor_ ? 1 : 0);
 
     if (use_cpu && !compressor_) {
         MPSBufferView view = extract_mps_buffer(tensor);

@@ -343,7 +343,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     watchdog_->watch(seq, "allreduce");
     metrics_->op_start(seq, "allreduce", nbytes);
 
-    engine_->submit(
+    engine_->run_sync(
         [this, tensor_copy, seq, ws, nbytes, red_op]() mutable {
             if (nbytes <= transport_->config().small_msg_threshold) {
                 allreduce_small(tensor_copy, seq, red_op);
@@ -675,7 +675,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
     watchdog_->watch(seq, "broadcast");
     metrics_->op_start(seq, "broadcast", nbytes);
 
-    engine_->submit(
+    engine_->run_sync(
         [this, tensor_copy, root, seq, rank, ws]() mutable {
             sync_mps_for_collective(overlap_comm_);
 
@@ -792,7 +792,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
     watchdog_->watch(seq, "allgather");
     metrics_->op_start(seq, "allgather", nbytes * ws);
 
-    engine_->submit(
+    engine_->run_sync(
         [this, input_copy, outputs_copy, seq, rank, ws, nbytes]() mutable {
             sync_mps_for_collective(overlap_comm_);
 
@@ -897,7 +897,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
     watchdog_->watch(seq, "reduce_scatter");
     metrics_->op_start(seq, "reduce_scatter", nbytes * ws);
 
-    engine_->submit(
+    engine_->run_sync(
         [this, output_copy, inputs_copy, seq, rank, ws, nbytes, rs_op]() mutable {
             sync_mps_for_collective(overlap_comm_);
 
@@ -997,7 +997,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
     watchdog_->watch(seq, "send");
     metrics_->op_start(seq, "send", nbytes);
 
-    engine_->submit(
+    engine_->run_sync(
         [this, tensor, dstRank, seq, tag, nbytes]() mutable {
             sync_mps_for_collective(overlap_comm_);
             StagingBuffer staged = stage_for_send_nosync(tensor);
@@ -1049,7 +1049,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
     watchdog_->watch(seq, "recv");
     metrics_->op_start(seq, "recv", nbytes);
 
-    engine_->submit(
+    engine_->run_sync(
         [this, tensor, srcRank, seq, tag, nbytes]() mutable {
             PooledBuffer recv_buf(staging_memory_pool(), nbytes);
             MCCL_CHECK(transport_->recv_chunks(srcRank, OpType::RECV, seq,

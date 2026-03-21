@@ -56,6 +56,45 @@ uint32_t ProgressEngine::submit(std::function<void()> execute,
     return seq;
 }
 
+void ProgressEngine::run_sync(std::function<void()> execute,
+                              std::function<void()> on_complete,
+                              std::function<void(std::exception_ptr)> on_error) {
+    MCCL_CHECK(running_.load(), "ProgressEngine is not running");
+
+    bool exec_ok = false;
+    std::exception_ptr exec_ex;
+    try {
+        execute();
+        exec_ok = true;
+    } catch (...) {
+        exec_ex = std::current_exception();
+        MCCL_ERROR("run_sync execute() failed with exception");
+    }
+
+    if (exec_ok) {
+        std::exception_ptr complete_ex;
+        try {
+            if (on_complete) on_complete();
+        } catch (...) {
+            complete_ex = std::current_exception();
+            MCCL_ERROR("run_sync on_complete() threw — routing to on_error");
+        }
+        if (complete_ex) {
+            try {
+                if (on_error) on_error(complete_ex);
+            } catch (...) {
+                MCCL_ERROR("run_sync on_error() also threw after on_complete() failure");
+            }
+        }
+    } else {
+        try {
+            if (on_error) on_error(exec_ex);
+        } catch (...) {
+            MCCL_ERROR("run_sync on_error() threw (swallowing to keep engine alive)");
+        }
+    }
+}
+
 void ProgressEngine::stop() {
     if (!running_.load()) return;
 

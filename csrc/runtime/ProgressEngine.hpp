@@ -42,6 +42,14 @@ public:
                     std::function<void()> on_complete,
                     std::function<void(std::exception_ptr)> on_error);
 
+    /// Run execute + on_complete (or on_error) on the calling thread.
+    /// Used for ops that call torch::mps::synchronize(): MPS is not safe to
+    /// synchronize from the engine worker thread while the main thread owns
+    /// the stream/command-buffer lifecycle.
+    void run_sync(std::function<void()> execute,
+                  std::function<void()> on_complete,
+                  std::function<void(std::exception_ptr)> on_error);
+
     /// Drain the queue and stop the engine thread.
     void stop();
 

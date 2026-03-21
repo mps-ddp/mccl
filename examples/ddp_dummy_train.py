@@ -124,17 +124,19 @@ def _model_dims_from_env() -> tuple[int, int, int, int]:
 
 
 class SyntheticDataset:
-    """Learnable synthetic labels: sample ``x ~ N(0, 1)``, then ``y = argmax(x @ W^T + b)``.
+    """Well-separated Gaussian clusters — trivially learnable for any model.
 
-    ``W`` and ``b`` are fixed (same on every rank) so the task is consistent for DDP.
-    Per-step RNG uses ``1000 + step * world_size + rank`` so each rank sees different ``x``.
+    Fixed class centroids are spread far apart (scale ``separation``).  Each batch
+    picks a random class per sample, adds small Gaussian noise, and returns (x, y).
+    Identical centroids on every rank; per-step RNG gives different samples per rank.
     """
 
-    def __init__(self, input_dim: int, num_classes: int, seed: int = 424242) -> None:
+    def __init__(
+        self, input_dim: int, num_classes: int, seed: int = 424242, separation: float = 5.0,
+    ) -> None:
         g = torch.Generator()
         g.manual_seed(seed)
-        self.W = torch.randn(num_classes, input_dim, generator=g)
-        self.b = torch.randn(num_classes, generator=g)
+        self.centroids = torch.randn(num_classes, input_dim, generator=g) * separation
         self.input_dim = input_dim
         self.num_classes = num_classes
 
@@ -147,12 +149,11 @@ class SyntheticDataset:
         world_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         torch.manual_seed(1000 + step * world_size + rank)
-        x = torch.randn(batch_size, self.input_dim, device=device)
-        W = self.W.to(device=device, dtype=x.dtype)
-        b = self.b.to(device=device, dtype=x.dtype)
-        with torch.no_grad():
-            logits = x @ W.T + b
-            y = logits.argmax(dim=-1)
+        y = torch.randint(0, self.num_classes, (batch_size,))
+        centroids = self.centroids.to(device=device)
+        noise = torch.randn(batch_size, self.input_dim, device=device) * 0.3
+        x = centroids[y] + noise
+        y = y.to(device=device)
         return x, y
 
 

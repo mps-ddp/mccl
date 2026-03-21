@@ -153,20 +153,72 @@ class MultiHeadAttention(nn.Module):
 
 
 class ConvBlock(nn.Module):
-    """Convolutional block with multiple operations."""
-    def __init__(self, in_channels: int, out_channels: int):
+    """Convolutional block with large kernels and multiple operations."""
+    def __init__(self, in_channels: int, out_channels: int, use_large_kernels: bool = True):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        
+        if use_large_kernels:
+            # Large kernel convolutions - much more compute intensive
+            self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=7, padding=3)
+            self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=5, padding=2)
+            self.conv3 = nn.Conv2d(out_channels, out_channels, kernel_size=9, padding=4)  # Very large kernel
+            
+            # Depthwise separable convolution with large kernel
+            self.depthwise = nn.Conv2d(out_channels, out_channels, kernel_size=11, padding=5, groups=out_channels)
+            self.pointwise = nn.Conv2d(out_channels, out_channels, kernel_size=1)
+        else:
+            # Standard small kernels
+            self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+            self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+            self.conv3 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+            self.depthwise = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, groups=out_channels)
+            self.pointwise = nn.Conv2d(out_channels, out_channels, kernel_size=1)
+        
+        # Batch normalization for each conv layer
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.bn2 = nn.BatchNorm2d(out_channels)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        self.bn4 = nn.BatchNorm2d(out_channels)
+        self.bn5 = nn.BatchNorm2d(out_channels)
+        
+        # Activations and regularization
         self.relu = nn.ReLU()
+        self.gelu = nn.GELU()  # More compute-intensive activation
         self.dropout = nn.Dropout2d(0.1)
         
+        # Squeeze-and-excitation block for more computation
+        self.se_pool = nn.AdaptiveAvgPool2d(1)
+        self.se_fc1 = nn.Linear(out_channels, out_channels // 4)
+        self.se_fc2 = nn.Linear(out_channels // 4, out_channels)
+        self.sigmoid = nn.Sigmoid()
+        
     def forward(self, x):
-        x = self.relu(self.bn1(self.conv1(x)))
+        identity = x
+        
+        # Large kernel convolution sequence
+        x = self.gelu(self.bn1(self.conv1(x)))
         x = self.dropout(x)
+        
         x = self.relu(self.bn2(self.conv2(x)))
+        x = self.dropout(x)
+        
+        x = self.gelu(self.bn3(self.conv3(x)))
+        
+        # Depthwise separable convolution
+        x = self.relu(self.bn4(self.depthwise(x)))
+        x = self.gelu(self.bn5(self.pointwise(x)))
+        
+        # Squeeze-and-excitation attention
+        b, c, h, w = x.shape
+        se_weight = self.se_pool(x).view(b, c)
+        se_weight = self.relu(self.se_fc1(se_weight))
+        se_weight = self.sigmoid(self.se_fc2(se_weight)).view(b, c, 1, 1)
+        x = x * se_weight
+        
+        # Residual connection if dimensions match
+        if identity.shape == x.shape:
+            x = x + identity
+            
         return x
 
 
@@ -179,25 +231,51 @@ class HeavyDummyModel(nn.Module):
         # Reshape input to work with both conv and attention
         self.input_proj = nn.Linear(input_dim, hidden)
         
-        # Convolutional layers (reshape to 2D for conv operations)
-        conv_dim = int(hidden ** 0.5)  # Make it square-ish
-        if conv_dim * conv_dim != hidden:
-            conv_dim = 32  # fallback
-            self.conv_proj = nn.Linear(hidden, conv_dim * conv_dim * 3)
-            conv_channels = 3
-        else:
-            self.conv_proj = nn.Identity()
-            conv_channels = 1
-            
+        # Convolutional layers with larger spatial dimensions for large kernels
+        # Use larger spatial dimensions to make large kernels more effective
+        conv_spatial = 64  # Larger spatial size for better large kernel utilization
+        conv_channels = 16  # More channels for more computation
+        
+        self.conv_proj = nn.Linear(hidden, conv_spatial * conv_spatial * conv_channels)
+        
+        # More conv layers with increasing channels
+        conv_layer_configs = [
+            (conv_channels, 32),  # 16 -> 32
+            (32, 64),             # 32 -> 64  
+            (64, 128),            # 64 -> 128
+            (128, 128),           # 128 -> 128 (deeper)
+            (128, 64),            # 128 -> 64 (reduce for efficiency)
+        ]
+        
+        # Build conv layers and track final channel count
+        actual_conv_layers = conv_layer_configs[:min(depth, 5)]
         self.conv_layers = nn.ModuleList([
-            ConvBlock(conv_channels if i == 0 else 64, 64)
-            for i in range(min(depth, 3))  # Limit conv layers
+            ConvBlock(in_ch, out_ch, use_large_kernels=True)
+            for i, (in_ch, out_ch) in enumerate(actual_conv_layers)
         ])
-        self.pool = nn.AdaptiveAvgPool2d((8, 8))  # Reduce spatial dims
+        
+        # Get the final channel count from the last conv layer
+        final_conv_channels = actual_conv_layers[-1][1] if actual_conv_layers else conv_channels
+        
+        self.dilated_conv = nn.Sequential(
+            nn.Conv2d(final_conv_channels, 64, kernel_size=3, padding=2, dilation=2),  # Reduce to 64 channels
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=4, dilation=4),  # Dilation=4
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=8, dilation=8),  # Dilation=8
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+        )
+        
+        self.pool = nn.AdaptiveAvgPool2d((16, 16))  # Larger output for more computation
         
         # Attention layers (reshape flattened conv output back to sequence)
-        self.attn_proj = nn.Linear(64 * 8 * 8, hidden)
-        self.pos_encoding = nn.Parameter(torch.randn(100, hidden))  # Max seq length 100
+        self.attn_proj = nn.Linear(64 * 16 * 16, hidden)
+        # Fixed sequence length for simplicity
+        self.seq_len = 16  # Fixed sequence length
+        self.pos_encoding = nn.Parameter(torch.randn(self.seq_len, hidden))
         self.attention_layers = nn.ModuleList([
             MultiHeadAttention(hidden, n_heads=8)
             for _ in range(min(depth, 4))  # Limit attention layers
@@ -224,39 +302,32 @@ class HeavyDummyModel(nn.Module):
         # Initial projection
         x = self.input_proj(x)  # [batch, hidden]
         
-        # Convolutional path
-        if hasattr(self, 'conv_proj') and not isinstance(self.conv_proj, nn.Identity):
-            conv_x = self.conv_proj(x)  # [batch, conv_dim*conv_dim*3]
-            conv_dim = int((conv_x.shape[1] // 3) ** 0.5)
-            conv_x = conv_x.view(batch_size, 3, conv_dim, conv_dim)
-        else:
-            conv_dim = int(x.shape[1] ** 0.5)
-            conv_x = x.view(batch_size, 1, conv_dim, conv_dim)
-            
-        # Apply conv layers
+        # Convolutional path with large kernels
+        conv_x = self.conv_proj(x)  # [batch, 64*64*16]
+        conv_x = conv_x.view(batch_size, 16, 64, 64)  # [batch, 16, 64, 64]
+        
+        # Apply conv layers with large kernels
         for conv_layer in self.conv_layers:
             conv_x = conv_layer(conv_x)
             
+        # Apply dilated convolutions for even larger receptive fields
+        conv_x = self.dilated_conv(conv_x)
+            
         # Pool and flatten
-        conv_x = self.pool(conv_x)  # [batch, 64, 8, 8]
-        conv_x = conv_x.flatten(1)  # [batch, 64*8*8]
+        conv_x = self.pool(conv_x)  # [batch, 64, 16, 16]
+        conv_x = conv_x.flatten(1)  # [batch, 64*16*16]
         
         # Project back to hidden dim for attention
         attn_x = self.attn_proj(conv_x)  # [batch, hidden]
         
-        # Add positional encoding and reshape for attention
-        seq_len = min(attn_x.shape[1] // 64, 100)  # Limit sequence length
-        if seq_len < 1:
-            seq_len = 1
-        attn_x = attn_x.view(batch_size, seq_len, -1)  # [batch, seq_len, hidden//seq_len]
+        # Reshape for attention with fixed sequence length
+        # attn_x is [batch, hidden] from attn_proj
+        # Expand to [batch, seq_len, hidden] by repeating
+        hidden_dim = attn_x.shape[1]  # Get hidden dimension from tensor
+        attn_x = attn_x.unsqueeze(1).expand(batch_size, self.seq_len, hidden_dim)
         
-        # Ensure last dim matches hidden
-        if attn_x.shape[-1] != attn_x.shape[-1]:
-            attn_x = nn.functional.adaptive_avg_pool1d(attn_x.transpose(1, 2), attn_x.shape[1]).transpose(1, 2)
-            
         # Add positional encoding
-        if seq_len <= self.pos_encoding.shape[0]:
-            attn_x = attn_x + self.pos_encoding[:seq_len].unsqueeze(0)
+        attn_x = attn_x + self.pos_encoding.unsqueeze(0)
         
         # Apply attention layers
         for attn_layer in self.attention_layers:

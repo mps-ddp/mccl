@@ -640,6 +640,10 @@ bool TcpTransport::send_recv_overlap(
         recv_conn.set_nonblocking();
     }
 
+    size_t total_sent = 0, total_recvd = 0;
+    size_t send_total = MessageHeader::WIRE_SIZE + send_nbytes;
+    size_t recv_total = MessageHeader::WIRE_SIZE + recv_nbytes;
+
     while (!send_done || !recv_done) {
         struct pollfd pfds[2];
         int nfds = 0;
@@ -654,7 +658,6 @@ bool TcpTransport::send_recv_overlap(
         }
         if (!recv_done) {
             if (recv_fd == send_fd && send_pfd_idx >= 0) {
-                // Same socket (2-rank): merge events into one pollfd entry
                 pfds[send_pfd_idx].events |= POLLIN;
                 recv_pfd_idx = send_pfd_idx;
             } else {
@@ -753,6 +756,9 @@ bool TcpTransport::send_recv_overlap(
     if (recv_fd != send_fd) {
         recv_conn.set_blocking();
     }
+
+    MCCL_DEBUG("send_recv_overlap: sent %zu recv %zu bytes (send_peer=%d recv_peer=%d)",
+               send_total, recv_total, send_peer, recv_peer);
 
     // Validate received header
     MessageHeader recv_hdr = MessageHeader::decode(recv_hdr_buf);

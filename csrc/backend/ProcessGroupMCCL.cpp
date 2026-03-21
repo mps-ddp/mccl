@@ -516,6 +516,9 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
 
         double net_ms = std::chrono::duration<double, std::milli>(net_t1 - net_t0).count();
         double red_ms = std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
+        double gbps = (nbytes * 2.0 * 8.0) / (net_ms / 1000.0) / 1e9;
+        MCCL_INFO("allreduce_two_rank: %zu bytes, net=%.1fms (%.2f Gbps), reduce=%.1fms",
+                  nbytes, net_ms, gbps, red_ms);
         metrics_->record_phase(seq, 0, net_ms, red_ms);
 
         metrics_->record_transport_bytes(nbytes, true);

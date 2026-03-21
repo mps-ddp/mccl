@@ -10,9 +10,9 @@ export PYTHONUNBUFFERED=1
 export TRAIN_STEPS="${TRAIN_STEPS:-30}"
 export BATCH_SIZE="${BATCH_SIZE:-4}"
 
-# DDP uses many allreduce buckets per step — need FULL sync per op (default).
-# Do not force coalesced here; it skips GPU waits after the first bucket and corrupts traffic.
-# export MCCL_SYNC_MODE=coalesced  # only for a single batched allreduce, not DDP hooks
+# DDP: many allreduce buckets per backward — each needs a GPU barrier. FULL is required.
+# Explicit default so a stale shell MCCL_SYNC_MODE=coalesced cannot break multi-bucket runs.
+export MCCL_SYNC_MODE="${MCCL_SYNC_MODE:-full}"
 
 # ~1B-param default (see ddp_dummy_train.py); quick smoke test, e.g.:
 #   MODEL_DEPTH=2 MODEL_HIDDEN=512 BATCH_SIZE=8 bash examples/compare_single_vs_ddp.sh

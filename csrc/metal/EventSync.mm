@@ -111,6 +111,7 @@ void commit_mps_and_signal(uint64_t value) {
         __block id<MTLSharedEvent> event = s.mps_event;
         __block uint64_t val = value;
         dispatch_sync(queue, ^{
+            torch::mps::commit();
             id<MTLCommandBuffer> cmd =
                 (id<MTLCommandBuffer>)torch::mps::get_command_buffer();
             [cmd encodeSignalEvent:event value:val];

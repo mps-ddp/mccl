@@ -52,7 +52,7 @@ If MPS runs out of memory, lower ``BATCH_SIZE`` (e.g. 2) or reduce ``MODEL_HIDDE
 
 Optional env (see MCCL docs): ``MCCL_LISTEN_ADDR``, ``MCCL_PORT_BASE``, ``MCCL_TRANSPORT``,
 ``MCCL_LINK_PROFILE=thunderbolt`` (production TCP tuning on Thunderbolt IP — see ``scripts/thunderbolt_prod.sh``).
-Training env: ``TRAIN_STEPS`` (default 30), ``BATCH_SIZE`` (default 4 per rank),
+Training env: ``TRAIN_STEPS`` (default 200), ``BATCH_SIZE`` (default 4 per rank),
 ``DDP_BUCKET_MB`` (default 25; **512** if ``MCCL_LINK_PROFILE=thunderbolt`` and unset; else try **50–200+** for 2-node),
 ``TRAIN_AUTOCAST_FP16=1`` for ``torch.autocast`` fp16 forward+loss (smaller/faster on MPS),
 ``MCCL_COMPRESSION=fp16`` when supported (halves cross-host bytes).
@@ -165,7 +165,7 @@ def single_gpu_baseline() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.01)
     loss_fn = nn.CrossEntropyLoss()
 
-    steps = int(os.environ.get("TRAIN_STEPS", "30"))
+    steps = int(os.environ.get("TRAIN_STEPS", "200"))
     batch_size = int(os.environ.get("BATCH_SIZE", "4"))
     if os.environ.get("BASELINE_BATCH_SIZE"):
         batch_size = int(os.environ["BASELINE_BATCH_SIZE"])
@@ -336,7 +336,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(ddp.parameters(), lr=0.0001, weight_decay=0.01)
     loss_fn = nn.CrossEntropyLoss()
 
-    steps = int(os.environ.get("TRAIN_STEPS", "30"))
+    steps = int(os.environ.get("TRAIN_STEPS", "200"))
     batch_size = int(os.environ.get("BATCH_SIZE", "4"))
     input_dim, num_classes, _, _ = _model_dims_from_env()
 

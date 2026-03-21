@@ -118,19 +118,177 @@ def _model_dims_from_env() -> tuple[int, int, int, int]:
     return input_dim, num_classes, hidden, depth
 
 
-def build_dummy_classifier() -> nn.Sequential:
-    """MLP for MCCL/DDP demos; dims from env (default few M params, stress via MCCL_STRESS_MODEL)."""
+class MultiHeadAttention(nn.Module):
+    """Simple multi-head attention for testing MPS performance."""
+    def __init__(self, d_model: int, n_heads: int = 8):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_k = d_model // n_heads
+        
+        self.w_q = nn.Linear(d_model, d_model)
+        self.w_k = nn.Linear(d_model, d_model)
+        self.w_v = nn.Linear(d_model, d_model)
+        self.w_o = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(0.1)
+        
+    def forward(self, x):
+        batch_size, seq_len, _ = x.shape
+        
+        # Create Q, K, V
+        q = self.w_q(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        k = self.w_k(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        v = self.w_v(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+        
+        # Attention computation (computationally expensive)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k ** 0.5)
+        attn_weights = torch.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Apply attention to values
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        
+        return self.w_o(attn_output)
+
+
+class ConvBlock(nn.Module):
+    """Convolutional block with multiple operations."""
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout2d(0.1)
+        
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.dropout(x)
+        x = self.relu(self.bn2(self.conv2(x)))
+        return x
+
+
+class HeavyDummyModel(nn.Module):
+    """More computationally intensive model for better MPS testing."""
+    def __init__(self, input_dim: int, num_classes: int, hidden: int, depth: int):
+        super().__init__()
+        self.input_dim = input_dim
+        
+        # Reshape input to work with both conv and attention
+        self.input_proj = nn.Linear(input_dim, hidden)
+        
+        # Convolutional layers (reshape to 2D for conv operations)
+        conv_dim = int(hidden ** 0.5)  # Make it square-ish
+        if conv_dim * conv_dim != hidden:
+            conv_dim = 32  # fallback
+            self.conv_proj = nn.Linear(hidden, conv_dim * conv_dim * 3)
+            conv_channels = 3
+        else:
+            self.conv_proj = nn.Identity()
+            conv_channels = 1
+            
+        self.conv_layers = nn.ModuleList([
+            ConvBlock(conv_channels if i == 0 else 64, 64)
+            for i in range(min(depth, 3))  # Limit conv layers
+        ])
+        self.pool = nn.AdaptiveAvgPool2d((8, 8))  # Reduce spatial dims
+        
+        # Attention layers (reshape flattened conv output back to sequence)
+        self.attn_proj = nn.Linear(64 * 8 * 8, hidden)
+        self.pos_encoding = nn.Parameter(torch.randn(100, hidden))  # Max seq length 100
+        self.attention_layers = nn.ModuleList([
+            MultiHeadAttention(hidden, n_heads=8)
+            for _ in range(min(depth, 4))  # Limit attention layers
+        ])
+        
+        # Final MLP layers
+        mlp_layers = []
+        in_f = hidden
+        for _ in range(max(1, depth - 4)):  # Remaining depth for MLP
+            mlp_layers.extend([
+                nn.Linear(in_f, hidden),
+                nn.LayerNorm(hidden),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            ])
+            in_f = hidden
+            
+        mlp_layers.append(nn.Linear(in_f, num_classes))
+        self.mlp = nn.Sequential(*mlp_layers)
+        
+    def forward(self, x):
+        batch_size = x.shape[0]
+        
+        # Initial projection
+        x = self.input_proj(x)  # [batch, hidden]
+        
+        # Convolutional path
+        if hasattr(self, 'conv_proj') and not isinstance(self.conv_proj, nn.Identity):
+            conv_x = self.conv_proj(x)  # [batch, conv_dim*conv_dim*3]
+            conv_dim = int((conv_x.shape[1] // 3) ** 0.5)
+            conv_x = conv_x.view(batch_size, 3, conv_dim, conv_dim)
+        else:
+            conv_dim = int(x.shape[1] ** 0.5)
+            conv_x = x.view(batch_size, 1, conv_dim, conv_dim)
+            
+        # Apply conv layers
+        for conv_layer in self.conv_layers:
+            conv_x = conv_layer(conv_x)
+            
+        # Pool and flatten
+        conv_x = self.pool(conv_x)  # [batch, 64, 8, 8]
+        conv_x = conv_x.flatten(1)  # [batch, 64*8*8]
+        
+        # Project back to hidden dim for attention
+        attn_x = self.attn_proj(conv_x)  # [batch, hidden]
+        
+        # Add positional encoding and reshape for attention
+        seq_len = min(attn_x.shape[1] // 64, 100)  # Limit sequence length
+        if seq_len < 1:
+            seq_len = 1
+        attn_x = attn_x.view(batch_size, seq_len, -1)  # [batch, seq_len, hidden//seq_len]
+        
+        # Ensure last dim matches hidden
+        if attn_x.shape[-1] != attn_x.shape[-1]:
+            attn_x = nn.functional.adaptive_avg_pool1d(attn_x.transpose(1, 2), attn_x.shape[1]).transpose(1, 2)
+            
+        # Add positional encoding
+        if seq_len <= self.pos_encoding.shape[0]:
+            attn_x = attn_x + self.pos_encoding[:seq_len].unsqueeze(0)
+        
+        # Apply attention layers
+        for attn_layer in self.attention_layers:
+            attn_x = attn_layer(attn_x) + attn_x  # Residual connection
+            
+        # Global average pooling over sequence dimension
+        x = attn_x.mean(dim=1)  # [batch, hidden]
+        
+        # Final MLP
+        return self.mlp(x)
+
+
+def build_dummy_classifier() -> nn.Module:
+    """Heavy model for MCCL/DDP demos with conv, attention, and MLP layers."""
     input_dim, num_classes, hidden, depth = _model_dims_from_env()
     if depth < 1:
         raise ValueError("MODEL_DEPTH must be >= 1")
-    layers: list[nn.Module] = []
-    in_f = input_dim
-    for _ in range(depth):
-        layers.append(nn.Linear(in_f, hidden))
-        layers.append(nn.ReLU())
-        in_f = hidden
-    layers.append(nn.Linear(in_f, num_classes))
-    return nn.Sequential(*layers)
+    
+    # Use heavy model by default, simple MLP if requested
+    if os.environ.get("MCCL_SIMPLE_MODEL", "").lower() in ("1", "true", "yes"):
+        # Original simple MLP
+        layers: list[nn.Module] = []
+        in_f = input_dim
+        for _ in range(depth):
+            layers.append(nn.Linear(in_f, hidden))
+            layers.append(nn.ReLU())
+            in_f = hidden
+        layers.append(nn.Linear(in_f, num_classes))
+        return nn.Sequential(*layers)
+    else:
+        # Heavy model with conv + attention + MLP
+        return HeavyDummyModel(input_dim, num_classes, hidden, depth)
 
 
 def _setup_mccl_env() -> None:

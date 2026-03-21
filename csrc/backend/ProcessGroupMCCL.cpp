@@ -375,11 +375,12 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     auto sync_t0 = std::chrono::steady_clock::now();
     sync_mps_for_collective(overlap_comm_);
 
-    // Convert private-storage tensors to shared storage so the fast CPU path
-    // fires (overlapped TCP + AMX reduce, zero blits during allreduce).
-    // This blit happens once here; all subsequent access is zero-copy.
+    // Promote private-storage tensors to shared so the fast overlapped CPU
+    // path fires (zero blits during allreduce, AMX reduce). The promotion
+    // allocates a CPU-backed copy (~same size as the tensor); safe with 64GB+.
     at::Tensor shared_tensor = ensure_shared_storage(tensor_copy);
-    bool promoted = !tensor_cpu_accessible(tensor_copy) && tensor_cpu_accessible(shared_tensor);
+    bool promoted = (shared_tensor.data_ptr() != tensor_copy.data_ptr())
+                    && tensor_cpu_accessible(shared_tensor);
 
     auto sync_t1 = std::chrono::steady_clock::now();
     double sync_ms = std::chrono::duration<double, std::milli>(sync_t1 - sync_t0).count();

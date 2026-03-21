@@ -669,7 +669,7 @@ bool TcpTransport::send_recv_overlap(
             }
         }
 
-        int ready = ::poll(pfds, nfds, 10000);
+        int ready = ::poll(pfds, nfds, 60000);
         if (ready < 0) {
             if (errno == EINTR) continue;
             MCCL_ERROR("send_recv_overlap: poll() failed: %s", strerror(errno));
@@ -735,7 +735,9 @@ bool TcpTransport::send_recv_overlap(
                 ssize_t n = recv_conn.try_recv(
                     recv_bufs[recv_phase] + recv_off, remain);
                 if (n < 0) {
-                    MCCL_ERROR("send_recv_overlap: recv failed");
+                    MCCL_ERROR("send_recv_overlap: recv failed (phase=%d, recvd %zu/%zu bytes total, peer=%d)",
+                               recv_phase, recv_off + (recv_phase > 0 ? recv_lens[0] : 0),
+                               recv_total, recv_peer);
                     send_conn.set_blocking();
                     if (recv_fd != send_fd) recv_conn.set_blocking();
                     return false;

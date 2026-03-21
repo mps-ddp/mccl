@@ -12,7 +12,9 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <cerrno>
+#include <climits>
 #include <cstring>
+#include <algorithm>
 
 namespace mccl {
 
@@ -165,10 +167,14 @@ bool Connection::accept_from(int listen_fd, std::chrono::milliseconds timeout) {
 bool Connection::send_all(const void* data, size_t len) {
     if (!alive_ || fd_ < 0) return false;
 
+    // macOS limits individual send() to ~2GB; cap each call.
+    constexpr size_t MAX_SEND = 1ULL << 30; // 1GB per syscall
+
     const uint8_t* p = static_cast<const uint8_t*>(data);
     size_t sent = 0;
     while (sent < len) {
-        ssize_t n = ::send(fd_, p + sent, len - sent, 0);
+        size_t chunk = std::min(MAX_SEND, len - sent);
+        ssize_t n = ::send(fd_, p + sent, chunk, 0);
         if (n <= 0) {
             if (n < 0 && (errno == EINTR)) continue;
             MCCL_ERROR("send failed after %zu/%zu bytes: %s",
@@ -184,10 +190,13 @@ bool Connection::send_all(const void* data, size_t len) {
 bool Connection::recv_all(void* data, size_t len) {
     if (!alive_ || fd_ < 0) return false;
 
+    constexpr size_t MAX_RECV = 1ULL << 30; // 1GB per syscall
+
     uint8_t* p = static_cast<uint8_t*>(data);
     size_t recvd = 0;
     while (recvd < len) {
-        ssize_t n = ::recv(fd_, p + recvd, len - recvd, 0);
+        size_t chunk = std::min(MAX_RECV, len - recvd);
+        ssize_t n = ::recv(fd_, p + recvd, chunk, 0);
         if (n <= 0) {
             if (n < 0 && (errno == EINTR)) continue;
             if (n == 0) {
@@ -213,13 +222,21 @@ bool Connection::send_header_payload(const void* header, size_t hdr_len,
         return send_all(header, hdr_len);
     }
 
+    size_t total = hdr_len + payload_len;
+
+    // macOS writev fails with EINVAL when total iov length exceeds INT32_MAX (~2GB).
+    // For large payloads, send header and payload separately.
+    if (total > static_cast<size_t>(INT32_MAX)) {
+        if (!send_all(header, hdr_len)) return false;
+        return send_all(payload, payload_len);
+    }
+
     struct iovec iov[2];
     iov[0].iov_base = const_cast<void*>(header);
     iov[0].iov_len = hdr_len;
     iov[1].iov_base = const_cast<void*>(payload);
     iov[1].iov_len = payload_len;
 
-    size_t total = hdr_len + payload_len;
     size_t sent = 0;
     int iov_idx = 0;
 
@@ -234,7 +251,6 @@ bool Connection::send_header_payload(const void* header, size_t hdr_len,
         }
         sent += static_cast<size_t>(n);
 
-        // Advance iov past fully-sent buffers
         size_t consumed = static_cast<size_t>(n);
         while (iov_idx < 2 && consumed >= iov[iov_idx].iov_len) {
             consumed -= iov[iov_idx].iov_len;

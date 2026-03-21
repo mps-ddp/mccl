@@ -86,42 +86,25 @@ at::Tensor ensure_shared_storage(const at::Tensor& tensor) {
         return tensor;
     }
 
-    // Private storage: create a CPU tensor (shared/unified memory) and blit into it.
-    // CPU tensors use page-aligned malloc which is compatible with Metal shared buffers.
-    at::Tensor shared = torch::empty(tensor.sizes(), tensor.options().device(at::kCPU));
     size_t nbytes = static_cast<size_t>(tensor.numel()) * tensor.element_size();
-
     id<MTLBuffer> src_buf = at::mps::getMTLBufferStorage(tensor);
     size_t src_offset = static_cast<size_t>(tensor.storage_offset()) * tensor.element_size();
 
-    void* dst_ptr = shared.data_ptr();
-    size_t page = 16384;
-    size_t aligned_len = (nbytes + page - 1) & ~(page - 1);
+    // Allocate page-aligned buffer and wrap as shared MTLBuffer (same as StagingPool).
+    constexpr size_t PAGE = 16384;
+    size_t alloc_size = (nbytes + PAGE - 1) & ~(PAGE - 1);
+
+    void* ptr = nullptr;
+    int rc = posix_memalign(&ptr, PAGE, alloc_size);
+    MCCL_CHECK(rc == 0 && ptr != nullptr,
+               "ensure_shared_storage: posix_memalign failed for " + std::to_string(alloc_size) + " bytes");
 
     id<MTLBuffer> dst_mtl = [cached_device()
-        newBufferWithBytesNoCopy:dst_ptr
-        length:aligned_len
+        newBufferWithBytesNoCopy:ptr
+        length:alloc_size
         options:MTLResourceStorageModeShared
         deallocator:nil];
-
-    if (!dst_mtl) {
-        // Alignment issue — fall back to staging pool
-        StagingPool& pool = staging_pool();
-        void* staging = pool.ensure(nbytes, cached_device());
-
-        @autoreleasepool {
-            id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
-            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-            [blit copyFromBuffer:src_buf sourceOffset:src_offset
-                        toBuffer:pool.mtl_wrapper destinationOffset:0
-                            size:nbytes];
-            [blit endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
-        }
-        memcpy(dst_ptr, staging, nbytes);
-        return shared;
-    }
+    MCCL_CHECK(dst_mtl != nil, "ensure_shared_storage: MTLBuffer wrap failed");
 
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
@@ -135,7 +118,17 @@ at::Tensor ensure_shared_storage(const at::Tensor& tensor) {
     }
 
     MCCL_DEBUG("ensure_shared_storage: blit %zu bytes from private to shared", nbytes);
-    return shared;
+
+    // Wrap the page-aligned buffer as a CPU tensor with a custom deleter.
+    auto deleter = [](void* p) { free(p); };
+    auto storage = c10::Storage(
+        c10::Storage::use_byte_size_t(),
+        static_cast<int64_t>(nbytes),
+        at::DataPtr(ptr, ptr, deleter, c10::Device(c10::kCPU)),
+        /*allocator=*/nullptr,
+        /*resizable=*/false);
+    return at::empty({0}, tensor.options().device(at::kCPU))
+        .set_(storage, 0, tensor.sizes(), tensor.strides());
 }
 
 void* get_mtl_device() {

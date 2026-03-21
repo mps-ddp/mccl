@@ -110,11 +110,11 @@ def single_gpu_baseline() -> None:
             self.classifier = nn.Linear(hidden_dim, num_classes)
             
         def forward(self, x):
-            x = self.input_proj(x)
+            x = self.input_proj(x)  # [batch, input_dim] -> [batch, hidden_dim]
             for layer in self.layers:
-                x = x + layer(x)
-            x = self.final_norm(x)
-            return self.classifier(x.mean(dim=1))
+                x = x + layer(x)  # Residual connection
+            x = self.final_norm(x)  # [batch, hidden_dim]
+            return self.classifier(x)  # Direct classification
 
     model = LargeMLPTransformer(
         input_dim=512, 
@@ -251,11 +251,11 @@ def main() -> None:
             self.classifier = nn.Linear(hidden_dim, num_classes)
             
         def forward(self, x):
-            x = self.input_proj(x)
+            x = self.input_proj(x)  # [batch, input_dim] -> [batch, hidden_dim]
             for layer in self.layers:
                 x = x + layer(x)  # Residual connection
-            x = self.final_norm(x)
-            return self.classifier(x.mean(dim=1))  # Global average pooling
+            x = self.final_norm(x)  # [batch, hidden_dim]
+            return self.classifier(x)  # Direct classification
 
     model = LargeMLPTransformer(
         input_dim=512, 

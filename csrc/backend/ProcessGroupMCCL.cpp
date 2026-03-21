@@ -27,12 +27,15 @@ SyncMode global_sync_mode() {
         auto* v = std::getenv("MCCL_SYNC_MODE");
         if (v) {
             std::string s(v);
-            if (s == "full") return SyncMode::FULL;
             if (s == "coalesced" || s == "fast") return SyncMode::COALESCED;
         }
-        // Default to coalesced: with event-based sync, one signal+commit per
-        // batch of ops is sufficient.  Set MCCL_SYNC_MODE=full to override.
-        return SyncMode::COALESCED;
+        // Default FULL: DDP gradient bucketing issues many allreduce calls per
+        // backward; each must wait for that bucket's GPU work.  COALESCED skips
+        // sync after the first op in a thread, which reads stale grads and
+        // corrupts wire traffic (broken pipe on rank 2+ buckets).
+        // Use MCCL_SYNC_MODE=coalesced only with a single batched collective
+        // (e.g. one manual allreduce_coalesced), not with DDP hooks.
+        return SyncMode::FULL;
     }();
     return mode;
 }

@@ -22,7 +22,7 @@ class MCCLConfig:
     # ── Transport ────────────────────────────────────────────────────
     transport: str = "auto"  # "auto", "tcp", "rdma"
     listen_addr: str = "auto"
-    port_base: int = 29500
+    port_base: int = 29600
     ifname: str = ""
     chunk_bytes: int = 4 * 1024 * 1024
     small_msg_threshold: int = 65536

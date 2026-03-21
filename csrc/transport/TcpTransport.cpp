@@ -101,6 +101,19 @@ TransportConfig TransportConfig::from_env() {
     return cfg;
 }
 
+void warn_if_mccl_port_overlaps_master(const TransportConfig& cfg) {
+    const char* mp = std::getenv("MASTER_PORT");
+    if (!mp) return;
+    int master_port = std::atoi(mp);
+    if (master_port <= 0 || master_port > 65535) return;
+    if (static_cast<int>(cfg.port_base) != master_port) return;
+    MCCL_WARN(
+        "MCCL_PORT_BASE (%u) equals MASTER_PORT (%d): PyTorch's TCP store and MCCL rank 0 "
+        "must not share the same port. Set MCCL_PORT_BASE away from MASTER_PORT on all nodes "
+        "(e.g. export MCCL_PORT_BASE=$((MASTER_PORT+100))).",
+        (unsigned)cfg.port_base, master_port);
+}
+
 
 TcpTransport::TcpTransport(int rank, int world_size, const TransportConfig& config)
     : rank_(rank), world_size_(world_size), config_(config),

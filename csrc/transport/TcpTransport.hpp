@@ -17,7 +17,7 @@ namespace mccl {
 struct TransportConfig {
     std::string transport = "auto";  // "auto", "tcp", "rdma"
     std::string listen_addr = "0.0.0.0";
-    uint16_t port_base = 29500;
+    uint16_t port_base = 29600;
     std::string ifname;              // MCCL_IFNAME — advisory interface hint
     size_t chunk_bytes = 4 * 1024 * 1024;  // 4 MB default chunk
     size_t small_msg_threshold = 65536;     // 64 KB
@@ -26,6 +26,9 @@ struct TransportConfig {
 
     static TransportConfig from_env();
 };
+
+/// Warn if MCCL listen base port matches MASTER_PORT (TCP store vs MCCL rank-0 collision).
+void warn_if_mccl_port_overlaps_master(const TransportConfig& cfg);
 
 class TcpTransport : public Transport {
 public:

@@ -150,6 +150,7 @@ ProcessGroupMCCL::~ProcessGroupMCCL() {
 
 void ProcessGroupMCCL::init_transport() {
     TransportConfig cfg = TransportConfig::from_env();
+    warn_if_mccl_port_overlaps_master(cfg);
 
     if (cfg.transport == "rdma" ||
         (cfg.transport == "auto" && RdmaTransport::is_available())) {

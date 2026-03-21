@@ -27,6 +27,16 @@ class TinyModel(nn.Module):
         return self.fc2(self.relu(self.fc1(x)))
 
 
+def _setup_mccl_env() -> None:
+    """Keep MCCL listen ports off MASTER_PORT (PyTorch TCP store). Same as examples/ddp_dummy_train.py."""
+    if "MCCL_PORT_BASE" not in os.environ:
+        mp = int(os.environ.get("MASTER_PORT", "29500"))
+        os.environ["MCCL_PORT_BASE"] = str(mp + 100)
+    master = os.environ.get("MASTER_ADDR", "")
+    if master in ("127.0.0.1", "localhost", "::1") and "MCCL_LISTEN_ADDR" not in os.environ:
+        os.environ["MCCL_LISTEN_ADDR"] = "127.0.0.1"
+
+
 def main():
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -35,6 +45,8 @@ def main():
 
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = master_port
+
+    _setup_mccl_env()
 
     import mccl  # noqa: F401
 

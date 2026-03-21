@@ -64,7 +64,7 @@ Python config takes priority when `mccl.init()` is called before `init_process_g
 | `MCCL_TRANSPORT` | `transport` | `auto` | Transport mode: `auto`, `tcp`, `rdma` |
 | `MCCL_LOG_LEVEL` | `log_level` | `WARN` | TRACE, DEBUG, INFO, WARN, ERROR, FATAL, OFF |
 | `MCCL_LISTEN_ADDR` | `listen_addr` | auto-detect | Bind address (auto-detects Thunderbolt bridge) |
-| `MCCL_PORT_BASE` | `port_base` | `29500` | Base port (rank N listens on port_base + N) |
+| `MCCL_PORT_BASE` | `port_base` | `29600` | Base port (rank N listens on port_base + N). **Must differ from `MASTER_PORT`** (PyTorch’s TCP store uses `MASTER_PORT` on the master; default `29600` avoids colliding with typical `MASTER_PORT=29500`). |
 | `MCCL_IFNAME` | `ifname` | (auto) | Advisory network interface hint |
 | `MCCL_CHUNK_BYTES` | `chunk_bytes` | `4194304` | Chunk size for CRC-enabled transport |
 | `MCCL_SMALL_MSG_THRESHOLD` | `small_msg_threshold` | `65536` | Bytes below which allreduce uses gather-reduce |
@@ -90,6 +90,14 @@ mccl.reset_metrics()  # zero all counters
 ```
 
 The C++ backend also logs the full resolved config at INFO level on every rank at startup, so setting `MCCL_LOG_LEVEL=INFO` shows every tunable value per node.
+
+### Multi-node appears hung
+
+Typical causes:
+
+1. **Not all ranks running** — `torchrun` / elastic block until every node joins; killing the master yields `DistNetworkError` / recv 0 bytes (expected).
+2. **`MCCL_PORT_BASE` equals `MASTER_PORT`** — PyTorch’s TCP rendezvous uses `MASTER_PORT` on the master host; MCCL rank 0 listens on `MCCL_PORT_BASE + 0`. They must be different ports (defaults use `29600` vs `29500`, or set `MCCL_PORT_BASE=$((MASTER_PORT+100))` on all nodes).
+3. **Firewall / wrong IP** — Peers must reach `MASTER_ADDR:MASTER_PORT` and each published MCCL endpoint; open `MCCL_PORT_BASE` through `MCCL_PORT_BASE + world_size - 1` if needed.
 
 ## RDMA over Thunderbolt 5
 

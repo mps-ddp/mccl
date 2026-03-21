@@ -23,8 +23,9 @@ dist.init_process_group(backend="mccl", rank=rank, world_size=world_size)
 # Use standard DDP on MPS tensors
 ```
 
-**Demo:** See distributed training in action over Thunderbolt:
-![video-example](https://github.com/user-attachments/assets/a20c0581-612f-4381-8e91-bb5b4e376caa)
+https://github.com/user-attachments/assets/944d967c-179f-42ed-8556-625cf3669e92
+
+
 
 **Tested:** M1 Max + M4 Max MacBook Pro, Thunderbolt 3, macOS 14–15, PyTorch 2.5+.
 

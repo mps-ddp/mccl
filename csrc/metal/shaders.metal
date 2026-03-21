@@ -3,6 +3,19 @@ using namespace metal;
 
 namespace {
 
+#if defined(__HAVE_BFLOAT__)
+// Metal's min/max overloads are ambiguous for scalar bfloat and unavailable for bfloat
+// vectors; use float intermediates (same numeric range as bf16).
+inline bfloat bf_min(bfloat a, bfloat b) { return bfloat(metal::min(float(a), float(b))); }
+inline bfloat bf_max(bfloat a, bfloat b) { return bfloat(metal::max(float(a), float(b))); }
+inline bfloat4 bf_min4(bfloat4 a, bfloat4 b) {
+    return bfloat4(metal::min(float4(a), float4(b)));
+}
+inline bfloat4 bf_max4(bfloat4 a, bfloat4 b) {
+    return bfloat4(metal::max(float4(a), float4(b)));
+}
+#endif
+
 constant uint kElementsPerThread = 8;
 constant uint kOpAdd = 0;
 constant uint kOpMin = 1;
@@ -66,19 +79,81 @@ struct BinaryApply<kOpMul, VecT> {
     static inline VecT vec(VecT a, VecT b) { return a * b; }
 };
 
+#if defined(__HAVE_BFLOAT__)
+template <>
+struct BinaryApply<kOpMin, bfloat4> {
+    static inline bfloat4 vec(bfloat4 a, bfloat4 b) { return bf_min4(a, b); }
+};
+
+template <>
+struct BinaryApply<kOpMax, bfloat4> {
+    static inline bfloat4 vec(bfloat4 a, bfloat4 b) { return bf_max4(a, b); }
+};
+#endif
+
+// Split per (Op, T): a single template with if(Op==...) still type-checks every branch for bfloat.
 template <uint Op, typename T>
-inline void apply_binary_tail(device T* dst, device const T* src, uint base, uint count) {
-    for (uint i = base; i < min(base + kElementsPerThread, count); ++i) {
-        if (Op == kOpAdd) {
+struct ApplyBinaryTail;
+
+template <typename T>
+struct ApplyBinaryTail<kOpAdd, T> {
+    static inline void apply(device T* dst, device const T* src, uint base, uint count) {
+        for (uint i = base; i < min(base + kElementsPerThread, count); ++i) {
             dst[i] += src[i];
-        } else if (Op == kOpMin) {
+        }
+    }
+};
+
+template <typename T>
+struct ApplyBinaryTail<kOpMin, T> {
+    static inline void apply(device T* dst, device const T* src, uint base, uint count) {
+        for (uint i = base; i < min(base + kElementsPerThread, count); ++i) {
             dst[i] = min(dst[i], src[i]);
-        } else if (Op == kOpMax) {
+        }
+    }
+};
+
+template <typename T>
+struct ApplyBinaryTail<kOpMax, T> {
+    static inline void apply(device T* dst, device const T* src, uint base, uint count) {
+        for (uint i = base; i < min(base + kElementsPerThread, count); ++i) {
             dst[i] = max(dst[i], src[i]);
-        } else {
+        }
+    }
+};
+
+template <typename T>
+struct ApplyBinaryTail<kOpMul, T> {
+    static inline void apply(device T* dst, device const T* src, uint base, uint count) {
+        for (uint i = base; i < min(base + kElementsPerThread, count); ++i) {
             dst[i] *= src[i];
         }
     }
+};
+
+#if defined(__HAVE_BFLOAT__)
+template <>
+struct ApplyBinaryTail<kOpMin, bfloat> {
+    static inline void apply(device bfloat* dst, device const bfloat* src, uint base, uint count) {
+        for (uint i = base; i < min(base + kElementsPerThread, count); ++i) {
+            dst[i] = bf_min(dst[i], src[i]);
+        }
+    }
+};
+
+template <>
+struct ApplyBinaryTail<kOpMax, bfloat> {
+    static inline void apply(device bfloat* dst, device const bfloat* src, uint base, uint count) {
+        for (uint i = base; i < min(base + kElementsPerThread, count); ++i) {
+            dst[i] = bf_max(dst[i], src[i]);
+        }
+    }
+};
+#endif
+
+template <uint Op, typename T>
+inline void apply_binary_tail(device T* dst, device const T* src, uint base, uint count) {
+    ApplyBinaryTail<Op, T>::apply(dst, src, base, count);
 }
 
 template <uint Op, typename T, typename VecT>

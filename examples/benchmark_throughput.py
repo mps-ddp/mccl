@@ -3,7 +3,7 @@
 Compare training throughput from two ``--save-stats`` JSON files produced by
 ``examples/ddp_dummy_train.py``.
 
-1. Single-device MPS::
+1. **Baseline** = single machine **M1 Max**, one MPS device::
 
     python examples/ddp_dummy_train.py --baseline --save-stats baseline_stats.json
 
@@ -18,6 +18,7 @@ Compare training throughput from two ``--save-stats`` JSON files produced by
         --baseline baseline_stats.json --ddp ddp_stats.json -o throughput_bench
 
 Writes ``<output>.npz`` (NumPy arrays) and ``<output>.png`` if matplotlib is installed.
+The loss subplot uses **cumulative wall time** (sum of per-step times in the JSON), not step index.
 """
 from __future__ import annotations
 
@@ -25,6 +26,10 @@ import argparse
 import json
 import sys
 from pathlib import Path
+
+# What ``--save-stats`` from ``ddp_dummy_train.py --baseline`` represents in plots / stdout.
+# Override with ``--baseline-label`` if your JSON came from another machine.
+_DEFAULT_BASELINE_LABEL = "single M1 Max (MPS)"
 
 
 def _load(path: Path) -> dict:
@@ -55,7 +60,14 @@ def main() -> None:
         metavar="PREFIX",
         help="Output prefix for .npz and .png (default: benchmark_throughput)",
     )
+    parser.add_argument(
+        "--baseline-label",
+        default=_DEFAULT_BASELINE_LABEL,
+        metavar="TEXT",
+        help=f"Label for baseline JSON in charts (default: {_DEFAULT_BASELINE_LABEL!r})",
+    )
     args = parser.parse_args()
+    bl_label = args.baseline_label
 
     for label, p in ("baseline", args.baseline), ("ddp", args.ddp):
         if not p.is_file():
@@ -92,6 +104,8 @@ def main() -> None:
     ddp_times = np.asarray(ddp["step_times"], dtype=np.float64)
     bl_loss = np.asarray(bl["losses"], dtype=np.float64)
     ddp_loss = np.asarray(ddp["losses"], dtype=np.float64)
+    bl_time_s = np.cumsum(bl_times)
+    ddp_time_s = np.cumsum(ddp_times)
 
     out_npz = Path(f"{args.output}.npz")
     np.savez(
@@ -100,6 +114,8 @@ def main() -> None:
         ddp_step_times=ddp_times,
         baseline_losses=bl_loss,
         ddp_losses=ddp_loss,
+        baseline_cumulative_time_s=bl_time_s,
+        ddp_cumulative_time_s=ddp_time_s,
         baseline_throughput=bl["throughput_samples_per_sec"],
         ddp_throughput=ddp["throughput_samples_per_sec"],
         baseline_avg_step_s=bl["avg_step_time_s"],
@@ -124,13 +140,13 @@ def main() -> None:
         )
 
     print("\n=== Throughput comparison ===")
-    print(f"  baseline ({bl['mode']}):  {bl_tput:,.1f} samples/s  "
+    print(f"  {bl_label}:  {bl_tput:,.1f} samples/s  "
           f"(global_batch={bl['global_batch_size']}, world={bl['world_size']})")
-    print(f"  ddp      ({ddp['mode']}):  {ddp_tput:,.1f} samples/s  "
+    print(f"  DDP (MCCL):  {ddp_tput:,.1f} samples/s  "
           f"(global_batch={ddp['global_batch_size']}, world={ddp['world_size']})")
-    print(f"  baseline / ddp throughput ratio: {ratio:.2f}x  "
+    print(f"  {bl_label} / DDP throughput ratio: {ratio:.2f}x  "
           f"(DDP achieves ~{ddp_frac:.0f}% of baseline samples/s)")
-    print(f"  params (baseline): {bl['total_params']:,}  (ddp): {ddp['total_params']:,}")
+    print(f"  params ({bl_label}): {bl['total_params']:,}  (ddp): {ddp['total_params']:,}")
 
     try:
         import matplotlib
@@ -138,7 +154,7 @@ def main() -> None:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+        fig, axes = plt.subplots(2, 1, figsize=(10, 8))
 
         steps_bl = np.arange(len(bl_times))
         steps_ddp = np.arange(len(ddp_times))
@@ -147,7 +163,7 @@ def main() -> None:
         axes[0].plot(
             steps_bl,
             bl_times * 1000.0,
-            label=f"baseline (MPS), mean {bl_mean_ms:.1f} ms/step",
+            label=f"{bl_label}, mean {bl_mean_ms:.1f} ms/step",
             alpha=0.85,
             linewidth=1.2,
         )
@@ -165,9 +181,21 @@ def main() -> None:
         axes[0].legend(loc="upper right", fontsize=9)
         axes[0].grid(True, alpha=0.3)
 
-        axes[1].plot(steps_bl, bl_loss, label="baseline loss", alpha=0.85, linewidth=1.2)
-        axes[1].plot(steps_ddp, ddp_loss, label="ddp loss", alpha=0.85, linewidth=1.2)
-        axes[1].set_xlabel("Training step (after warmup, zero-based in JSON)")
+        axes[1].plot(
+            bl_time_s,
+            bl_loss,
+            label=f"{bl_label} loss",
+            alpha=0.85,
+            linewidth=1.2,
+        )
+        axes[1].plot(
+            ddp_time_s,
+            ddp_loss,
+            label="ddp loss",
+            alpha=0.85,
+            linewidth=1.2,
+        )
+        axes[1].set_xlabel("Wall time (s, cumulative from timed train steps)")
         axes[1].set_ylabel("Loss")
         axes[1].legend(loc="upper right", fontsize=9)
         axes[1].grid(True, alpha=0.3)
@@ -176,7 +204,7 @@ def main() -> None:
         gbatch = int(bl["global_batch_size"])
         fig.suptitle(
             f"MCCL benchmark  |  global_batch={gbatch}  |  ~{nparams / 1e6:.1f}M params  |  "
-            f"baseline/DDP throughput = {ratio:.2f}×",
+            f"{bl_label} / DDP throughput = {ratio:.2f}×",
             fontsize=11,
             y=1.02,
         )
@@ -187,13 +215,13 @@ def main() -> None:
         print(f"wrote {out_png.resolve()}")
 
         fig2, ax2 = plt.subplots(figsize=(7, 4.5))
-        names = ["baseline\n(MPS)", "DDP\n(MCCL)"]
+        names = [bl_label.replace(" ", "\n"), "DDP\n(MCCL)"]
         vals = [bl_tput, ddp_tput]
         colors = ["#2ecc71", "#3498db"]
         bars = ax2.bar(names, vals, color=colors, width=0.55)
         ax2.set_ylabel("Throughput (samples / sec)")
         ax2.set_title(
-            f"Average throughput  |  global_batch={gbatch}  |  baseline/DDP = {ratio:.2f}×",
+            f"Average throughput  |  global_batch={gbatch}  |  {bl_label} / DDP = {ratio:.2f}×",
         )
         ax2.grid(True, axis="y", alpha=0.3)
         ymax = max(vals) * 1.18 if vals else 1.0

@@ -117,10 +117,10 @@ def single_gpu_baseline() -> None:
             return self.classifier(x)  # Direct classification
 
     model = LargeMLPTransformer(
-        input_dim=512, 
-        hidden_dim=1024, 
-        num_layers=6,
-        num_classes=100
+        input_dim=256, 
+        hidden_dim=512, 
+        num_layers=4,
+        num_classes=10
     ).to(device)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.01)
@@ -144,8 +144,8 @@ def single_gpu_baseline() -> None:
     
     for step in range(warmup_steps + steps):
         torch.manual_seed(1000 + step)
-        x = torch.randn(batch_size, 512, device=device)
-        y = torch.randint(0, 100, (batch_size,), device=device)
+        x = torch.randn(batch_size, 256, device=device)
+        y = torch.randint(0, 10, (batch_size,), device=device)
         
         start_time = time.perf_counter()
         
@@ -258,10 +258,10 @@ def main() -> None:
             return self.classifier(x)  # Direct classification
 
     model = LargeMLPTransformer(
-        input_dim=512, 
-        hidden_dim=1024,  # Smaller hidden dim
-        num_layers=6,     # Fewer layers  
-        num_classes=100   # Fewer classes
+        input_dim=256,    # Much smaller input
+        hidden_dim=512,   # Reasonable hidden dim
+        num_layers=4,     # Fewer layers  
+        num_classes=10    # Back to 10 classes
     ).to(device)
     ddp = DDP(model)
 
@@ -270,7 +270,7 @@ def main() -> None:
 
     steps = int(os.environ.get("TRAIN_STEPS", "30"))  # Reasonable for testing
     batch_size = int(os.environ.get("BATCH_SIZE", "64"))  # Back to larger batch
-    input_dim = 512
+    input_dim = 256
 
     # Model stats
     total_params = sum(p.numel() for p in model.parameters())
@@ -296,7 +296,7 @@ def main() -> None:
         # Different data per rank (simulates data sharding)
         torch.manual_seed(1000 + step * world_size + rank)
         x = torch.randn(batch_size, input_dim, device=device)
-        y = torch.randint(0, 100, (batch_size,), device=device)  # 100-class classification
+        y = torch.randint(0, 10, (batch_size,), device=device)  # 10-class classification
 
         start_time = time.perf_counter()
         

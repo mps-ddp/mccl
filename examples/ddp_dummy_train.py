@@ -177,6 +177,9 @@ def main() -> None:
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    
+    # Try to avoid Metal command buffer issues during gradient sync
+    os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 
     if world_size < 2:
         print(
@@ -250,9 +253,24 @@ def main() -> None:
         start_time = time.perf_counter()
         
         optimizer.zero_grad(set_to_none=True)
+        
+        if rank == 0 and step < 3:
+            print(f"    step {step}: forward pass...", flush=True)
         logits = ddp(x)
         loss = loss_fn(logits, y)
-        loss.backward()  # This triggers gradient allreduce via MCCL
+        
+        if rank == 0 and step < 3:
+            print(f"    step {step}: backward pass...", flush=True)
+        
+        # Try to isolate the Metal crash
+        try:
+            loss.backward()  # This triggers gradient allreduce via MCCL
+        except Exception as e:
+            print(f"BACKWARD FAILED: {e}", flush=True)
+            raise
+            
+        if rank == 0 and step < 3:
+            print(f"    step {step}: optimizer step...", flush=True)
         optimizer.step()
         
         step_time = time.perf_counter() - start_time

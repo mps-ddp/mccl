@@ -89,17 +89,10 @@ def single_gpu_baseline() -> None:
     device = torch.device("mps")
     torch.manual_seed(42)
     
-    # Same medium model as DDP version
+    # Same simple model as DDP version
     model = nn.Sequential(
-        nn.Linear(256, 1024),
+        nn.Linear(256, 512),
         nn.ReLU(),
-        nn.Dropout(0.1),
-        nn.Linear(1024, 1024),
-        nn.ReLU(),
-        nn.Dropout(0.1),
-        nn.Linear(1024, 512),
-        nn.ReLU(),
-        nn.Dropout(0.1),
         nn.Linear(512, 256),
         nn.ReLU(),
         nn.Linear(256, 10),
@@ -109,7 +102,7 @@ def single_gpu_baseline() -> None:
     loss_fn = nn.CrossEntropyLoss()
     
     steps = int(os.environ.get("TRAIN_STEPS", "30"))
-    batch_size = int(os.environ.get("BATCH_SIZE", "64"))
+    batch_size = int(os.environ.get("BATCH_SIZE", "32"))
     
     total_params = sum(p.numel() for p in model.parameters())
     print(
@@ -211,28 +204,21 @@ def main() -> None:
 
     torch.manual_seed(42 + rank)
 
-    # Medium-sized model that benefits from DDP without crashing Metal
+    # Simple model that won't crash Metal during gradient sync
     model = nn.Sequential(
-        nn.Linear(256, 1024),
+        nn.Linear(256, 512),
         nn.ReLU(),
-        nn.Dropout(0.1),
-        nn.Linear(1024, 1024),
-        nn.ReLU(),
-        nn.Dropout(0.1),
-        nn.Linear(1024, 512),
-        nn.ReLU(),
-        nn.Dropout(0.1),
         nn.Linear(512, 256),
         nn.ReLU(),
         nn.Linear(256, 10),
     ).to(device)
-    ddp = DDP(model)
+    ddp = DDP(model, find_unused_parameters=False)
 
     optimizer = torch.optim.AdamW(ddp.parameters(), lr=0.0001, weight_decay=0.01)
     loss_fn = nn.CrossEntropyLoss()
 
     steps = int(os.environ.get("TRAIN_STEPS", "30"))  # Reasonable for testing
-    batch_size = int(os.environ.get("BATCH_SIZE", "64"))  # Back to larger batch
+    batch_size = int(os.environ.get("BATCH_SIZE", "32"))  # Smaller batch to be safe
     input_dim = 256
 
     # Model stats

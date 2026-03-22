@@ -1,0 +1,37 @@
+# Build sdist + arm64 wheel on Apple Silicon, upload to PyPI.
+# Configure either:
+#   - PyPI "Trusted Publishing" for this repo + workflow (OIDC, no token), or
+#   - Repository secret PYPI_API_TOKEN (classic API token) and uncomment the `with:` block below.
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build
+        run: pip install --upgrade pip build
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      # Uses repo secret PYPI_API_TOKEN (classic API token). For OIDC instead, remove `with:` and
+      # configure https://pypi.org/manage/project/settings/publishing/ for this workflow.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

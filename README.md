@@ -4,10 +4,6 @@
 
 `torch.distributed` backend for DDP and collectives on **MPS** (Apple Silicon). TCP by default; RDMA only if the machine/OS actually supports it.
 
-macOS **arm64** only. CI is `macos-15` + `pytest tests/test_build.py tests/test_ddp.py` (two processes on one runner, not two laptops).
-
-Fix **`OWNER/REPO`** in the badge link and in `pyproject.toml` → `[project.urls]` when the repo exists.
-
 ## Requirements
 
 - Apple Silicon Mac (arm64). No Intel.

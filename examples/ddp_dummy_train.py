@@ -53,16 +53,16 @@ If MPS runs out of memory, lower ``BATCH_SIZE`` (e.g. 2) or reduce ``MODEL_HIDDE
 
 Optional env (see MCCL docs): ``MCCL_LISTEN_ADDR``, ``MCCL_PORT_BASE``, ``MCCL_TRANSPORT``,
 ``MCCL_LINK_PROFILE=thunderbolt`` (production TCP tuning on Thunderbolt IP — see ``scripts/thunderbolt_prod.sh``).
-Training env: ``TRAIN_STEPS`` (default 500), ``BATCH_SIZE`` (default 4 per rank),
+Training env: ``TRAIN_STEPS`` (default 500), ``BATCH_SIZE`` (default **128** per DDP rank → global **256** with 2 ranks),
 ``DDP_BUCKET_MB`` (default 25; **512** if ``MCCL_LINK_PROFILE=thunderbolt`` and unset; else try **50–200+** for 2-node),
 ``TRAIN_AUTOCAST_FP16=1`` for ``torch.autocast`` fp16 forward+loss (smaller/faster on MPS),
 ``MCCL_COMPRESSION=fp16`` when supported (halves cross-host bytes).
 
 **Multi-node guide**: ``docs/MULTINODE.md`` (firewall, listen addr, baseline matching).
 
-**Fair baseline vs DDP**: set ``BASELINE_BATCH_SIZE`` to the **global** batch
-(``BATCH_SIZE * WORLD_SIZE`` from your DDP run), e.g. ``BASELINE_BATCH_SIZE=8``
-for 4 per rank × 2 nodes.
+**Fair baseline vs DDP**: default baseline batch is **256** (global on one GPU).
+DDP default is **128 per rank** × **world 2** = **256** global. Override with
+``BASELINE_BATCH_SIZE`` / ``BATCH_SIZE`` if you OOM.
 
 **Why it looks like a "hang"**
 
@@ -428,9 +428,11 @@ def single_gpu_baseline(save_stats: str | None = None) -> None:
     loss_fn = nn.CrossEntropyLoss()
 
     steps = int(os.environ.get("TRAIN_STEPS", "500"))
-    batch_size = int(os.environ.get("BATCH_SIZE", "4"))
     if os.environ.get("BASELINE_BATCH_SIZE"):
         batch_size = int(os.environ["BASELINE_BATCH_SIZE"])
+    else:
+        # Default 256 global on one GPU — matches 2-rank DDP with BATCH_SIZE=128 each.
+        batch_size = int(os.environ.get("BATCH_SIZE", "256"))
     input_dim, num_classes, _, _ = _model_dims_from_env()
     dataset = SyntheticDataset(input_dim, num_classes)
 
@@ -439,7 +441,7 @@ def single_gpu_baseline(save_stats: str | None = None) -> None:
     print(
         f"Single GPU baseline | device={device}\n"
         f"  Model: {total_params:,} params{'  MCCL_STRESS_MODEL' if st else ''}\n"
-        f"  Batch: {batch_size} (set BASELINE_BATCH_SIZE=global_batch to match DDP)\n"
+        f"  Batch: {batch_size} global (override BASELINE_BATCH_SIZE / BATCH_SIZE if OOM)\n"
         f"  Steps: {steps}\n"
         f"  INPUT_DIM={input_dim} NUM_CLASSES={num_classes} "
         f"(MODEL_HIDDEN/MODEL_DEPTH from env)",
@@ -620,7 +622,7 @@ def main() -> None:
     loss_fn = nn.CrossEntropyLoss()
 
     steps = int(os.environ.get("TRAIN_STEPS", "500"))
-    batch_size = int(os.environ.get("BATCH_SIZE", "4"))
+    batch_size = int(os.environ.get("BATCH_SIZE", "128"))
     input_dim, num_classes, _, _ = _model_dims_from_env()
     dataset = SyntheticDataset(input_dim, num_classes)
 

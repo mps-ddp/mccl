@@ -8,7 +8,7 @@ export PYTHONUNBUFFERED=1
 
 # Shared knobs — override before calling this script if you want longer runs
 export TRAIN_STEPS="${TRAIN_STEPS:-30}"
-export BATCH_SIZE="${BATCH_SIZE:-4}"
+export BATCH_SIZE="${BATCH_SIZE:-128}"
 # Fair baseline vs local 2-rank DDP: same **global** batch (per_rank × 2).
 # Override explicitly for multi-node (e.g. BASELINE_BATCH_SIZE=$((BATCH_SIZE*2))).
 export BASELINE_BATCH_SIZE="${BASELINE_BATCH_SIZE:-$((BATCH_SIZE * 2))}"

@@ -47,28 +47,32 @@ dist.init_process_group(backend="mccl", rank=rank, world_size=world_size)
 model = DDP(MyModel().to("mps"))
 ```
 
-## Throughput chart (one run)
+`ddp_dummy_train.py` defaults: **DDP** `BATCH_SIZE=128` per rank (global **256** with 2 ranks); **`--baseline`** global **256** unless you set `BASELINE_BATCH_SIZE` / `BATCH_SIZE`. Lower if you OOM.
 
-**Numbers from that run** (`--save-stats` + `examples/benchmark_throughput.py`): **~59.6** vs **~22.9** samples/s (baseline vs 2-rank DDP), **~2.6×** throughput ratio — **only** for that JSON, not a spec.
+## Throughput (example — **your mileage will vary**)
 
-**Setup was wrong for a fair fight:**
+Latest author run (`examples/ddp_dummy_train.py` + `--save-stats` + `examples/benchmark_throughput.py`):
 
-| | Baseline | DDP |
-|--|--|--|
-| Hardware | **1× M1 Max** | **2 Macs, mixed SoCs** (e.g. M1 Max + M4 Max) |
-| Network | — | **TCP**, TB3-class link |
-| Model / batch | ~96M-param example, **global batch 8** | same |
+```
+single M1 Max (MPS):  78.3 samples/s   (global_batch=256, world=1)
+DDP (MCCL):          134.2 samples/s   (global_batch=256, world=2)
+baseline / DDP:      0.58×  → DDP ~172% of baseline samples/s
+params:              96,510,024 (same both sides)
+```
 
-So: **slowest rank wins the step**, baseline never hits the network, chips don’t match — **don’t read this as “MCCL is 2.6× slower” in general.** No same-SKU cluster to test on; **PR [RESULTS.md](RESULTS.md)** if you have better data.
+**Global batch 256:** baseline = `BASELINE_BATCH_SIZE=256` (or `BATCH_SIZE=256` on one process). DDP = **`BATCH_SIZE=128` per rank × 2 ranks** (or 256×1 on two nodes — same global).
+
+**Takeaway:** with this **~96M-param** model, **big batch + higher GPU/memory util**, **2-rank MCCL DDP beat one M1 Max** on **samples/s** in our JSON. With **small global batch** (we’ve seen **global 8**), **comm/sync dominated** and DDP looked **much slower**. **Hardware mix still matters** (slowest rank sets the step); **PR [RESULTS.md](RESULTS.md)** with your setup.
 
 ```bash
+# Match global batch: e.g. DDP BATCH_SIZE=128 × world 2 → baseline BASELINE_BATCH_SIZE=256
 python examples/ddp_dummy_train.py --baseline --save-stats baseline_stats.json
 torchrun --nproc_per_node=2 --nnodes=1 --master_addr=127.0.0.1 --master_port=29500 \
   examples/ddp_dummy_train.py --save-stats ddp_stats.json
 python examples/benchmark_throughput.py --baseline baseline_stats.json --ddp ddp_stats.json -o bench
 ```
 
-`bash scripts/benchmark_matrix.sh` — other checks. Env knobs: [examples/ddp_dummy_train.py](examples/ddp_dummy_train.py).
+`bash scripts/benchmark_matrix.sh` — other checks. Env: [examples/ddp_dummy_train.py](examples/ddp_dummy_train.py).
 
 ![bench](bench.png)  
 ![bars](bench_bars.png)
@@ -108,7 +112,7 @@ mccl.get_metrics(); mccl.log_metrics(); mccl.reset_metrics()
 
 ## Thunderbolt, TCP, and what was tested
 
-- **Throughput charts in this repo:** two Macs talking over a **Thunderbolt bridge IP** using the **TCP** transport path (TB3-class link in our case). **Not RDMA.**
+- **Throughput charts in this repo:** **TCP** over a **Thunderbolt bridge IP** (TB3-class link here). **Not RDMA.** Plots match the **high global-batch** run above unless you regenerate.
 - **Ethernet / Wi‑Fi:** same code paths; expect worse RTT and throughput than a direct TB cable between hosts.
 - **`MCCL_LINK_PROFILE=thunderbolt`:** optional buffer/chunk tuning when peers are on a TB link — see [docs/MULTINODE.md](docs/MULTINODE.md).
 - **Cabling / `169.254.x.x` / firewall:** [docs/THUNDERBOLT_SETUP.md](docs/THUNDERBOLT_SETUP.md).

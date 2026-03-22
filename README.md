@@ -2,7 +2,9 @@
 
 [![CI](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml)
 
-`torch.distributed` backend for DDP and collectives on **MPS** (Apple Silicon). TCP by default; RDMA only if the machine/OS actually supports it.
+MCCL registers a **`mccl`** backend for **`torch.distributed`** on **Apple Silicon (MPS)**. Install PyTorch, then **`pip install mccl`**, and use `torchrun` with `dist.init_process_group(backend="mccl", device_id=…)` for DDP—**single-node or multi-node**. For multiple Macs, set listen/bind addresses and open ports (`MCCL_*`, firewall); see [docs/MULTINODE.md](docs/MULTINODE.md).
+
+Uses **TCP** by default; **RDMA** only where the OS exposes it.
 
 ## Requirements
 
@@ -22,6 +24,13 @@ pip install mccl
 Source tree: `pip install -e ".[dev]"`. If the PyPI name `mccl` is taken, rename in `pyproject.toml` and `setup.py`.
 
 Demo: https://github.com/user-attachments/assets/21865149-b077-4b65-93cc-f9e319ff0328
+
+## Performance
+
+**M4 Max** + **M1 Max**, TCP over Thunderbolt, global batch **256**, ~**96.5M** params — **~78** samples/s single-GPU vs **~134** samples/s MCCL DDP (2 ranks). Details and reproduce commands in [Throughput](#throughput) below.
+
+![bench](bench.png)  
+![bars](bench_bars.png)
 
 ## Examples
 
@@ -95,9 +104,6 @@ python examples/benchmark_throughput.py --baseline baseline_stats.json --ddp ddp
 ```
 
 `bash scripts/benchmark_matrix.sh` for more sweeps.
-
-![bench](bench.png)  
-![bars](bench_bars.png)
 
 ## PyPI (maintainers)
 

@@ -26,9 +26,8 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# Replace with your GitHub path after publishing (badge + PyPI sidebar).
 [project.urls]
-Repository = "https://github.com/OWNER/REPO"
+Repository = "https://github.com/mps-ddp/mccl"
 
 
 [project.optional-dependencies]

@@ -1,6 +1,6 @@
 # MCCL
 
-[![CI](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+[![CI](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml)
 
 `torch.distributed` backend for DDP and collectives on **MPS** (Apple Silicon). TCP by default; RDMA only if the machine/OS actually supports it.
 
@@ -10,7 +10,7 @@
 - **Xcode Command Line Tools** — `xcode-select --install` (needed to compile the extension).
 - **Full Xcode** — optional; speeds up Metal by emitting a `.metallib` at build time instead of JIT at runtime.
 - **Python 3.11+**
-- **PyTorch 2.5+** installed *before* you build or `pip install` this package.
+- **`torch` (PyTorch) ≥2.5** — required dependency of the `mccl` package ([`pyproject.toml`](pyproject.toml), [`requirements.txt`](requirements.txt)); install it first when building from source so headers/libs resolve (`pip install torch` or `pip install -r requirements.txt`).
 
 ## Install
 
@@ -75,17 +75,6 @@ if __name__ == "__main__":
 torchrun --nproc_per_node=2 --nnodes=1 --master_addr=127.0.0.1 --master_port=29500 your_train.py
 ```
 
-## Docs
-
-| | |
-|--|--|
-| Two Macs / TB | [docs/THUNDERBOLT_SETUP.md](docs/THUNDERBOLT_SETUP.md) |
-| Firewall, ports, env tuning | [docs/MULTINODE.md](docs/MULTINODE.md) (`MCCL_*`, buckets, listen addr) |
-| Dev / layout | [docs/DEVELOPING.md](docs/DEVELOPING.md) |
-| Tests | [TESTING.md](TESTING.md) |
-| Versions | [COMPATIBILITY.md](COMPATIBILITY.md) |
-| Timings | [RESULTS.md](RESULTS.md) |
-
 ## Throughput
 
 One saved run, **M4 Max** + **M1 Max** MBPs, TCP over TB, global batch **256**, ~**96.5M** params. Your numbers will differ.
@@ -140,7 +129,9 @@ Bench plots were TCP over a Thunderbolt-style link, not RDMA. Wi‑Fi/Ethernet w
 
 ## Internals
 
-f32 reductions: Accelerate/vDSP on CPU-visible MPS memory (`csrc/metal/AccelerateOps.mm`), chunked; Apple’s math can route through AMX. fp16/bf16: Metal when big enough, else widen to f32 and back. Network: TCP progress thread, ring/direct allreduce depending on world size. Details: [docs/DEVELOPING.md](docs/DEVELOPING.md)
+Apple Silicon is **UMA**: GPU and CPU share a physical memory pool. MPS tensors are usually **`MTLBuffer`s**; with **`MTLStorageModeShared`**, `buffer.contents` is a CPU pointer into the **same pages** the GPU uses (`extract_mps_buffer`, `MPSInterop.mm`). MCCL **exploits that** by staging sends from that pointer, writing receives with `memcpy` into it, and running **Accelerate/vDSP** in **`AccelerateOps.mm`** on the same bytes—no duplicate host tensor when the fast path applies. **Private** GPU storage still needs a **blit** through a shared staging buffer (`chunked_blit_*`).
+
+I/O runs on a **queued worker** (`ProgressEngine`, `csrc/runtime/`). Before the worker reads or sends, **`commit_mps_and_signal` / `wait_for_mps`** (`EventSync.mm`) align CPU access with a finished PyTorch MPS command buffer via **`MTLSharedEvent`**; `MCCL_EVENT_SYNC=0` forces stream sync instead. `ProcessGroupMCCL.cpp` submits work into this pipeline. [docs/DEVELOPING.md](docs/DEVELOPING.md) covers collectives and transport.
 
 ## License
 

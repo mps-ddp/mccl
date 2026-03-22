@@ -82,7 +82,7 @@ def init(
     Examples::
 
         # Keyword shorthand
-        mccl.init(compression="fp16", listen_addr="192.168.1.10")
+        mccl.init(compression="fp16")
 
         # Full config object
         cfg = mccl.MCCLConfig(fast_math=False, gpu_threshold=8192)

@@ -51,7 +51,7 @@ is easier to see. Override any dim with env:
 
 If MPS runs out of memory, lower ``BATCH_SIZE`` (e.g. 2) or reduce ``MODEL_HIDDEN`` / ``MODEL_DEPTH``.
 
-Optional env (see MCCL docs): ``MCCL_LISTEN_ADDR``, ``MCCL_PORT_BASE``, ``MCCL_TRANSPORT``,
+Optional env (see MCCL docs): ``MCCL_PORT_BASE``, ``MCCL_TRANSPORT``,
 ``MCCL_LINK_PROFILE=thunderbolt`` (production TCP tuning on Thunderbolt IP — see ``scripts/thunderbolt_prod.sh``).
 Training env: ``TRAIN_STEPS`` (default 500), ``BATCH_SIZE`` (default **128** per DDP rank → global **256** with 2 ranks),
 ``DDP_BUCKET_MB`` (default 25; **512** if ``MCCL_LINK_PROFILE=thunderbolt`` and unset; else try **50–200+** for 2-node),
@@ -74,10 +74,8 @@ DDP default is **128 per rank** × **world 2** = **256** global. Override with
    TCP to ``MASTER_ADDR:MASTER_PORT`` (default 29500), it retries forever. **Open inbound TCP
    on the master** for that port (macOS Firewall / Security).
 
-3. **MCCL** — After the store works, ranks exchange ``IP:port`` for MCCL's own sockets. If the
-   published address is wrong (e.g. loopback or another interface), peers **hang in
-   ``connect_all``**. On each Mac set ``MCCL_LISTEN_ADDR`` to that machine's **reachable**
-   unicast IP on the link between the two (not ``.255`` broadcast, not ``127.0.0.1``).
+3. **MCCL** — After the store works, ranks connect for collective traffic. Hangs here are usually
+   firewall / wrong ``MASTER_ADDR`` / not all nodes up.
 
 4. **Ports to allow** (world_size=2, default): ``MASTER_PORT`` (e.g. 29500) and
    ``MCCL_PORT_BASE`` … ``MCCL_PORT_BASE+1`` (e.g. 29600–29601 if ``MCCL_PORT_BASE=29600``).
@@ -550,19 +548,9 @@ def main() -> None:
     _apply_thunderbolt_profile_training_defaults()
     print(
         f"[ddp_dummy_train] MCCL_PORT_BASE={os.environ.get('MCCL_PORT_BASE')} "
-        f"MCCL_LISTEN_ADDR={os.environ.get('MCCL_LISTEN_ADDR', '(unset)')} "
         f"MCCL_LINK_PROFILE={os.environ.get('MCCL_LINK_PROFILE', '(unset)')}",
         flush=True,
     )
-    master_addr = os.environ.get("MASTER_ADDR", "")
-    if master_addr and master_addr not in ("127.0.0.1", "localhost", "::1"):
-        if "MCCL_LISTEN_ADDR" not in os.environ:
-            print(
-                "[ddp_dummy_train] hint: multi-node? set MCCL_LISTEN_ADDR on **each** machine to "
-                "that machine's own IP on the peer link (not MASTER_ADDR). "
-                "Open firewall for MCCL_PORT_BASE..+world_size-1.",
-                flush=True,
-            )
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])

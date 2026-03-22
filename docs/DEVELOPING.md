@@ -19,7 +19,7 @@ PyTorch ships NCCL for CUDA and Gloo for CPU; **MPS did not have a first-party m
 | `csrc/runtime/` | Progress engine, watchdog, metrics, memory pool, rendezvous |
 | `csrc/compression/` | Optional fp16 / top-k compression |
 | `examples/` | `ddp_dummy_train.py`, compare scripts |
-| `docs/MULTINODE.md` | **2+ Macs**: wiring, firewall, `MCCL_LISTEN_ADDR`, tuning for cross-host DDP |
+| `docs/MULTINODE.md` | **2+ Macs**: `MASTER_ADDR` (head), firewall, ports, tuning |
 | `tests/` | Pytest suite (see [TESTING.md](../TESTING.md)) |
 
 ## Build (from source)
@@ -56,7 +56,7 @@ python setup.py build_ext --inplace
 
    **DDP**: `examples/ddp_dummy_train.py` uses **bucketed** allreduce during `backward()` (no `no_sync()` workaround). **`MCCL_SYNC_MODE=coalesced` must not** be used with hook-driven multi-bucket DDP (skips per-bucket GPU waits → corrupt traffic).
 
-   **Multi-node**: see [MULTINODE.md](MULTINODE.md) for `MCCL_LISTEN_ADDR`, ports, and tuning.
+   **Multi-node**: see [MULTINODE.md](MULTINODE.md) for `MASTER_ADDR`, ports / firewall, and tuning.
 4. **Float32 + shared memory**: often **CPU-side reduction** via Accelerate (vDSP) reading the same pointers as MPS.
 5. **Float16 / bf16**: **Metal** kernels on a dedicated MCCL queue; may sync more heavily.
 6. **Transport**: overlapped **TCP** by default; **RDMA** optional when OS/hardware support it (`MCCL_TRANSPORT`).

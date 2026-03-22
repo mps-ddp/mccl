@@ -6,15 +6,15 @@ Checklist and tuning for **one MPS GPU per machine** (`torchrun --nnodes=N --npr
 
 ## Phase 0 — Wiring (do this before tuning performance)
 
-1. **`MCCL_LISTEN_ADDR`** (each Mac): set to **this machine’s** IP on the **link to peers** (Thunderbolt bridge `169.254.x.x`, or LAN). **Not** `MASTER_ADDR` of the other host. **Not** `127.0.0.1` for real cross-host traffic.
+1. **`MASTER_ADDR` / `MASTER_PORT` (head / rank 0)** — On **every** node, set `MASTER_ADDR` to the **rank-0 machine’s reachable IP** (Thunderbolt bridge `169.254.x.x`, LAN, etc.) and the same `MASTER_PORT` everywhere. Standard PyTorch multi-node; MCCL follows from that.
 
 2. **Firewall (both sides)**  
    - PyTorch store: `MASTER_PORT` (e.g. 29500).  
-   - MCCL: `MCCL_PORT_BASE` through `MCCL_PORT_BASE + world_size - 1` (default base is often `MASTER_PORT + 100` — see `ddp_dummy_train._setup_mccl_env`).
+   - MCCL: `MCCL_PORT_BASE` through `MCCL_PORT_BASE + world_size - 1` (default base is often `MASTER_PORT + 100` — see `ddp_dummy_train._setup_mccl_env`). Keep **`MCCL_PORT_BASE` ≠ `MASTER_PORT`**.
 
 3. **Link**: Prefer **Thunderbolt bridge** or **wired Ethernet** over WiFi for bandwidth and stable latency.
 
-4. **Same software**: Matching **PyTorch** and **`pip install -e .`** MCCL build on every node (nightly vs stable mismatch causes subtle failures).
+4. **Same software**: Matching **PyTorch** and **MCCL** build on every node (nightly vs stable mismatch causes subtle failures).
 
 5. **Elastic / launcher**: With `--nnodes=2`, workers start only after all nodes join — starting one machine alone can look like a hang until the second runs the same command.
 
@@ -23,7 +23,7 @@ Checklist and tuning for **one MPS GPU per machine** (`torchrun --nnodes=N --npr
 Direct Mac-to-Mac Thunderbolt often uses **link-local** IPv4 (`169.254.x.x`). For a **production-ready, high-throughput TCP** setup:
 
 1. Set **`MASTER_ADDR`** on every node to the **rank-0 Mac’s Thunderbolt IPv4** (the address on the bridge interface peers can reach).
-2. **Multi-homed Macs**: when `MASTER_ADDR` is in `169.254.0.0/16`, MCCL **prefers the Thunderbolt bridge** when publishing the listen endpoint from `0.0.0.0` (see `resolve_best_local_addr` in [`csrc/transport/TcpTransport.cpp`](../csrc/transport/TcpTransport.cpp)) so ranks do not advertise a Wi‑Fi/LAN IP by mistake.
+2. **Multi-homed Macs**: when `MASTER_ADDR` is in `169.254.0.0/16`, MCCL **prefers the Thunderbolt bridge** for peer-visible addresses (`resolve_best_local_addr` in [`csrc/transport/TcpTransport.cpp`](../csrc/transport/TcpTransport.cpp)) so ranks do not pick Wi‑Fi/LAN by mistake.
 3. **Opt-in tuning**: on **all** nodes, before `init_process_group`:
    - `export MCCL_LINK_PROFILE=thunderbolt`, or
    - `source scripts/thunderbolt_prod.sh`

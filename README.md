@@ -4,7 +4,7 @@
 
 MCCL registers a **`mccl`** backend for **`torch.distributed`** on **Apple Silicon (MPS)**.
 
-Install PyTorch, then **`pip install mccl`**, and use `torchrun` with `dist.init_process_group(backend="mccl", device_id=…)` for DDP—**single-node or multi-node** on MPS. 
+Install PyTorch, then **`pip install mccl`**. That opens the door to **several Apple Silicon machines training as one run** over the network—not just a single box. Multi-machine setup: [docs/MULTINODE.md](docs/MULTINODE.md). Transport is **TCP** by default; **RDMA** only where the OS supports it.
 
 ## Requirements
 
@@ -42,7 +42,7 @@ torchrun --nproc_per_node=2 --nnodes=1 --master_addr=127.0.0.1 --master_port=295
 
 Defaults there: DDP `BATCH_SIZE=128` per rank → global 256 with 2 ranks; baseline path uses global 256 unless you override. Shrink batch if you OOM.
 
-Minimal DDP script (run with `torchrun` below). Multi-node needs `MCCL_LISTEN_ADDR`, `MCCL_PORT_BASE`, etc. — [docs/MULTINODE.md](docs/MULTINODE.md).
+Minimal DDP script (run with `torchrun` below). Multi-node: set **`MASTER_ADDR`** to the rank-0 host on every machine (standard PyTorch); optional MCCL env if autodetection is wrong — [docs/MULTINODE.md](docs/MULTINODE.md).
 
 ```python
 import os

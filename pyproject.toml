@@ -32,6 +32,7 @@ Repository = "https://github.com/mps-ddp/mccl"
 
 [project.optional-dependencies]
 dev = [
+    "numpy>=1.24",  # PyTorch probes NumPy at import; avoids UserWarning in CI without it
     "pytest>=7.0",
     "pytest-timeout>=2.1",
 ]

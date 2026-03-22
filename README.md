@@ -105,17 +105,6 @@ python examples/benchmark_throughput.py --baseline baseline_stats.json --ddp ddp
 
 `bash scripts/benchmark_matrix.sh` for more sweeps.
 
-## PyPI (maintainers)
-
-**CI (tests only):** push to **`main`** or **`master`**, or open a PR targeting those branches. That runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — it does **not** upload to PyPI.
-
-**Upload:** [`.github/workflows/publish.yml`](.github/workflows/publish.yml) runs on **GitHub Release (published)** or **Actions → Publish to PyPI → Run workflow** (`workflow_dispatch`).
-
-1. GitHub repo → **Settings → Secrets and variables → Actions** → New repository secret **`PYPI_API_TOKEN`** (PyPI → Account settings → API tokens).
-2. Bump **`version`** in `pyproject.toml`, `setup.py`, and the assertion in `tests/test_build.py`.
-3. Either: **Releases → Draft a new release** → publish (triggers upload), or **Actions** tab → **Publish to PyPI** → **Run workflow** → branch `main`.
-
-First-time PyPI: create the **`mccl`** project on pypi.org (or change the package `name` everywhere if the name is taken).
 
 ## Collectives
 

@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml)
 
-MCCL registers a **`mccl`** backend for **`torch.distributed`** on **Apple Silicon (MPS)**. Install PyTorch, then **`pip install mccl`**, and use `torchrun` with `dist.init_process_group(backend="mccl", device_id=…)` for DDP—**single-node or multi-node**. For multiple Macs, set listen/bind addresses and open ports (`MCCL_*`, firewall); see [docs/MULTINODE.md](docs/MULTINODE.md).
+MCCL registers a **`mccl`** backend for **`torch.distributed`** on **Apple Silicon (MPS)**.
 
-Uses **TCP** by default; **RDMA** only where the OS exposes it.
+Install PyTorch, then **`pip install mccl`**, and use `torchrun` with `dist.init_process_group(backend="mccl", device_id=…)` for DDP—**single-node or multi-node** on MPS. 
 
 ## Requirements
 

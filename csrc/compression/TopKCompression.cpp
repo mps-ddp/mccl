@@ -31,22 +31,20 @@ size_t TopKCompressor::compress(const void* src, size_t nbytes,
 
     const float* data = static_cast<const float*>(src);
 
-    // Ensure error feedback buffer is sized.
-    // NOTE: error_buf_ is keyed only on element count, not on tensor identity.
-    // If two different parameter tensors share the same element count (common in
-    // practice), their error feedback states are merged into the same buffer,
-    // corrupting the residual signal for both.  A future fix would use a
-    // per-tensor-id error buffer map.  For now, TopK compression is documented
-    // as experimental.
-    if (error_buf_.size() != count) {
-        error_buf_.assign(count, 0.0f);
-        last_count_ = count;
+    // Get tensor identity using data pointer (stable for DDP gradient buffers)
+    uintptr_t tensor_id = reinterpret_cast<uintptr_t>(src);
+    
+    // Ensure per-tensor error feedback buffer is sized
+    auto it = error_buffers_.find(tensor_id);
+    if (it == error_buffers_.end() || it->second.size() != count) {
+        error_buffers_[tensor_id].assign(count, 0.0f);
     }
+    std::vector<float>& error_buf = error_buffers_[tensor_id];
 
     // Add error feedback to current gradients
     std::vector<float> adjusted(count);
     for (size_t i = 0; i < count; i++) {
-        adjusted[i] = data[i] + error_buf_[i];
+        adjusted[i] = data[i] + error_buf[i];
     }
 
     // Find top-k by magnitude using partial sort
@@ -87,7 +85,7 @@ size_t TopKCompressor::compress(const void* src, size_t nbytes,
 
     // Error feedback: unsent values become the residual for next iteration
     for (size_t i = 0; i < count; i++) {
-        error_buf_[i] = sent[i] ? 0.0f : adjusted[i];
+        error_buf[i] = sent[i] ? 0.0f : adjusted[i];
     }
 
     double sparsity = 100.0 * (1.0 - (double)k / count);
@@ -136,8 +134,17 @@ size_t TopKCompressor::max_compressed_size(size_t nbytes) const {
 }
 
 void TopKCompressor::reset_error_feedback() {
-    std::fill(error_buf_.begin(), error_buf_.end(), 0.0f);
-    MCCL_DEBUG("TopK: error feedback buffer reset");
+    error_buffers_.clear();
+    MCCL_DEBUG("TopK: all error feedback buffers reset");
+}
+
+void TopKCompressor::reset_error_feedback_for_tensor(const void* tensor_ptr) {
+    uintptr_t tensor_id = reinterpret_cast<uintptr_t>(tensor_ptr);
+    auto it = error_buffers_.find(tensor_id);
+    if (it != error_buffers_.end()) {
+        std::fill(it->second.begin(), it->second.end(), 0.0f);
+        MCCL_DEBUG("TopK: error feedback reset for tensor %p", tensor_ptr);
+    }
 }
 
 } // namespace mccl

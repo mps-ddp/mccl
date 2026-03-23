@@ -32,9 +32,13 @@ def _worker(rank, world_size, fn, port):
         dist.destroy_process_group()
 
 
-def _run_distributed(fn, world_size=2, port=29500):
+def _run_distributed(fn, world_size=2, port=29500, extra_env=None):
     import subprocess, sys, textwrap, inspect
+    extra_env = extra_env or {}
     src = textwrap.dedent(inspect.getsource(fn))
+    env_lines = "".join(
+        [f"os.environ[{k!r}] = {str(v)!r}\n" for k, v in extra_env.items()]
+    )
     script = (
         "import os, sys, torch, torch.distributed as dist\n"
         f"os.environ['MASTER_ADDR'] = '127.0.0.1'\n"
@@ -42,6 +46,7 @@ def _run_distributed(fn, world_size=2, port=29500):
         f"os.environ['MCCL_LISTEN_ADDR'] = '127.0.0.1'\n"
         f"os.environ['MCCL_PORT_BASE'] = '{port + 100}'\n"
         f"os.environ['MCCL_LOG_LEVEL'] = 'DEBUG'\n"
+        f"{env_lines}"
         "rank = int(sys.argv[1])\n"
         "world_size = int(sys.argv[2])\n"
         "import mccl\n"
@@ -196,6 +201,35 @@ class TestThreeRankReduceScatter:
             assert torch.allclose(output, expected, rtol=1e-4)
 
         _run_distributed(fn, world_size=3, port=34300)
+
+
+class TestThreeRankPipelineCanary:
+    """Canary checks for 3-rank ring env toggles on v2 collectives."""
+
+    def test_allgather_reduce_scatter_pipelined(self):
+        def fn(rank, world_size):
+            input_tensor = torch.randn(20_000, device="mps") + rank
+            gathered = [torch.zeros_like(input_tensor) for _ in range(world_size)]
+            dist.all_gather(gathered, input_tensor)
+            for r in range(world_size):
+                assert gathered[r].shape == input_tensor.shape
+
+            input_list = [torch.ones(10_000, device="mps") * (i + 1)
+                          for i in range(world_size)]
+            output = torch.zeros(10_000, device="mps")
+            dist.reduce_scatter(output, input_list)
+            expected = torch.ones(10_000, device="mps") * ((rank + 1) * world_size)
+            assert torch.allclose(output, expected, rtol=1e-4, atol=1e-4)
+
+        _run_distributed(
+            fn,
+            world_size=3,
+            port=34800,
+            extra_env={
+                "MCCL_RING_ASSERT_ORDER": "1",
+                "MCCL_RING_PIPELINE_WINDOW": "2",
+            },
+        )
 
 
 class TestF16Collectives:

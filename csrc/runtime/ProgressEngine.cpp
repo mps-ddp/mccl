@@ -3,6 +3,7 @@
 #include "common/Logging.hpp"
 
 #include <utility>
+#include <future>
 
 namespace mccl {
 
@@ -58,6 +59,29 @@ uint32_t ProgressEngine::submit(std::function<void()> execute,
 
     MCCL_TRACE("Submitted op seq=%u (queue_depth=%zu)", seq, queue_depth());
     return seq;
+}
+
+void ProgressEngine::submit_sync(std::function<void()> execute) {
+    auto promise = std::make_shared<std::promise<void>>();
+    std::future<void> future = promise->get_future();
+
+    submit(
+        [execute = std::move(execute), promise]() {
+            try {
+                execute();
+                promise->set_value();
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
+        },
+        []() {},
+        [promise](std::exception_ptr) {
+            // execute() already set the exception on the promise above;
+            // on_error fires only if on_complete throws, which is a no-op here.
+        }
+    );
+
+    future.get();
 }
 
 void ProgressEngine::stop() {

@@ -63,13 +63,24 @@ public:
         uint64_t total_bytes_sent;
         uint64_t total_bytes_recv;
         uint64_t total_errors;
+        uint64_t small_ops;
+        uint64_t medium_ops;
+        uint64_t large_ops;
         double avg_latency_ms;
+        double avg_wall_ms;
         double p50_latency_ms;
         double p99_latency_ms;
         double peak_throughput_gbps;
         double avg_sync_ms;
         double avg_network_ms;
         double avg_reduce_ms;
+        double avg_overlap_efficiency;
+        double small_avg_wall_ms;
+        double medium_avg_wall_ms;
+        double large_avg_wall_ms;
+        double small_p99_wall_ms;
+        double medium_p99_wall_ms;
+        double large_p99_wall_ms;
     };
 
     Summary summarize() const;

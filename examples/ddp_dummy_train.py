@@ -170,6 +170,7 @@ def run_ddp(args) -> None:
 
     dataset = SyntheticDataset(dims[0], dims[1])
     total_params = sum(p.numel() for p in model.parameters())
+    validate_grads = os.environ.get("MCCL_VALIDATE_GRAD_SYNC", "0").lower() in ("1", "true", "yes")
 
     if rank == 0:
         print(f"DDP training | backend={args.backend} world_size={world_size}\n"
@@ -193,6 +194,21 @@ def run_ddp(args) -> None:
             loss = loss_fn(ddp_model(x), y)
 
         loss.backward()
+        if validate_grads and world_size >= 3:
+            grad_sum = torch.zeros(1, dtype=torch.float32, device=device)
+            for p in model.parameters():
+                if p.grad is not None:
+                    grad_sum += p.grad.detach().float().sum()
+            grad_global = grad_sum.clone()
+            dist.all_reduce(grad_global, op=dist.ReduceOp.SUM)
+            grad_expected = grad_global / world_size
+            grad_div = (grad_sum - grad_expected).abs().item()
+            if grad_div > 1e-3:
+                raise RuntimeError(
+                    f"[rank {rank}] Gradient mismatch at step {step}: "
+                    f"local_sum={grad_sum.item():.6f} expected={grad_expected.item():.6f} "
+                    f"divergence={grad_div:.2e}"
+                )
         optimizer.step()
         dt = time.perf_counter() - t0
 
@@ -216,10 +232,21 @@ def run_ddp(args) -> None:
                 if metrics:
                     mccl_info = (f"\n  MCCL: {metrics.total_ops} ops, "
                                  f"avg_lat={metrics.avg_latency_ms:.2f}ms")
-                    for attr in ("avg_sync_ms", "avg_network_ms", "avg_reduce_ms"):
+                    for attr in (
+                        "avg_sync_ms",
+                        "avg_network_ms",
+                        "avg_reduce_ms",
+                    ):
                         val = getattr(metrics, attr, None)
                         if val is not None:
                             mccl_info += f"  {attr}={val:.2f}ms"
+                    overlap = getattr(metrics, "avg_overlap_efficiency", None)
+                    if overlap is not None:
+                        mccl_info += f"  avg_overlap_efficiency={overlap:.2f}"
+                    for attr in ("small_ops", "medium_ops", "large_ops"):
+                        val = getattr(metrics, attr, None)
+                        if val is not None:
+                            mccl_info += f"  {attr}={val}"
             except Exception:
                 pass
 
@@ -241,17 +268,51 @@ def run_ddp(args) -> None:
         torch.mps.synchronize()
     dist.barrier()
 
-    # Sanity check: params in sync
-    head = next(model.parameters()).detach().flatten()[:8].to(device)
-    ref = head.clone()
-    dist.broadcast(ref, src=0)
-    if not torch.allclose(head, ref, rtol=1e-4, atol=1e-4):
-        raise RuntimeError("Parameter mismatch across ranks!")
+    # ── Symmetric parameter sync check ───────────────────────────────
+    # Each rank computes a checksum of its first parameter tensor, then
+    # all_reduce(SUM) so every rank participates.  If all parameters are
+    # identical the per-rank checksum equals the group average.  This
+    # avoids the false-positive that the old broadcast-from-rank-0 check
+    # had: rank 0 always agreed with itself even when rank 1 had stale
+    # values, so the success message printed while rank 1 was crashing.
+    param_check_ok = True
+    try:
+        # Sum across all parameters to avoid false negatives from checking
+        # only one tensor on large models with many DDP buckets.
+        local_sum = torch.zeros(1, dtype=torch.float32, device=device)
+        for p in model.parameters():
+            local_sum += p.detach().float().sum()
+        global_sum = local_sum.clone()
+        dist.all_reduce(global_sum, op=dist.ReduceOp.SUM)
+        expected = global_sum / world_size
+        divergence = (local_sum - expected).abs().item()
+        if divergence > 1e-3:
+            param_check_ok = False
+            print(f"[rank {rank}] Parameter mismatch: local_sum={local_sum.item():.6f} "
+                  f"expected={expected.item():.6f} divergence={divergence:.2e}",
+                  file=sys.stderr, flush=True)
+    except Exception as e:
+        param_check_ok = False
+        print(f"[rank {rank}] Parameter check raised: {e}", file=sys.stderr, flush=True)
+
+    # Share pass/fail across all ranks so no rank is left waiting in the
+    # final barrier while another has already exited with an error.
+    ok_tensor = torch.tensor([1 if param_check_ok else 0],
+                             dtype=torch.int32, device=device)
+    dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
+    all_ok = ok_tensor.item() == 1
+
     if rank == 0:
-        print("Parameters in sync across ranks.", flush=True)
+        if all_ok:
+            print("Parameters in sync across ranks.", flush=True)
+        else:
+            print("Parameter mismatch detected across ranks.", file=sys.stderr, flush=True)
 
     dist.barrier()
     dist.destroy_process_group()
+
+    if not all_ok:
+        raise RuntimeError("Parameter mismatch across ranks!")
 
 
 def _setup_mccl_env() -> None:

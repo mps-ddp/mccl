@@ -59,6 +59,9 @@ void Metrics::record_error() {
 }
 
 Metrics::Summary Metrics::summarize() const {
+    constexpr size_t kSmallBytes = 64 * 1024;
+    constexpr size_t kMediumBytes = 1024 * 1024;
+
     std::lock_guard<std::mutex> lock(mu_);
     Summary s{};
     s.total_ops = completed_.size();
@@ -70,19 +73,37 @@ Metrics::Summary Metrics::summarize() const {
 
     std::vector<double> latencies;
     latencies.reserve(completed_.size());
+    std::vector<double> small_latencies;
+    std::vector<double> medium_latencies;
+    std::vector<double> large_latencies;
     double peak_tp = 0;
+    double total_overlap_eff = 0;
 
     for (auto& m : completed_) {
         double ms = m.elapsed_ms();
         latencies.push_back(ms);
+        if (m.bytes <= kSmallBytes) {
+            small_latencies.push_back(ms);
+        } else if (m.bytes <= kMediumBytes) {
+            medium_latencies.push_back(ms);
+        } else {
+            large_latencies.push_back(ms);
+        }
         double tp = m.throughput_gbps();
         if (tp > peak_tp) peak_tp = tp;
+        if (ms > 0) {
+            total_overlap_eff += std::max(0.0, (m.network_ms + m.reduce_ms - ms) / ms);
+        }
     }
 
     std::sort(latencies.begin(), latencies.end());
+    std::sort(small_latencies.begin(), small_latencies.end());
+    std::sort(medium_latencies.begin(), medium_latencies.end());
+    std::sort(large_latencies.begin(), large_latencies.end());
 
     s.avg_latency_ms = std::accumulate(latencies.begin(), latencies.end(), 0.0) /
                        latencies.size();
+    s.avg_wall_ms = s.avg_latency_ms;
 
     size_t n = latencies.size();
     s.p50_latency_ms = latencies[n / 2];
@@ -98,6 +119,28 @@ Metrics::Summary Metrics::summarize() const {
     s.avg_sync_ms = total_sync / n;
     s.avg_network_ms = total_net / n;
     s.avg_reduce_ms = total_reduce / n;
+    s.avg_overlap_efficiency = total_overlap_eff / n;
+    s.small_ops = small_latencies.size();
+    s.medium_ops = medium_latencies.size();
+    s.large_ops = large_latencies.size();
+    if (!small_latencies.empty()) {
+        size_t sn = small_latencies.size();
+        s.small_avg_wall_ms = std::accumulate(
+            small_latencies.begin(), small_latencies.end(), 0.0) / sn;
+        s.small_p99_wall_ms = small_latencies[std::min(sn - 1, (size_t)(sn * 0.99))];
+    }
+    if (!medium_latencies.empty()) {
+        size_t mn = medium_latencies.size();
+        s.medium_avg_wall_ms = std::accumulate(
+            medium_latencies.begin(), medium_latencies.end(), 0.0) / mn;
+        s.medium_p99_wall_ms = medium_latencies[std::min(mn - 1, (size_t)(mn * 0.99))];
+    }
+    if (!large_latencies.empty()) {
+        size_t ln = large_latencies.size();
+        s.large_avg_wall_ms = std::accumulate(
+            large_latencies.begin(), large_latencies.end(), 0.0) / ln;
+        s.large_p99_wall_ms = large_latencies[std::min(ln - 1, (size_t)(ln * 0.99))];
+    }
 
     return s;
 }
@@ -118,6 +161,13 @@ void Metrics::log_summary() const {
     MCCL_INFO("  Avg sync:         %.3f ms", s.avg_sync_ms);
     MCCL_INFO("  Avg network:      %.3f ms", s.avg_network_ms);
     MCCL_INFO("  Avg reduce:       %.3f ms", s.avg_reduce_ms);
+    MCCL_INFO("  Avg overlap eff:  %.3f", s.avg_overlap_efficiency);
+    MCCL_INFO("  Small bucket:     ops=%llu avg=%.3fms p99=%.3fms",
+              (unsigned long long)s.small_ops, s.small_avg_wall_ms, s.small_p99_wall_ms);
+    MCCL_INFO("  Medium bucket:    ops=%llu avg=%.3fms p99=%.3fms",
+              (unsigned long long)s.medium_ops, s.medium_avg_wall_ms, s.medium_p99_wall_ms);
+    MCCL_INFO("  Large bucket:     ops=%llu avg=%.3fms p99=%.3fms",
+              (unsigned long long)s.large_ops, s.large_avg_wall_ms, s.large_p99_wall_ms);
     MCCL_INFO("============================");
 }
 

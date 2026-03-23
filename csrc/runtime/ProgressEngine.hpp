@@ -8,6 +8,7 @@
 #include <thread>
 #include <atomic>
 #include <cstdint>
+#include <future>
 
 namespace mccl {
 
@@ -37,6 +38,12 @@ public:
     uint32_t submit(std::function<void()> execute,
                     std::function<void()> on_complete,
                     std::function<void(std::exception_ptr)> on_error);
+
+    /// Submit work and block the caller until it completes on the engine thread.
+    /// Rethrows any exception from execute(). Intended for ring-step I/O where
+    /// the calling thread (reduce_engine_) must wait for the result before
+    /// proceeding to the next step.
+    void submit_sync(std::function<void()> execute);
 
     /// Drain the queue and stop the engine thread.
     void stop();

@@ -20,6 +20,8 @@
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <deque>
+#include <future>
 #include <unordered_map>
 
 namespace mccl {
@@ -118,6 +120,19 @@ private:
     /// to the correct per-peer engine for concurrent I/O.
     ProgressEngine& net_engine_for(int peer_rank);
 
+    /// Dispatch send and recv to separate per-peer net_engines concurrently.
+    /// recv completion is waited immediately; send completion may be deferred
+    /// up to ring_pipeline_window_ to allow bounded overlap.
+    void ring_send_recv(
+        int send_peer, OpType op, uint32_t seq, uint32_t send_tid,
+        const void* send_data, size_t send_nbytes,
+        int recv_peer, uint32_t recv_tid,
+        void* recv_data, size_t recv_nbytes);
+    void drain_ring_send_futures();
+    void validate_ring_step_indices(
+        int ws, int send_idx, int recv_idx,
+        uint32_t step_tid, uint32_t recv_tid) const;
+
     c10::intrusive_ptr<c10d::Store> store_;
     std::chrono::milliseconds timeout_;
 
@@ -133,9 +148,13 @@ private:
     std::atomic<uint32_t> collective_seq_{0};
     bool transport_initialized_ = false;
     bool overlap_comm_ = true;
+    bool ring_assert_order_ = false;
+    int ring_pipeline_window_ = 1;
 
     mutable std::mutex work_registry_mu_;
     std::unordered_map<uint32_t, c10::weak_intrusive_ptr<WorkMCCL>> work_registry_;
+    mutable std::mutex ring_pipeline_mu_;
+    std::vector<std::deque<std::shared_ptr<std::future<void>>>> pending_ring_sends_;
 };
 
 c10::intrusive_ptr<c10d::Backend> createProcessGroupMCCL(

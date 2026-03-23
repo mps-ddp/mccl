@@ -89,17 +89,23 @@ def main():
 
     # Flush GPU work and synchronize all ranks before reading parameters —
     # on slower transports (TCP) the last DDP allreduce may still be in-flight.
+    # The dist.barrier() here goes through MCCL's barrier() which now drains
+    # all per-peer net engines first, closing the race where the 2-rank
+    # large-message split allreduce could leave its local reduction pending
+    # on reduce_engine_ while barrier overtook it.
     torch.mps.synchronize()
     dist.barrier()
 
-    # Final parameter checksum
+    # Final parameter checksum — symmetric: every rank participates via
+    # all_reduce(SUM) so no rank can report false success.
     param_sum = sum(p.sum().item() for p in model.parameters())
     print(f"Rank {rank} | Final param checksum: {param_sum:.6f}")
     print(f"Rank {rank} | Final loss: {losses[-1]:.6f}")
 
-    # Verify params match across ranks: all_reduce the checksum with SUM,
-    # then check that every rank's individual checksum equals the average
-    # (which is only true when all parameter tensors are identical).
+    # Regression: this check previously failed on slow TCP because the
+    # broadcast-from-rank-0 pattern let rank 0 print "PASSED" while rank 1
+    # still had stale parameters and crashed.  The all_reduce(SUM) approach
+    # ensures every rank contributes before any rank evaluates the result.
     param_tensor = torch.tensor([param_sum], device=device)
     dist.all_reduce(param_tensor, op=dist.ReduceOp.SUM)
 
@@ -108,15 +114,26 @@ def main():
     print(f"Rank {rank} | param checksum: {param_sum:.6f}  avg: {avg_param:.6f}  "
           f"divergence: {diff:.8f}")
 
+    check_passed = diff < 1e-3
+
+    # Share pass/fail across all ranks so neither rank hangs in the final
+    # barrier while the other has already exited with an error.
+    ok_tensor = torch.tensor([1 if check_passed else 0],
+                             dtype=torch.int32, device=device)
+    dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
+    all_ok = ok_tensor.item() == 1
+
     if rank == 0:
-        if diff < 1e-3:
+        if all_ok:
             print("\n*** DDP CORRECTNESS TEST PASSED ***")
         else:
-            print("\n*** WARNING: Param divergence detected ***")
-            sys.exit(1)
+            print("\n*** WARNING: Param divergence detected ***", file=sys.stderr)
 
     dist.barrier()
     dist.destroy_process_group()
+
+    if not all_ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

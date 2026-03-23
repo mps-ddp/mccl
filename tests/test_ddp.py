@@ -18,9 +18,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _run_distributed(fn, world_size=2, port=29500):
+def _run_distributed(fn, world_size=2, port=29500, extra_env=None):
     import subprocess, sys, textwrap, inspect
+    extra_env = extra_env or {}
     src = textwrap.dedent(inspect.getsource(fn))
+    env_lines = "".join(
+        [f"os.environ[{k!r}] = {str(v)!r}\n" for k, v in extra_env.items()]
+    )
     script = (
         "import os, sys, torch, torch.nn as nn, torch.distributed as dist\n"
         "from torch.nn.parallel import DistributedDataParallel as DDP\n"
@@ -29,6 +33,7 @@ def _run_distributed(fn, world_size=2, port=29500):
         f"os.environ['MCCL_LISTEN_ADDR'] = '127.0.0.1'\n"
         f"os.environ['MCCL_PORT_BASE'] = '{port + 100}'\n"
         f"os.environ['MCCL_LOG_LEVEL'] = 'DEBUG'\n"
+        f"{env_lines}"
         "rank = int(sys.argv[1])\n"
         "world_size = int(sys.argv[2])\n"
         "import mccl\n"
@@ -194,3 +199,100 @@ class TestDDPThreeRank:
                     f"Rank {rank}: params diverged after 3-rank training"
 
         _run_distributed(fn, world_size=3, port=35300)
+
+
+class TestDDPThreeRankProductionGates:
+    """3-rank correctness and canary settings for production rollouts."""
+
+    def test_three_rank_grad_checksum_gate(self):
+        def fn(rank, world_size):
+            torch.manual_seed(42)
+            model = nn.Sequential(
+                nn.Linear(16, 64),
+                nn.ReLU(),
+                nn.Linear(64, 8),
+            ).to("mps")
+            ddp_model = DDP(model)
+            optimizer = torch.optim.AdamW(ddp_model.parameters(), lr=1e-3)
+            loss_fn = nn.MSELoss()
+
+            for step in range(8):
+                torch.manual_seed(5000 + step * world_size + rank)
+                x = torch.randn(16, 16, device="mps")
+                y = torch.randn(16, 8, device="mps")
+                optimizer.zero_grad(set_to_none=True)
+                loss = loss_fn(ddp_model(x), y)
+                loss.backward()
+
+                grad_sum = torch.zeros(1, dtype=torch.float32, device="mps")
+                for p in model.parameters():
+                    if p.grad is not None:
+                        grad_sum += p.grad.detach().float().sum()
+                global_sum = grad_sum.clone()
+                dist.all_reduce(global_sum, op=dist.ReduceOp.SUM)
+                expected = global_sum / world_size
+                assert torch.allclose(grad_sum, expected, rtol=1e-4, atol=1e-3), (
+                    f"Rank {rank}: gradient checksum mismatch at step {step}"
+                )
+                optimizer.step()
+
+            checksum = torch.zeros(1, dtype=torch.float32, device="mps")
+            for p in model.parameters():
+                checksum += p.detach().float().sum()
+            checksum_global = checksum.clone()
+            dist.all_reduce(checksum_global, op=dist.ReduceOp.SUM)
+            checksum_expected = checksum_global / world_size
+            assert torch.allclose(checksum, checksum_expected, rtol=1e-4, atol=1e-3)
+
+        _run_distributed(
+            fn,
+            world_size=3,
+            port=35400,
+            extra_env={"MCCL_VALIDATE_GRAD_SYNC": "1"},
+        )
+
+    def test_three_rank_pipelined_canary_smoke(self):
+        def fn(rank, world_size):
+            torch.manual_seed(42)
+            model = nn.Linear(512, 512, bias=False).to("mps")
+            ddp_model = DDP(model, bucket_cap_mb=8)
+            optimizer = torch.optim.SGD(ddp_model.parameters(), lr=1e-2)
+            loss_fn = nn.MSELoss()
+
+            for step in range(6):
+                torch.manual_seed(6000 + step * world_size + rank)
+                x = torch.randn(32, 512, device="mps")
+                y = torch.randn(32, 512, device="mps")
+                optimizer.zero_grad(set_to_none=True)
+                loss = loss_fn(ddp_model(x), y)
+                loss.backward()
+                optimizer.step()
+
+            checksum = torch.zeros(1, dtype=torch.float32, device="mps")
+            for p in model.parameters():
+                checksum += p.detach().float().sum()
+            checksum_global = checksum.clone()
+            dist.all_reduce(checksum_global, op=dist.ReduceOp.SUM)
+            checksum_expected = checksum_global / world_size
+            assert torch.allclose(checksum, checksum_expected, rtol=1e-4, atol=1e-3)
+
+            if rank == 0:
+                import mccl
+
+                metrics = mccl.get_metrics()
+                assert metrics is not None
+                total_bucketed = metrics.small_ops + metrics.medium_ops + metrics.large_ops
+                assert total_bucketed > 0
+                assert metrics.avg_wall_ms >= 0.0
+                assert metrics.avg_network_ms >= 0.0
+                assert metrics.avg_reduce_ms >= 0.0
+
+        _run_distributed(
+            fn,
+            world_size=3,
+            port=35500,
+            extra_env={
+                "MCCL_RING_ASSERT_ORDER": "1",
+                "MCCL_RING_PIPELINE_WINDOW": "2",
+            },
+        )

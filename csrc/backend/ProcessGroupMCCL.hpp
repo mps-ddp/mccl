@@ -101,6 +101,10 @@ private:
                         c10d::ReduceOp::RedOpType op);
     void allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
                                  c10d::ReduceOp::RedOpType op);
+    void allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint32_t seq,
+                                         c10d::ReduceOp::RedOpType op);
+    void allreduce_ring_chunked_serial(at::Tensor& tensor, uint32_t seq,
+                                       c10d::ReduceOp::RedOpType op);
     void allreduce_small(at::Tensor& tensor, uint32_t seq,
                          c10d::ReduceOp::RedOpType op);
 
@@ -132,6 +136,7 @@ private:
     void validate_ring_step_indices(
         int ws, int send_idx, int recv_idx,
         uint32_t step_tid, uint32_t recv_tid) const;
+    int default_ring_pipeline_window(int world_size) const;
 
     c10::intrusive_ptr<c10d::Store> store_;
     std::chrono::milliseconds timeout_;
@@ -149,6 +154,7 @@ private:
     bool transport_initialized_ = false;
     bool overlap_comm_ = true;
     bool ring_assert_order_ = false;
+    bool dedicated_3plus_pipeline_ = true;
     int ring_pipeline_window_ = 1;
 
     mutable std::mutex work_registry_mu_;

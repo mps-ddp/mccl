@@ -9,15 +9,18 @@
 #include <atomic>
 #include <cstdint>
 #include <future>
+#include <chrono>
 
 namespace mccl {
 
 /// A single unit of work submitted to the progress engine.
 struct EngineOp {
     uint32_t seq_num;
+    std::chrono::steady_clock::time_point enqueue_ts;
     std::function<void()> execute;
     std::function<void()> on_complete;
     std::function<void(std::exception_ptr)> on_error;
+    std::function<void(double)> on_queue_wait_ms;
 };
 
 /// Bounded single-thread progress engine. Tensor collectives call MPS sync on the
@@ -37,7 +40,8 @@ public:
     /// Returns the sequence number assigned.
     uint32_t submit(std::function<void()> execute,
                     std::function<void()> on_complete,
-                    std::function<void(std::exception_ptr)> on_error);
+                    std::function<void(std::exception_ptr)> on_error,
+                    std::function<void(double)> on_queue_wait_ms = nullptr);
 
     /// Submit work and block the caller until it completes on the engine thread.
     /// Rethrows any exception from execute(). Intended for ring-step I/O where

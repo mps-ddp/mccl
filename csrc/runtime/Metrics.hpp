@@ -21,6 +21,17 @@ struct OpMetric {
     double sync_ms = 0;
     double network_ms = 0;
     double reduce_ms = 0;
+    double queue_wait_ms = 0;
+    double send_queue_wait_ms = 0;
+    double recv_queue_wait_ms = 0;
+    double send_ms = 0;
+    double recv_ms = 0;
+    double stage_ms = 0;
+    double writeback_ms = 0;
+    double backpressure_ms = 0;
+    double pipeline_depth_sum = 0;
+    uint64_t pipeline_depth_samples = 0;
+    uint64_t max_pipeline_depth = 0;
 
     double elapsed_ms() const {
         return std::chrono::duration<double, std::milli>(end - start).count();
@@ -49,6 +60,16 @@ public:
 
     /// Record per-phase breakdown for an in-flight op.
     void record_phase(uint32_t seq, double sync_ms, double network_ms, double reduce_ms);
+    /// Record engine queue wait for an in-flight op.
+    void record_queue_wait(uint32_t seq, double queue_wait_ms);
+    /// Record queue waits on ring send/recv worker queues.
+    void record_ring_queue_wait(uint32_t seq, double send_queue_wait_ms, double recv_queue_wait_ms);
+    /// Record ring send/recv wire execution times.
+    void record_ring_io(uint32_t seq, double send_ms, double recv_ms);
+    /// Record slot pipeline bookkeeping and staging costs.
+    void record_pipeline(uint32_t seq, double stage_ms, double writeback_ms,
+                         double backpressure_ms, uint64_t pipeline_depth,
+                         bool sample_depth);
 
     /// Record a transport-level send/recv.
     void record_transport_bytes(size_t bytes, bool is_send);
@@ -74,6 +95,16 @@ public:
         double avg_sync_ms;
         double avg_network_ms;
         double avg_reduce_ms;
+        double avg_queue_wait_ms;
+        double avg_send_queue_wait_ms;
+        double avg_recv_queue_wait_ms;
+        double avg_send_ms;
+        double avg_recv_ms;
+        double avg_stage_ms;
+        double avg_writeback_ms;
+        double avg_backpressure_ms;
+        double avg_pipeline_depth;
+        uint64_t max_pipeline_depth;
         double avg_overlap_efficiency;
         double small_avg_wall_ms;
         double medium_avg_wall_ms;

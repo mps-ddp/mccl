@@ -66,7 +66,8 @@ def main():
     optimizer = torch.optim.SGD(ddp_model.parameters(), lr=0.01)
     loss_fn = nn.CrossEntropyLoss()
 
-    num_steps = 50
+    num_steps = int(os.environ.get("MCCL_PROD_STEPS", "50"))
+    validate_grads = os.environ.get("MCCL_VALIDATE_GRAD_SYNC", "0").lower() in ("1", "true", "yes")
     losses = []
 
     for step in range(num_steps):
@@ -79,6 +80,22 @@ def main():
         outputs = ddp_model(inputs)
         loss = loss_fn(outputs, labels)
         loss.backward()
+
+        if validate_grads:
+            grad_sum = torch.zeros(1, dtype=torch.float32, device=device)
+            for p in model.parameters():
+                if p.grad is not None:
+                    grad_sum += p.grad.detach().float().sum()
+            grad_global = grad_sum.clone()
+            dist.all_reduce(grad_global, op=dist.ReduceOp.SUM)
+            grad_expected = grad_global / world_size
+            grad_div = (grad_sum - grad_expected).abs().item()
+            if grad_div > 1e-3:
+                raise RuntimeError(
+                    f"[rank {rank}] gradient checksum mismatch at step {step}: "
+                    f"local={grad_sum.item():.6f} expected={grad_expected.item():.6f} "
+                    f"divergence={grad_div:.2e}"
+                )
         optimizer.step()
 
         loss_val = loss.item()
@@ -128,6 +145,25 @@ def main():
             print("\n*** DDP CORRECTNESS TEST PASSED ***")
         else:
             print("\n*** WARNING: Param divergence detected ***", file=sys.stderr)
+        try:
+            import mccl
+            metrics = mccl.get_metrics()
+            if metrics is not None:
+                print(
+                    "Rank 0 | metrics: "
+                    f"avg_network_ms={metrics.avg_network_ms:.3f} "
+                    f"avg_reduce_ms={metrics.avg_reduce_ms:.3f} "
+                    f"avg_queue_wait_ms={metrics.avg_queue_wait_ms:.3f} "
+                    f"avg_send_ms={metrics.avg_send_ms:.3f} "
+                    f"avg_recv_ms={metrics.avg_recv_ms:.3f} "
+                    f"avg_stage_ms={metrics.avg_stage_ms:.3f} "
+                    f"avg_writeback_ms={metrics.avg_writeback_ms:.3f} "
+                    f"avg_backpressure_ms={metrics.avg_backpressure_ms:.3f} "
+                    f"avg_pipeline_depth={metrics.avg_pipeline_depth:.3f} "
+                    f"max_pipeline_depth={metrics.max_pipeline_depth}"
+                )
+        except Exception:
+            pass
 
     dist.barrier()
     dist.destroy_process_group()

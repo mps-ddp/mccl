@@ -25,10 +25,27 @@ enum class SyncMode {
 
 SyncMode global_sync_mode() {
     static SyncMode mode = [] {
+        bool requested_coalesced = false;
         auto* v = std::getenv("MCCL_SYNC_MODE");
         if (v) {
             std::string s(v);
-            if (s == "coalesced" || s == "fast") return SyncMode::COALESCED;
+            requested_coalesced = (s == "coalesced" || s == "fast");
+        }
+        if (requested_coalesced) {
+            auto* unsafe = std::getenv("MCCL_ALLOW_UNSAFE_COALESCED_DDP");
+            bool allow_unsafe = unsafe && (std::string(unsafe) == "1" ||
+                                           std::string(unsafe) == "true" ||
+                                           std::string(unsafe) == "yes");
+            if (!allow_unsafe) {
+                MCCL_WARN(
+                    "MCCL_SYNC_MODE=coalesced requested but disabled for DDP safety. "
+                    "Using FULL sync; set MCCL_ALLOW_UNSAFE_COALESCED_DDP=1 to override.");
+                return SyncMode::FULL;
+            }
+            MCCL_WARN(
+                "MCCL_SYNC_MODE=coalesced enabled with MCCL_ALLOW_UNSAFE_COALESCED_DDP=1. "
+                "This is unsafe for bucketed DDP and may corrupt convergence.");
+            return SyncMode::COALESCED;
         }
         // Default FULL: DDP gradient bucketing issues many allreduce calls per
         // backward; each must wait for that bucket's GPU work.  COALESCED skips
@@ -73,6 +90,47 @@ inline void sync_mps_for_collective(bool overlap) {
 
 inline void reset_sync_state() {
     tl_sync_done = false;
+}
+
+enum class RingPipelinePhase {
+    REDUCE_SCATTER,
+    ALLGATHER,
+};
+
+struct RingReduceResult {
+    double reduce_ms = 0.0;
+    double writeback_ms = 0.0;
+};
+
+struct RingPipelineSlot {
+    RingPipelinePhase phase = RingPipelinePhase::REDUCE_SCATTER;
+    int step = 0;
+    int send_chunk_idx = 0;
+    int recv_chunk_idx = 0;
+    size_t recv_bytes = 0;
+    at::Tensor recv_chunk;
+    SharedPooledBuffer recv_buf;
+    std::shared_ptr<std::future<void>> recv_future;
+    std::future<RingReduceResult> reduce_future;
+    bool recv_done = false;
+    bool reduce_started = false;
+};
+
+inline std::shared_ptr<std::future<void>> make_ready_future() {
+    auto promise = std::make_shared<std::promise<void>>();
+    promise->set_value();
+    return std::make_shared<std::future<void>>(promise->get_future());
+}
+
+template <typename T>
+inline bool future_ready(std::future<T>& future) {
+    if (!future.valid()) return false;
+    return future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+}
+
+inline bool future_ready(const std::shared_ptr<std::future<void>>& future) {
+    if (!future) return true;
+    return future->wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
 }
 
 } // anonymous namespace
@@ -123,9 +181,17 @@ ProcessGroupMCCL::ProcessGroupMCCL(
         std::string s(v);
         ring_assert_order_ = (s == "1" || s == "true" || s == "yes");
     }
+    // Dedicated 3+ pipeline is the production default. Set the env to 0/no/false
+    // only when rolling back to the legacy serial ring implementation.
+    if (auto* v = std::getenv("MCCL_3PLUS_PIPELINE")) {
+        std::string s(v);
+        dedicated_3plus_pipeline_ = !(s == "0" || s == "false" || s == "no");
+    }
     if (auto* v = std::getenv("MCCL_RING_PIPELINE_WINDOW")) {
         int parsed = std::atoi(v);
         ring_pipeline_window_ = std::max(1, parsed);
+    } else {
+        ring_pipeline_window_ = default_ring_pipeline_window(world_size);
     }
 
     size_t queue_depth = 1024;
@@ -194,6 +260,7 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     }
     MCCL_INFO("  overlap_comm        = %s", overlap_comm_ ? "on" : "off");
     MCCL_INFO("  ring_assert_order   = %s", ring_assert_order_ ? "on" : "off");
+    MCCL_INFO("  3plus_pipeline      = %s", dedicated_3plus_pipeline_ ? "on" : "off");
     MCCL_INFO("  ring_pipeline_win   = %d", ring_pipeline_window_);
     {
         const char* es = std::getenv("MCCL_EVENT_SYNC");
@@ -213,6 +280,14 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     MCCL_INFO("==============================");
 
     MCCL_INFO("ProcessGroupMCCL rank=%d ready", rank);
+}
+
+int ProcessGroupMCCL::default_ring_pipeline_window(int world_size) const {
+    if (world_size < 3 || !overlap_comm_) return 1;
+    // Conservative adaptive default: keep low in-flight depth for small rings.
+    if (world_size >= 10) return 4;
+    if (world_size >= 5) return 3;
+    return 2;
 }
 
 ProgressEngine& ProcessGroupMCCL::net_engine_for(int peer_rank) {
@@ -243,7 +318,7 @@ void ProcessGroupMCCL::drain_ring_send_futures() {
 
 void ProcessGroupMCCL::validate_ring_step_indices(
     int ws, int send_idx, int recv_idx, uint32_t step_tid, uint32_t recv_tid) const {
-    if (!ring_assert_order_ || ws < 3) return;
+    if (ws < 3) return;
     MCCL_CHECK(send_idx >= 0 && send_idx < ws,
                "ring assert: send_idx out of range");
     MCCL_CHECK(recv_idx >= 0 && recv_idx < ws,
@@ -254,6 +329,14 @@ void ProcessGroupMCCL::validate_ring_step_indices(
                "ring assert: send tid lower bits do not match send_idx");
     MCCL_CHECK(recv_tid_idx == static_cast<uint32_t>(recv_idx),
                "ring assert: recv tid lower bits do not match recv_idx");
+    uint32_t send_step = (step_tid >> 16);
+    uint32_t recv_step = (recv_tid >> 16);
+    MCCL_CHECK(send_step == recv_step,
+               "ring assert: send/recv step mismatch");
+    if (ring_assert_order_) {
+        MCCL_CHECK(send_step < static_cast<uint32_t>(4 * ws),
+                   "ring assert: step index out of expected bound");
+    }
 }
 
 void ProcessGroupMCCL::ring_send_recv(
@@ -302,31 +385,49 @@ void ProcessGroupMCCL::ring_send_recv(
     net_engine_for(send_peer).submit(
         [this, send_peer, op, seq, send_tid, send_data, send_nbytes, send_promise]() {
             try {
+                auto send_t0 = std::chrono::steady_clock::now();
                 MCCL_CHECK(transport_->send_chunks(send_peer, op, seq, send_tid,
                                                    send_data, send_nbytes),
                            "ring_send_recv send failed");
+                auto send_t1 = std::chrono::steady_clock::now();
+                metrics_->record_ring_io(
+                    seq,
+                    std::chrono::duration<double, std::milli>(send_t1 - send_t0).count(),
+                    0.0);
                 send_promise->set_value();
             } catch (...) {
                 send_promise->set_exception(std::current_exception());
             }
         },
         []() {},
-        [](std::exception_ptr) {}
+        [](std::exception_ptr) {},
+        [this, seq](double q_ms) {
+            metrics_->record_ring_queue_wait(seq, q_ms, 0.0);
+        }
     );
 
     net_engine_for(recv_peer).submit(
         [this, recv_peer, op, seq, recv_tid, recv_data, recv_nbytes, recv_promise]() {
             try {
+                auto recv_t0 = std::chrono::steady_clock::now();
                 MCCL_CHECK(transport_->recv_chunks(recv_peer, op, seq, recv_tid,
                                                    recv_data, recv_nbytes),
                            "ring_send_recv recv failed");
+                auto recv_t1 = std::chrono::steady_clock::now();
+                metrics_->record_ring_io(
+                    seq,
+                    0.0,
+                    std::chrono::duration<double, std::milli>(recv_t1 - recv_t0).count());
                 recv_promise->set_value();
             } catch (...) {
                 recv_promise->set_exception(std::current_exception());
             }
         },
         []() {},
-        [](std::exception_ptr) {}
+        [](std::exception_ptr) {},
+        [this, seq](double q_ms) {
+            metrics_->record_ring_queue_wait(seq, 0.0, q_ms);
+        }
     );
 
     {
@@ -652,6 +753,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                             metrics_->op_end(seq);
                             metrics_->record_error();
                             work_ptr->markError(e);
+                        },
+                        [this, seq](double q_ms) {
+                            metrics_->record_queue_wait(seq, q_ms);
                         }
                     );
                 },
@@ -661,6 +765,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                     metrics_->op_end(seq);
                     metrics_->record_error();
                     work_ptr->markError(e);
+                },
+                [this, seq](double q_ms) {
+                    metrics_->record_queue_wait(seq, q_ms);
                 }
             );
         } else {
@@ -694,6 +801,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                     metrics_->op_end(seq);
                     metrics_->record_error();
                     work_ptr->markError(e);
+                },
+                [this, seq](double q_ms) {
+                    metrics_->record_queue_wait(seq, q_ms);
                 }
             );
         }
@@ -734,6 +844,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 metrics_->op_end(seq);
                 metrics_->record_error();
                 work_ptr->markError(e);
+            },
+            [this, seq](double q_ms) {
+                metrics_->record_queue_wait(seq, q_ms);
             }
         );
     }
@@ -811,6 +924,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
             metrics_->op_end(seq);
             metrics_->record_error();
             work_ptr->markError(e);
+        },
+        [this, seq](double q_ms) {
+            metrics_->record_queue_wait(seq, q_ms);
         }
     );
 
@@ -981,6 +1097,382 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
 
 void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
                                                c10d::ReduceOp::RedOpType op) {
+    if (dedicated_3plus_pipeline_ && getSize() >= 3) {
+        allreduce_ring_chunked_pipeline(tensor, seq, op);
+        return;
+    }
+    allreduce_ring_chunked_serial(tensor, seq, op);
+}
+
+void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint32_t seq,
+                                                       c10d::ReduceOp::RedOpType op) {
+    int rank = getRank();
+    int ws = getSize();
+    size_t elem_size = tensor.element_size();
+    int64_t total_elems = tensor.numel();
+    const int num_chunks = 2 * ws;
+    const int total_steps = 2 * (ws - 1);
+    const int slot_limit = std::max(1, ring_pipeline_window_);
+    bool use_cpu = (tensor.scalar_type() == at::kFloat) && tensor_cpu_accessible(tensor);
+
+    int left = (rank - 1 + ws) % ws;
+    int right = (rank + 1) % ws;
+
+    at::Tensor flat = tensor.flatten();
+    std::vector<at::Tensor> chunks;
+    chunks.reserve(num_chunks);
+    int64_t chunk_elems = (total_elems + num_chunks - 1) / num_chunks;
+    for (int c = 0; c < num_chunks; c++) {
+        int64_t start = c * chunk_elems;
+        int64_t len = std::min(chunk_elems, total_elems - start);
+        if (len <= 0) {
+            chunks.push_back(torch::empty(0, tensor.options()));
+        } else {
+            chunks.push_back(flat.narrow(0, start, len));
+        }
+    }
+
+    double total_net_ms = 0.0;
+    double total_reduce_ms = 0.0;
+    double total_stage_ms = 0.0;
+    double total_writeback_ms = 0.0;
+    double total_backpressure_ms = 0.0;
+    uint64_t max_pipeline_depth = 0;
+
+    auto stable_stage_chunk = [&](const at::Tensor& chunk, void* dst, size_t nbytes) {
+        if (nbytes == 0) return;
+        auto stage_t0 = std::chrono::steady_clock::now();
+        if (tensor_cpu_accessible(chunk)) {
+            MPSBufferView view = extract_mps_buffer(chunk);
+            std::memcpy(dst, view.cpu_ptr, nbytes);
+        } else {
+            StagingBuffer staged = stage_for_send_nosync(chunk);
+            std::memcpy(dst, staged.data, nbytes);
+        }
+        auto stage_t1 = std::chrono::steady_clock::now();
+        double stage_ms = std::chrono::duration<double, std::milli>(stage_t1 - stage_t0).count();
+        total_stage_ms += stage_ms;
+    };
+
+    auto submit_send_async =
+        [&](uint32_t send_tid, SharedPooledBuffer send_buf, size_t send_nbytes)
+        -> std::shared_ptr<std::future<void>> {
+            if (send_nbytes == 0) return make_ready_future();
+            auto send_promise = std::make_shared<std::promise<void>>();
+            auto send_future = std::make_shared<std::future<void>>(send_promise->get_future());
+            net_engine_for(right).submit(
+                [this, right, seq, send_tid, send_buf, send_nbytes, send_promise]() {
+                    try {
+                        auto send_t0 = std::chrono::steady_clock::now();
+                        MCCL_CHECK(transport_->send_chunks(
+                            right, OpType::ALLREDUCE, seq, send_tid,
+                            send_buf->data(), send_nbytes),
+                            "ring pipeline send failed");
+                        auto send_t1 = std::chrono::steady_clock::now();
+                        metrics_->record_transport_bytes(send_nbytes, true);
+                        metrics_->record_ring_io(
+                            seq,
+                            std::chrono::duration<double, std::milli>(send_t1 - send_t0).count(),
+                            0.0);
+                        send_promise->set_value();
+                    } catch (...) {
+                        send_promise->set_exception(std::current_exception());
+                    }
+                },
+                []() {},
+                [](std::exception_ptr) {},
+                [this, seq](double q_ms) {
+                    metrics_->record_ring_queue_wait(seq, q_ms, 0.0);
+                });
+            return send_future;
+        };
+
+    auto submit_recv_async =
+        [&](uint32_t recv_tid, SharedPooledBuffer recv_buf, size_t recv_nbytes)
+        -> std::shared_ptr<std::future<void>> {
+            if (recv_nbytes == 0) return make_ready_future();
+            auto recv_promise = std::make_shared<std::promise<void>>();
+            auto recv_future = std::make_shared<std::future<void>>(recv_promise->get_future());
+            net_engine_for(left).submit(
+                [this, left, seq, recv_tid, recv_buf, recv_nbytes, recv_promise]() {
+                    try {
+                        auto recv_t0 = std::chrono::steady_clock::now();
+                        MCCL_CHECK(transport_->recv_chunks(
+                            left, OpType::ALLREDUCE, seq, recv_tid,
+                            recv_buf->data(), recv_nbytes),
+                            "ring pipeline recv failed");
+                        auto recv_t1 = std::chrono::steady_clock::now();
+                        metrics_->record_transport_bytes(recv_nbytes, false);
+                        metrics_->record_ring_io(
+                            seq,
+                            0.0,
+                            std::chrono::duration<double, std::milli>(recv_t1 - recv_t0).count());
+                        recv_promise->set_value();
+                    } catch (...) {
+                        recv_promise->set_exception(std::current_exception());
+                    }
+                },
+                []() {},
+                [](std::exception_ptr) {},
+                [this, seq](double q_ms) {
+                    metrics_->record_ring_queue_wait(seq, 0.0, q_ms);
+                });
+            return recv_future;
+        };
+
+    auto sample_pipeline_depth = [&](uint64_t depth) {
+        max_pipeline_depth = std::max(max_pipeline_depth, depth);
+        metrics_->record_pipeline(seq, 0.0, 0.0, 0.0, depth, true);
+    };
+
+    auto run_phase =
+        [&](RingPipelinePhase phase,
+            auto compute_indices) {
+            std::vector<int> chunk_ready_step(num_chunks, 0);
+            std::deque<RingPipelineSlot> inflight;
+            std::deque<std::shared_ptr<std::future<void>>> pending_sends;
+
+            auto drain_send_window = [&](bool force_all) {
+                const size_t max_pending = force_all
+                    ? 0
+                    : static_cast<size_t>(std::max(0, slot_limit - 1));
+                while (pending_sends.size() > max_pending) {
+                    auto future = pending_sends.front();
+                    pending_sends.pop_front();
+                    auto wait_t0 = std::chrono::steady_clock::now();
+                    future->get();
+                    auto wait_t1 = std::chrono::steady_clock::now();
+                    double wait_ms = std::chrono::duration<double, std::milli>(wait_t1 - wait_t0).count();
+                    total_backpressure_ms += wait_ms;
+                    total_net_ms += wait_ms;
+                }
+            };
+
+            auto launch_reduce = [&](RingPipelineSlot& slot) {
+                if (slot.reduce_started) return;
+                slot.reduce_started = true;
+                if (slot.recv_bytes == 0) {
+                    slot.reduce_future = std::async(std::launch::deferred, [] {
+                        return RingReduceResult{};
+                    });
+                    return;
+                }
+                if (use_cpu) {
+                    at::Tensor recv_chunk = slot.recv_chunk;
+                    SharedPooledBuffer recv_buf = slot.recv_buf;
+                    slot.reduce_future = std::async(
+                        std::launch::async,
+                        [recv_chunk, recv_buf, recv_bytes = slot.recv_bytes, elem_size, op, phase]() {
+                            RingReduceResult result;
+                            if (phase == RingPipelinePhase::REDUCE_SCATTER) {
+                                auto red_t0 = std::chrono::steady_clock::now();
+                                MPSBufferView chunk_view = extract_mps_buffer(recv_chunk);
+                                cpu_reduce_op(
+                                    static_cast<float*>(chunk_view.cpu_ptr),
+                                    static_cast<const float*>(recv_buf->data()),
+                                    recv_chunk.numel(), op);
+                                auto red_t1 = std::chrono::steady_clock::now();
+                                result.reduce_ms = std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
+                            } else {
+                                auto wb_t0 = std::chrono::steady_clock::now();
+                                MPSBufferView chunk_view = extract_mps_buffer(recv_chunk);
+                                std::memcpy(chunk_view.cpu_ptr, recv_buf->data(), recv_bytes);
+                                auto wb_t1 = std::chrono::steady_clock::now();
+                                result.writeback_ms = std::chrono::duration<double, std::milli>(wb_t1 - wb_t0).count();
+                            }
+                            return result;
+                        });
+                }
+            };
+
+            auto finish_front = [&](bool block) -> bool {
+                if (inflight.empty()) return false;
+                auto& slot = inflight.front();
+
+                if (!slot.recv_done) {
+                    if (!block && !future_ready(slot.recv_future)) return false;
+                    auto wait_t0 = std::chrono::steady_clock::now();
+                    slot.recv_future->get();
+                    auto wait_t1 = std::chrono::steady_clock::now();
+                    total_net_ms += std::chrono::duration<double, std::milli>(wait_t1 - wait_t0).count();
+                    slot.recv_done = true;
+                    launch_reduce(slot);
+                }
+
+                RingReduceResult reduce_result;
+                if (use_cpu) {
+                    if (!slot.reduce_started) launch_reduce(slot);
+                    if (!block && !future_ready(slot.reduce_future)) return false;
+                    reduce_result = slot.reduce_future.get();
+                } else {
+                    if (slot.recv_bytes > 0) {
+                        if (phase == RingPipelinePhase::REDUCE_SCATTER) {
+                            auto wb_t0 = std::chrono::steady_clock::now();
+                            at::Tensor incoming = torch::empty_like(slot.recv_chunk);
+                            unstage_from_recv(incoming, slot.recv_buf->data(), slot.recv_bytes);
+                            auto wb_t1 = std::chrono::steady_clock::now();
+                            reduce_result.writeback_ms += std::chrono::duration<double, std::milli>(wb_t1 - wb_t0).count();
+
+                            auto red_t0 = std::chrono::steady_clock::now();
+                            metal_reduce_op(slot.recv_chunk, incoming, op);
+                            auto red_t1 = std::chrono::steady_clock::now();
+                            reduce_result.reduce_ms += std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
+                        } else {
+                            auto wb_t0 = std::chrono::steady_clock::now();
+                            unstage_from_recv(slot.recv_chunk, slot.recv_buf->data(), slot.recv_bytes);
+                            auto wb_t1 = std::chrono::steady_clock::now();
+                            reduce_result.writeback_ms += std::chrono::duration<double, std::milli>(wb_t1 - wb_t0).count();
+                        }
+                    }
+                }
+
+                total_reduce_ms += reduce_result.reduce_ms;
+                total_writeback_ms += reduce_result.writeback_ms;
+                chunk_ready_step[slot.recv_chunk_idx] =
+                    std::max(chunk_ready_step[slot.recv_chunk_idx], slot.step + 2);
+                inflight.pop_front();
+                return true;
+            };
+
+            auto kick_ready_reductions = [&]() {
+                if (!use_cpu) return;
+                for (auto& slot : inflight) {
+                    if (slot.recv_done || !future_ready(slot.recv_future)) continue;
+                    slot.recv_future->get();
+                    slot.recv_done = true;
+                    launch_reduce(slot);
+                }
+            };
+
+            for (int step = 0; step < total_steps;) {
+                kick_ready_reductions();
+                while (finish_front(false)) {}
+
+                bool launched = false;
+                while (step < total_steps && static_cast<int>(inflight.size()) < slot_limit) {
+                    int send_chunk_idx = 0;
+                    int recv_chunk_idx = 0;
+                    uint32_t send_tid = 0;
+                    uint32_t recv_tid = 0;
+                    compute_indices(step, send_chunk_idx, recv_chunk_idx, send_tid, recv_tid);
+
+                    if (step < chunk_ready_step[send_chunk_idx]) break;
+
+                    at::Tensor& send_chunk = chunks[send_chunk_idx];
+                    at::Tensor& recv_chunk = chunks[recv_chunk_idx];
+                    size_t send_bytes = send_chunk.numel() * elem_size;
+                    size_t recv_bytes = recv_chunk.numel() * elem_size;
+
+                    if (send_bytes == 0 && recv_bytes == 0) {
+                        chunk_ready_step[recv_chunk_idx] =
+                            std::max(chunk_ready_step[recv_chunk_idx], step + 2);
+                        step++;
+                        launched = true;
+                        continue;
+                    }
+
+                    if (send_bytes > 0) {
+                        auto send_buf = std::make_shared<PooledBuffer>(staging_memory_pool(), send_bytes);
+                        stable_stage_chunk(send_chunk, send_buf->data(), send_bytes);
+                        auto send_future = submit_send_async(send_tid, send_buf, send_bytes);
+                        pending_sends.push_back(send_future);
+                        drain_send_window(false);
+                    }
+
+                    RingPipelineSlot slot;
+                    slot.phase = phase;
+                    slot.step = step;
+                    slot.send_chunk_idx = send_chunk_idx;
+                    slot.recv_chunk_idx = recv_chunk_idx;
+                    slot.recv_bytes = recv_bytes;
+                    slot.recv_chunk = recv_chunk;
+                    if (recv_bytes > 0) {
+                        slot.recv_buf = std::make_shared<PooledBuffer>(staging_memory_pool(), recv_bytes);
+                    }
+                    slot.recv_future = submit_recv_async(recv_tid, slot.recv_buf, recv_bytes);
+                    inflight.push_back(std::move(slot));
+                    sample_pipeline_depth(static_cast<uint64_t>(inflight.size() + pending_sends.size()));
+                    launched = true;
+                    step++;
+                }
+
+                kick_ready_reductions();
+
+                if (!launched) {
+                    auto wait_t0 = std::chrono::steady_clock::now();
+                    bool progressed = finish_front(true);
+                    auto wait_t1 = std::chrono::steady_clock::now();
+                    double wait_ms = std::chrono::duration<double, std::milli>(wait_t1 - wait_t0).count();
+                    total_backpressure_ms += wait_ms;
+                    if (!progressed) break;
+                }
+            }
+
+            while (finish_front(true)) {}
+            drain_send_window(true);
+        };
+
+    auto compute_rs_indices =
+        [&](int step, int& send_chunk_idx, int& recv_chunk_idx, uint32_t& send_tid, uint32_t& recv_tid) {
+            send_chunk_idx = (rank * 2 - step + num_chunks) % num_chunks;
+            recv_chunk_idx = (rank * 2 - step - 2 + num_chunks) % num_chunks;
+            send_tid = (static_cast<uint32_t>(step) << 16) | static_cast<uint32_t>(send_chunk_idx);
+            recv_tid = (static_cast<uint32_t>(step) << 16) | static_cast<uint32_t>(recv_chunk_idx);
+            validate_ring_step_indices(num_chunks, send_chunk_idx, recv_chunk_idx, send_tid, recv_tid);
+        };
+
+    auto compute_ag_indices =
+        [&](int step, int& send_chunk_idx, int& recv_chunk_idx, uint32_t& send_tid, uint32_t& recv_tid) {
+            uint32_t ag_step = static_cast<uint32_t>(total_steps + step);
+            send_chunk_idx = (rank * 2 + step + 2 + num_chunks) % num_chunks;
+            recv_chunk_idx = (rank * 2 + step + num_chunks) % num_chunks;
+            send_tid = (ag_step << 16) | static_cast<uint32_t>(send_chunk_idx);
+            recv_tid = (ag_step << 16) | static_cast<uint32_t>(recv_chunk_idx);
+            validate_ring_step_indices(num_chunks, send_chunk_idx, recv_chunk_idx, send_tid, recv_tid);
+        };
+
+    run_phase(
+        RingPipelinePhase::REDUCE_SCATTER,
+        compute_rs_indices);
+    run_phase(
+        RingPipelinePhase::ALLGATHER,
+        compute_ag_indices);
+
+    if (use_cpu) {
+        if (op == c10d::ReduceOp::AVG) {
+            auto red_t0 = std::chrono::steady_clock::now();
+            MPSBufferView view = extract_mps_buffer(tensor);
+            cpu_scale_inplace(static_cast<float*>(view.cpu_ptr), total_elems, 1.0f / ws);
+            auto red_t1 = std::chrono::steady_clock::now();
+            total_reduce_ms += std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
+        }
+        if (overlap_comm_) signal_mccl_done(next_event_value());
+    } else {
+        if (op == c10d::ReduceOp::AVG) {
+            auto red_t0 = std::chrono::steady_clock::now();
+            metal_begin_batch("mccl_allreduce_ring_chunked_pipeline_avg");
+            metal_scale_inplace(tensor, 1.0 / ws);
+            auto red_t1 = std::chrono::steady_clock::now();
+            total_reduce_ms += std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
+        }
+        auto sync_t0 = std::chrono::steady_clock::now();
+        metal_sync();
+        auto sync_t1 = std::chrono::steady_clock::now();
+        total_reduce_ms += std::chrono::duration<double, std::milli>(sync_t1 - sync_t0).count();
+    }
+
+    metrics_->record_pipeline(
+        seq,
+        total_stage_ms,
+        total_writeback_ms,
+        total_backpressure_ms,
+        max_pipeline_depth,
+        false);
+    metrics_->record_phase(seq, 0.0, total_net_ms, total_reduce_ms);
+}
+
+void ProcessGroupMCCL::allreduce_ring_chunked_serial(at::Tensor& tensor, uint32_t seq,
+                                                     c10d::ReduceOp::RedOpType op) {
     // Gloo-style ring allreduce with 2P chunks for double buffering.
     // 4*P communication steps but only 2*S bytes on wire (vs P*S for basic ring).
     // Steps are serial (data dependencies), but the 2P chunking halves per-step

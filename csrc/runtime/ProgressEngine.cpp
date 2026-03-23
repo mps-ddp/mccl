@@ -32,16 +32,19 @@ void ProgressEngine::start() {
 
 uint32_t ProgressEngine::submit(std::function<void()> execute,
                                 std::function<void()> on_complete,
-                                std::function<void(std::exception_ptr)> on_error) {
+                                std::function<void(std::exception_ptr)> on_error,
+                                std::function<void(double)> on_queue_wait_ms) {
     MCCL_CHECK(running_.load(), "ProgressEngine is not running");
 
     uint32_t seq = seq_counter_.fetch_add(1);
 
     EngineOp op;
     op.seq_num = seq;
+    op.enqueue_ts = std::chrono::steady_clock::now();
     op.execute = std::move(execute);
     op.on_complete = std::move(on_complete);
     op.on_error = std::move(on_error);
+    op.on_queue_wait_ms = std::move(on_queue_wait_ms);
 
     {
         std::unique_lock<std::mutex> lock(mu_);
@@ -133,6 +136,15 @@ void ProgressEngine::worker_loop() {
         not_full_.notify_one();
 
         MCCL_TRACE("Executing op seq=%u", op.seq_num);
+        if (op.on_queue_wait_ms) {
+            auto now = std::chrono::steady_clock::now();
+            double q_ms = std::chrono::duration<double, std::milli>(now - op.enqueue_ts).count();
+            try {
+                op.on_queue_wait_ms(q_ms);
+            } catch (...) {
+                MCCL_WARN("Op seq=%u queue-wait callback threw; continuing", op.seq_num);
+            }
+        }
 
         bool exec_ok = false;
         std::exception_ptr exec_ex;

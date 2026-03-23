@@ -254,15 +254,15 @@ class TestDDPThreeRankProductionGates:
     def test_three_rank_pipelined_canary_smoke(self):
         def fn(rank, world_size):
             torch.manual_seed(42)
-            model = nn.Linear(512, 512, bias=False).to("mps")
-            ddp_model = DDP(model, bucket_cap_mb=8)
+            model = nn.Linear(256, 256, bias=False).to("mps")
+            ddp_model = DDP(model, bucket_cap_mb=4)
             optimizer = torch.optim.SGD(ddp_model.parameters(), lr=1e-2)
             loss_fn = nn.MSELoss()
 
             for step in range(6):
                 torch.manual_seed(6000 + step * world_size + rank)
-                x = torch.randn(32, 512, device="mps")
-                y = torch.randn(32, 512, device="mps")
+                x = torch.randn(16, 256, device="mps")
+                y = torch.randn(16, 256, device="mps")
                 optimizer.zero_grad(set_to_none=True)
                 loss = loss_fn(ddp_model(x), y)
                 loss.backward()
@@ -286,12 +286,106 @@ class TestDDPThreeRankProductionGates:
                 assert metrics.avg_wall_ms >= 0.0
                 assert metrics.avg_network_ms >= 0.0
                 assert metrics.avg_reduce_ms >= 0.0
+                assert metrics.avg_queue_wait_ms >= 0.0
+                assert metrics.avg_send_queue_wait_ms >= 0.0
+                assert metrics.avg_recv_queue_wait_ms >= 0.0
+                assert metrics.avg_send_ms >= 0.0
+                assert metrics.avg_recv_ms >= 0.0
+                assert metrics.avg_stage_ms >= 0.0
+                assert metrics.avg_writeback_ms >= 0.0
+                assert metrics.avg_backpressure_ms >= 0.0
+                assert metrics.avg_pipeline_depth >= 0.0
+                assert metrics.max_pipeline_depth >= 1
 
         _run_distributed(
             fn,
             world_size=3,
             port=35500,
             extra_env={
+                "MCCL_RING_ASSERT_ORDER": "1",
+                "MCCL_RING_PIPELINE_WINDOW": "2",
+            },
+        )
+
+    def test_three_rank_multiseed_bucket_parity_gate(self):
+        def fn(rank, world_size):
+            seeds = (41, 777)
+            bucket_mbs = (4, 16)
+            loss_fn = nn.MSELoss()
+
+            for seed in seeds:
+                for bucket_mb in bucket_mbs:
+                    torch.manual_seed(seed)
+                    model = nn.Sequential(
+                        nn.Linear(128, 256),
+                        nn.ReLU(),
+                        nn.Linear(256, 64),
+                    ).to("mps")
+                    ddp_model = DDP(model, bucket_cap_mb=bucket_mb)
+                    optimizer = torch.optim.AdamW(ddp_model.parameters(), lr=1e-3)
+
+                    losses = []
+                    for step in range(6):
+                        torch.manual_seed(seed * 1000 + step * world_size + rank)
+                        x = torch.randn(24, 128, device="mps")
+                        y = torch.randn(24, 64, device="mps")
+                        optimizer.zero_grad(set_to_none=True)
+                        loss = loss_fn(ddp_model(x), y)
+                        loss.backward()
+
+                        grad_sum = torch.zeros(1, dtype=torch.float32, device="mps")
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                grad_sum += p.grad.detach().float().sum()
+                        grad_global = grad_sum.clone()
+                        dist.all_reduce(grad_global, op=dist.ReduceOp.SUM)
+                        grad_expected = grad_global / world_size
+                        assert torch.allclose(grad_sum, grad_expected, rtol=1e-4, atol=1e-3), (
+                            f"Rank {rank}: grad checksum mismatch seed={seed} "
+                            f"bucket={bucket_mb} step={step}"
+                        )
+
+                        optimizer.step()
+                        losses.append(loss.item())
+
+                    assert losses[-1] < losses[0], (
+                        f"Rank {rank}: loss did not decrease seed={seed} bucket={bucket_mb} "
+                        f"({losses[0]:.4f} -> {losses[-1]:.4f})"
+                    )
+
+                    checksum = torch.zeros(1, dtype=torch.float32, device="mps")
+                    for p in model.parameters():
+                        checksum += p.detach().float().sum()
+                    checksum_global = checksum.clone()
+                    dist.all_reduce(checksum_global, op=dist.ReduceOp.SUM)
+                    checksum_expected = checksum_global / world_size
+                    assert torch.allclose(checksum, checksum_expected, rtol=1e-4, atol=1e-3), (
+                        f"Rank {rank}: param checksum mismatch seed={seed} bucket={bucket_mb}"
+                    )
+
+            if rank == 0:
+                import mccl
+
+                metrics = mccl.get_metrics()
+                assert metrics is not None
+                assert metrics.total_errors == 0
+                assert metrics.avg_queue_wait_ms >= 0.0
+                assert metrics.avg_send_queue_wait_ms >= 0.0
+                assert metrics.avg_recv_queue_wait_ms >= 0.0
+                assert metrics.avg_send_ms >= 0.0
+                assert metrics.avg_recv_ms >= 0.0
+                assert metrics.avg_stage_ms >= 0.0
+                assert metrics.avg_writeback_ms >= 0.0
+                assert metrics.avg_backpressure_ms >= 0.0
+                assert metrics.avg_pipeline_depth >= 0.0
+                assert metrics.max_pipeline_depth >= 1
+
+        _run_distributed(
+            fn,
+            world_size=3,
+            port=35600,
+            extra_env={
+                "MCCL_VALIDATE_GRAD_SYNC": "1",
                 "MCCL_RING_ASSERT_ORDER": "1",
                 "MCCL_RING_PIPELINE_WINDOW": "2",
             },

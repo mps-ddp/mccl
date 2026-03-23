@@ -46,6 +46,45 @@ void Metrics::record_phase(uint32_t seq, double sync_ms, double network_ms, doub
     it->second.reduce_ms += reduce_ms;
 }
 
+void Metrics::record_queue_wait(uint32_t seq, double queue_wait_ms) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = inflight_.find(seq);
+    if (it == inflight_.end()) return;
+    it->second.queue_wait_ms += queue_wait_ms;
+}
+
+void Metrics::record_ring_queue_wait(uint32_t seq, double send_queue_wait_ms, double recv_queue_wait_ms) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = inflight_.find(seq);
+    if (it == inflight_.end()) return;
+    it->second.send_queue_wait_ms += send_queue_wait_ms;
+    it->second.recv_queue_wait_ms += recv_queue_wait_ms;
+}
+
+void Metrics::record_ring_io(uint32_t seq, double send_ms, double recv_ms) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = inflight_.find(seq);
+    if (it == inflight_.end()) return;
+    it->second.send_ms += send_ms;
+    it->second.recv_ms += recv_ms;
+}
+
+void Metrics::record_pipeline(uint32_t seq, double stage_ms, double writeback_ms,
+                              double backpressure_ms, uint64_t pipeline_depth,
+                              bool sample_depth) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = inflight_.find(seq);
+    if (it == inflight_.end()) return;
+    it->second.stage_ms += stage_ms;
+    it->second.writeback_ms += writeback_ms;
+    it->second.backpressure_ms += backpressure_ms;
+    if (sample_depth) {
+        it->second.pipeline_depth_sum += static_cast<double>(pipeline_depth);
+        it->second.pipeline_depth_samples += 1;
+        it->second.max_pipeline_depth = std::max(it->second.max_pipeline_depth, pipeline_depth);
+    }
+}
+
 void Metrics::record_transport_bytes(size_t bytes, bool is_send) {
     if (is_send) {
         total_bytes_sent_.fetch_add(bytes, std::memory_order_relaxed);
@@ -111,14 +150,43 @@ Metrics::Summary Metrics::summarize() const {
     s.peak_throughput_gbps = peak_tp;
 
     double total_sync = 0, total_net = 0, total_reduce = 0;
+    double total_queue_wait = 0, total_send_queue_wait = 0, total_recv_queue_wait = 0;
+    double total_send_ms = 0, total_recv_ms = 0;
+    double total_stage_ms = 0, total_writeback_ms = 0, total_backpressure_ms = 0;
+    double total_avg_pipeline_depth = 0;
+    uint64_t total_pipeline_samples = 0;
+    uint64_t max_pipeline_depth = 0;
     for (auto& m : completed_) {
         total_sync += m.sync_ms;
         total_net += m.network_ms;
         total_reduce += m.reduce_ms;
+        total_queue_wait += m.queue_wait_ms;
+        total_send_queue_wait += m.send_queue_wait_ms;
+        total_recv_queue_wait += m.recv_queue_wait_ms;
+        total_send_ms += m.send_ms;
+        total_recv_ms += m.recv_ms;
+        total_stage_ms += m.stage_ms;
+        total_writeback_ms += m.writeback_ms;
+        total_backpressure_ms += m.backpressure_ms;
+        total_avg_pipeline_depth += m.pipeline_depth_sum;
+        total_pipeline_samples += m.pipeline_depth_samples;
+        max_pipeline_depth = std::max(max_pipeline_depth, m.max_pipeline_depth);
     }
     s.avg_sync_ms = total_sync / n;
     s.avg_network_ms = total_net / n;
     s.avg_reduce_ms = total_reduce / n;
+    s.avg_queue_wait_ms = total_queue_wait / n;
+    s.avg_send_queue_wait_ms = total_send_queue_wait / n;
+    s.avg_recv_queue_wait_ms = total_recv_queue_wait / n;
+    s.avg_send_ms = total_send_ms / n;
+    s.avg_recv_ms = total_recv_ms / n;
+    s.avg_stage_ms = total_stage_ms / n;
+    s.avg_writeback_ms = total_writeback_ms / n;
+    s.avg_backpressure_ms = total_backpressure_ms / n;
+    s.avg_pipeline_depth = total_pipeline_samples > 0
+        ? (total_avg_pipeline_depth / static_cast<double>(total_pipeline_samples))
+        : 0.0;
+    s.max_pipeline_depth = max_pipeline_depth;
     s.avg_overlap_efficiency = total_overlap_eff / n;
     s.small_ops = small_latencies.size();
     s.medium_ops = medium_latencies.size();
@@ -161,6 +229,16 @@ void Metrics::log_summary() const {
     MCCL_INFO("  Avg sync:         %.3f ms", s.avg_sync_ms);
     MCCL_INFO("  Avg network:      %.3f ms", s.avg_network_ms);
     MCCL_INFO("  Avg reduce:       %.3f ms", s.avg_reduce_ms);
+    MCCL_INFO("  Avg queue wait:   %.3f ms", s.avg_queue_wait_ms);
+    MCCL_INFO("  Avg send q wait:  %.3f ms", s.avg_send_queue_wait_ms);
+    MCCL_INFO("  Avg recv q wait:  %.3f ms", s.avg_recv_queue_wait_ms);
+    MCCL_INFO("  Avg send wire:    %.3f ms", s.avg_send_ms);
+    MCCL_INFO("  Avg recv wire:    %.3f ms", s.avg_recv_ms);
+    MCCL_INFO("  Avg stage:        %.3f ms", s.avg_stage_ms);
+    MCCL_INFO("  Avg writeback:    %.3f ms", s.avg_writeback_ms);
+    MCCL_INFO("  Avg backpressure: %.3f ms", s.avg_backpressure_ms);
+    MCCL_INFO("  Avg pipe depth:   %.3f", s.avg_pipeline_depth);
+    MCCL_INFO("  Max pipe depth:   %llu", (unsigned long long)s.max_pipeline_depth);
     MCCL_INFO("  Avg overlap eff:  %.3f", s.avg_overlap_efficiency);
     MCCL_INFO("  Small bucket:     ops=%llu avg=%.3fms p99=%.3fms",
               (unsigned long long)s.small_ops, s.small_avg_wall_ms, s.small_p99_wall_ms);

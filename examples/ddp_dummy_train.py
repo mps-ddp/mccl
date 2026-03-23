@@ -194,7 +194,7 @@ def run_ddp(args) -> None:
             loss = loss_fn(ddp_model(x), y)
 
         loss.backward()
-        if validate_grads and world_size >= 3:
+        if validate_grads and world_size >= 2:
             grad_sum = torch.zeros(1, dtype=torch.float32, device=device)
             for p in model.parameters():
                 if p.grad is not None:
@@ -236,10 +236,24 @@ def run_ddp(args) -> None:
                         "avg_sync_ms",
                         "avg_network_ms",
                         "avg_reduce_ms",
+                        "avg_queue_wait_ms",
+                        "avg_send_queue_wait_ms",
+                        "avg_recv_queue_wait_ms",
+                        "avg_send_ms",
+                        "avg_recv_ms",
+                        "avg_stage_ms",
+                        "avg_writeback_ms",
+                        "avg_backpressure_ms",
                     ):
                         val = getattr(metrics, attr, None)
                         if val is not None:
                             mccl_info += f"  {attr}={val:.2f}ms"
+                    avg_depth = getattr(metrics, "avg_pipeline_depth", None)
+                    if avg_depth is not None:
+                        mccl_info += f"  avg_pipeline_depth={avg_depth:.2f}"
+                    max_depth = getattr(metrics, "max_pipeline_depth", None)
+                    if max_depth is not None:
+                        mccl_info += f"  max_pipeline_depth={max_depth}"
                     overlap = getattr(metrics, "avg_overlap_efficiency", None)
                     if overlap is not None:
                         mccl_info += f"  avg_overlap_efficiency={overlap:.2f}"

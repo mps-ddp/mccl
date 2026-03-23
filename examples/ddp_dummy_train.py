@@ -234,7 +234,11 @@ def run_ddp(args) -> None:
                              args.batch_size, world_size, total_params)
         print(f"Wrote stats to {args.save_stats}", flush=True)
 
-    # Sanity check: params in sync
+    # Sanity check: params in sync — barrier ensures all ranks finished
+    # training before any rank issues the broadcast.
+    dist.barrier()
+    if args.backend == "mccl":
+        torch.mps.synchronize()
     head = next(model.parameters()).detach().flatten()[:8].to(device)
     ref = head.clone()
     dist.broadcast(ref, src=0)

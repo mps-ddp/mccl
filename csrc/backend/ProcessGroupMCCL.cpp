@@ -220,10 +220,13 @@ ProcessGroupMCCL::~ProcessGroupMCCL() {
         metrics_->log_summary();
         if (health_) health_->stop();
         if (watchdog_) watchdog_->stop();
-        if (reduce_engine_) reduce_engine_->stop();
+        // Stop net engines first — their on_complete callbacks may chain
+        // submissions into reduce_engine_, so reduce_engine_ must still be
+        // running while net engines drain.
         for (auto& engine : net_engines_) {
             if (engine) engine->stop();
         }
+        if (reduce_engine_) reduce_engine_->stop();
         if (transport_) transport_->shutdown();
     } catch (const std::exception& e) {
         MCCL_DEBUG("Exception during shutdown (suppressed): %s", e.what());
@@ -644,41 +647,67 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
     auto tensors_copy = tensors;
     auto flat_copy = flat;
 
-    reduce_engine_->submit(
-        [this, flat_copy, tensors_copy, seq, ws, nbytes, red_op, sync_val]() mutable {
-            if (sync_val > 0) wait_for_mps(sync_val);
-            if (ws == 2) {
-                allreduce_two_rank(flat_copy, seq, red_op);
-            } else if (ws >= 3) {
-                allreduce_ring_chunked(flat_copy, seq, red_op);
-            } else {
-                allreduce_ring(flat_copy, seq, red_op);
-            }
-
-            // Scatter the reduced flat buffer back into the original tensors
-            size_t offset = 0;
-            for (auto& t : tensors_copy) {
-                size_t t_nbytes = tensor_nbytes(t);
-                auto src_slice = flat_copy.narrow(0, static_cast<int64_t>(offset / flat_copy.element_size()),
-                                                  t.numel());
-                t.view_as(src_slice).copy_(src_slice);
-                offset += t_nbytes;
-            }
-        },
-        [this, work_ptr, seq]() {
-            unregister_work(seq);
-            watchdog_->complete(seq);
-            metrics_->op_end(seq);
-            work_ptr->markComplete();
-        },
-        [this, work_ptr, seq](std::exception_ptr e) {
-            unregister_work(seq);
-            watchdog_->complete(seq);
-            metrics_->op_end(seq);
-            metrics_->record_error();
-            work_ptr->markError(e);
+    // For 2-rank, route through net_engine_for(peer) to serialize all peer
+    // I/O and avoid racing with concurrent allreduce ops on the same socket.
+    auto scatter_back = [](at::Tensor& flat_buf, std::vector<at::Tensor>& orig_tensors) {
+        size_t offset = 0;
+        for (auto& t : orig_tensors) {
+            size_t t_nbytes = tensor_nbytes(t);
+            auto src_slice = flat_buf.narrow(0, static_cast<int64_t>(offset / flat_buf.element_size()),
+                                              t.numel());
+            t.view_as(src_slice).copy_(src_slice);
+            offset += t_nbytes;
         }
-    );
+    };
+
+    if (ws == 2) {
+        int peer = 1 - getRank();
+        net_engine_for(peer).submit(
+            [this, flat_copy, tensors_copy, seq, red_op, sync_val, scatter_back]() mutable {
+                if (sync_val > 0) wait_for_mps(sync_val);
+                allreduce_two_rank(flat_copy, seq, red_op);
+                scatter_back(flat_copy, tensors_copy);
+            },
+            [this, work_ptr, seq]() {
+                unregister_work(seq);
+                watchdog_->complete(seq);
+                metrics_->op_end(seq);
+                work_ptr->markComplete();
+            },
+            [this, work_ptr, seq](std::exception_ptr e) {
+                unregister_work(seq);
+                watchdog_->complete(seq);
+                metrics_->op_end(seq);
+                metrics_->record_error();
+                work_ptr->markError(e);
+            }
+        );
+    } else {
+        reduce_engine_->submit(
+            [this, flat_copy, tensors_copy, seq, ws, nbytes, red_op, sync_val, scatter_back]() mutable {
+                if (sync_val > 0) wait_for_mps(sync_val);
+                if (ws >= 3) {
+                    allreduce_ring_chunked(flat_copy, seq, red_op);
+                } else {
+                    allreduce_ring(flat_copy, seq, red_op);
+                }
+                scatter_back(flat_copy, tensors_copy);
+            },
+            [this, work_ptr, seq]() {
+                unregister_work(seq);
+                watchdog_->complete(seq);
+                metrics_->op_end(seq);
+                work_ptr->markComplete();
+            },
+            [this, work_ptr, seq](std::exception_ptr e) {
+                unregister_work(seq);
+                watchdog_->complete(seq);
+                metrics_->op_end(seq);
+                metrics_->record_error();
+                work_ptr->markError(e);
+            }
+        );
+    }
 
     return work;
 }
@@ -719,30 +748,21 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
 
             // ── Phase 1: reduce-scatter ──
             // Send peer's half, recv my half in chunks, reduce each chunk.
-            std::atomic<bool> send_ok{false};
-            std::thread send_thread([&]() {
-                bool ok = true;
-                for (size_t c = 0; c < nchunks && ok; ++c) {
-                    size_t off = c * REDUCE_CHUNK;
-                    size_t len = std::min(REDUCE_CHUNK, half - off);
-                    uint32_t tid = static_cast<uint32_t>(c + 1);
-                    ok = transport_->send_chunks(
-                        peer, OpType::ALLREDUCE, seq, tid,
-                        static_cast<const uint8_t*>(staged.data) + peer_off + off, len);
-                }
-                send_ok.store(ok, std::memory_order_release);
-            });
-
+            // Uses send_recv_overlap per chunk instead of a raw std::thread
+            // to stay within the engine's serialization guarantee and avoid
+            // interleaving with concurrent DDP bucket operations over TCP.
             for (size_t c = 0; c < nchunks; ++c) {
                 size_t off = c * REDUCE_CHUNK;
                 size_t len = std::min(REDUCE_CHUNK, half - off);
                 int64_t chunk_count = static_cast<int64_t>(len / sizeof(float));
                 uint32_t tid = static_cast<uint32_t>(c + 1);
 
-                MCCL_CHECK(transport_->recv_chunks(
+                MCCL_CHECK(transport_->send_recv_overlap(
+                    peer, OpType::ALLREDUCE, seq, tid,
+                    static_cast<const uint8_t*>(staged.data) + peer_off + off, len,
                     peer, OpType::ALLREDUCE, seq, tid,
                     recv_buf.data(), len),
-                    "allreduce_two_rank RS recv chunk failed");
+                    "allreduce_two_rank RS chunk " + std::to_string(c) + " failed");
 
                 auto rc0 = std::chrono::steady_clock::now();
                 float* chunk_dst = base + (my_off + off) / sizeof(float);
@@ -755,10 +775,6 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
                 auto rc1 = std::chrono::steady_clock::now();
                 red_ms_accum += std::chrono::duration<double, std::milli>(rc1 - rc0).count();
             }
-
-            send_thread.join();
-            MCCL_CHECK(send_ok.load(std::memory_order_acquire),
-                       "allreduce_two_rank RS send failed");
 
             // ── Phase 2: allgather ──
             // Exchange reduced halves so both ranks have the full result.

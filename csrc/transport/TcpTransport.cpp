@@ -488,6 +488,7 @@ bool TcpTransport::recv_msg(int peer_rank, MessageHeader& header,
 
 bool TcpTransport::send_chunks(int peer_rank, OpType op, uint32_t seq,
                                uint32_t tensor_id, const void* data, size_t nbytes) {
+    if (shut_down_.load()) return false;
     std::lock_guard<std::mutex> lock(send_mu_for(peer_rank));
 
     MCCL_CHECK(nbytes <= static_cast<size_t>(UINT32_MAX),
@@ -540,6 +541,7 @@ bool TcpTransport::send_chunks(int peer_rank, OpType op, uint32_t seq,
 
 bool TcpTransport::recv_chunks(int peer_rank, OpType op, uint32_t seq,
                                uint32_t tensor_id, void* data, size_t nbytes) {
+    if (shut_down_.load()) return false;
     std::lock_guard<std::mutex> lock(recv_mu_for(peer_rank));
 
     // Point-to-point operations (SEND/RECV) match on tensor_id (the user tag)
@@ -596,6 +598,8 @@ bool TcpTransport::send_recv_overlap(
     const void* send_data, size_t send_nbytes,
     int recv_peer, OpType recv_op, uint32_t recv_seq, uint32_t recv_tid,
     void* recv_data, size_t recv_nbytes) {
+
+    if (shut_down_.load()) return false;
 
     MCCL_CHECK(send_nbytes <= static_cast<size_t>(UINT32_MAX),
                "send_recv_overlap: send payload too large");

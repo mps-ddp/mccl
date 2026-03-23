@@ -58,7 +58,7 @@ def _worker_mccl(rank, world_size, port, results):
 
     device = torch.device("mps")
     torch.manual_seed(42)
-    model = BenchModel(hidden=512, layers=4).to(device)
+    model = BenchModel(hidden=2048, layers=20).to(device)
     ddp_model = DDP(model)
     opt = torch.optim.SGD(ddp_model.parameters(), lr=0.01)
     loss_fn = nn.CrossEntropyLoss()
@@ -102,7 +102,7 @@ def _worker_gloo(rank, world_size, port, results):
     # Gloo requires CPU tensors
     device = torch.device("cpu")
     torch.manual_seed(42)
-    model = BenchModel(hidden=512, layers=4).to(device)
+    model = BenchModel(hidden=2048, layers=20).to(device)
     ddp_model = DDP(model)
     opt = torch.optim.SGD(ddp_model.parameters(), lr=0.01)
     loss_fn = nn.CrossEntropyLoss()

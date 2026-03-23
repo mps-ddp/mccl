@@ -2,6 +2,7 @@
 
 #include "compression/Compression.hpp"
 #include <vector>
+#include <unordered_map>
 
 namespace mccl {
 
@@ -36,13 +37,15 @@ public:
     /// Reset the error feedback buffer (e.g. between training runs).
     void reset_error_feedback();
 
-    /// Get the current error feedback buffer (for diagnostics).
-    const std::vector<float>& error_feedback() const { return error_buf_; }
+    /// Reset error feedback for a specific tensor (identified by data pointer).
+    void reset_error_feedback_for_tensor(const void* tensor_ptr);
+
+    /// Get the current error feedback buffers (for diagnostics).
+    const std::unordered_map<uintptr_t, std::vector<float>>& error_feedback_buffers() const { return error_buffers_; }
 
 private:
     double k_ratio_;
-    std::vector<float> error_buf_;
-    size_t last_count_ = 0;
+    std::unordered_map<uintptr_t, std::vector<float>> error_buffers_;  // Per-tensor error feedback
 };
 
 } // namespace mccl

@@ -97,6 +97,8 @@ private:
                             c10d::ReduceOp::RedOpType op);
     void allreduce_ring(at::Tensor& tensor, uint32_t seq,
                         c10d::ReduceOp::RedOpType op);
+    void allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
+                                 c10d::ReduceOp::RedOpType op);
     void allreduce_small(at::Tensor& tensor, uint32_t seq,
                          c10d::ReduceOp::RedOpType op);
 
@@ -112,11 +114,16 @@ private:
     void unregister_work(uint32_t seq);
     void abort_all_inflight_works(const std::string& reason);
 
+    /// Get the NetEngine for a specific peer rank. Used to route network operations
+    /// to the correct per-peer engine for concurrent I/O.
+    ProgressEngine& net_engine_for(int peer_rank);
+
     c10::intrusive_ptr<c10d::Store> store_;
     std::chrono::milliseconds timeout_;
 
     std::unique_ptr<Transport> transport_;
-    std::unique_ptr<ProgressEngine> engine_;
+    std::unique_ptr<ProgressEngine> reduce_engine_;
+    std::vector<std::unique_ptr<ProgressEngine>> net_engines_;
     std::unique_ptr<Rendezvous> rendezvous_;
     std::unique_ptr<Watchdog> watchdog_;
     std::unique_ptr<HealthMonitor> health_;

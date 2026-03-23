@@ -71,6 +71,10 @@ private:
     MemoryPool::Buffer buf_;
 };
 
+/// Shared ownership wrapper for PooledBuffer to support cross-thread lifetime management.
+/// Used when network phase and reduce phase execute on different engines.
+using SharedPooledBuffer = std::shared_ptr<PooledBuffer>;
+
 /// Global staging pool singleton.
 MemoryPool& staging_memory_pool();
 

@@ -59,9 +59,15 @@ inline uint64_t sync_mps_nonblocking(bool overlap) {
 }
 
 // Blocking: for callers that don't defer the wait to an engine thread.
+// DEPRECATED: Use commit_mps_and_signal + deferred wait_for_mps in engine for better overlap.
 inline void sync_mps_for_collective(bool overlap) {
-    uint64_t val = sync_mps_nonblocking(overlap);
-    if (val > 0) wait_for_mps(val);
+    if (overlap && event_sync_available()) {
+        uint64_t val = next_event_value();
+        commit_mps_and_signal(val);
+        wait_for_mps(val);
+    } else {
+        mps_stream_sync();
+    }
 }
 
 inline void reset_sync_state() {
@@ -116,8 +122,19 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     size_t queue_depth = 1024;
     if (auto* v = std::getenv("MCCL_MAX_QUEUE_DEPTH"))
         queue_depth = static_cast<size_t>(std::atoll(v));
-    engine_ = std::make_unique<ProgressEngine>(queue_depth);
-    engine_->start();
+    
+    // Create reduce engine
+    reduce_engine_ = std::make_unique<ProgressEngine>(queue_depth);
+    reduce_engine_->start();
+    
+    // Create net engines (one per peer rank, excluding self)
+    net_engines_.resize(world_size);
+    for (int i = 0; i < world_size; i++) {
+        if (i != rank) {
+            net_engines_[i] = std::make_unique<ProgressEngine>(queue_depth);
+            net_engines_[i]->start();
+        }
+    }
 
     auto wd_timeout = timeout;
     if (auto* v = std::getenv("MCCL_WATCHDOG_TIMEOUT_MS"))
@@ -186,6 +203,16 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     MCCL_INFO("ProcessGroupMCCL rank=%d ready", rank);
 }
 
+ProgressEngine& ProcessGroupMCCL::net_engine_for(int peer_rank) {
+    MCCL_CHECK(peer_rank >= 0 && peer_rank < getSize(),
+               "net_engine_for: invalid peer_rank " + std::to_string(peer_rank));
+    MCCL_CHECK(peer_rank != getRank(),
+               "net_engine_for: cannot get engine for self rank " + std::to_string(peer_rank));
+    MCCL_CHECK(net_engines_[peer_rank] != nullptr,
+               "net_engine_for: engine for peer " + std::to_string(peer_rank) + " is null");
+    return *net_engines_[peer_rank];
+}
+
 ProcessGroupMCCL::~ProcessGroupMCCL() {
     try {
         MCCL_INFO("ProcessGroupMCCL rank=%d shutting down", getRank());
@@ -193,7 +220,10 @@ ProcessGroupMCCL::~ProcessGroupMCCL() {
         metrics_->log_summary();
         if (health_) health_->stop();
         if (watchdog_) watchdog_->stop();
-        if (engine_) engine_->stop();
+        if (reduce_engine_) reduce_engine_->stop();
+        for (auto& engine : net_engines_) {
+            if (engine) engine->stop();
+        }
         if (transport_) transport_->shutdown();
     } catch (const std::exception& e) {
         MCCL_DEBUG("Exception during shutdown (suppressed): %s", e.what());
@@ -403,46 +433,176 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         MCCL_DEBUG("allreduce seq=%u: asyncOp=true, MPS sync deferred to ProgressEngine", seq);
     }
 
-    engine_->submit(
-        [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
-            if (defer_mps_sync_to_engine) {
-                if (overlap_comm_) {
-                    uint64_t v = next_event_value();
-                    commit_mps_and_signal(v);
-                    wait_for_mps(v);
-                } else {
-                    mps_stream_sync();
+    if (ws == 2) {
+        // ── Two-rank path: ALL network I/O goes through net_engine_for(peer) ──
+        // This serializes all sends/recvs to the same peer on one thread,
+        // preventing protocol message interleaving. For large messages, the
+        // reduce phase chains to reduce_engine for bucket overlap.
+        int peer = 1 - getRank();
+
+        if (nbytes > transport_->config().small_msg_threshold) {
+            // Large message: split net/reduce across engines for bucket overlap
+            auto shared_recv_buf = std::make_shared<PooledBuffer>(staging_memory_pool(), nbytes);
+
+            net_engine_for(peer).submit(
+                [this, tensor_copy, seq, red_op, sync_val, defer_mps_sync_to_engine,
+                 peer, nbytes, shared_recv_buf]() mutable {
+                    if (defer_mps_sync_to_engine) {
+                        if (overlap_comm_ && event_sync_available()) {
+                            uint64_t v = next_event_value();
+                            commit_mps_and_signal(v);
+                            wait_for_mps(v);
+                        } else {
+                            mps_stream_sync();
+                        }
+                    } else if (sync_val > 0) {
+                        wait_for_mps(sync_val);
+                    }
+
+                    StagingBuffer staged = stage_for_send_nosync(tensor_copy);
+                    auto net_t0 = std::chrono::steady_clock::now();
+                    MCCL_CHECK(transport_->send_recv_overlap(
+                        peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes,
+                        peer, OpType::ALLREDUCE, seq, 0, shared_recv_buf->data(), nbytes),
+                        "allreduce two_rank_split net phase failed");
+                    auto net_t1 = std::chrono::steady_clock::now();
+
+                    double net_ms = std::chrono::duration<double, std::milli>(net_t1 - net_t0).count();
+                    metrics_->record_phase(seq, 0, net_ms, 0);
+                    metrics_->record_transport_bytes(nbytes, true);
+                    metrics_->record_transport_bytes(nbytes, false);
+                    MCCL_INFO("allreduce seq=%u: algo=two_rank_split net=%.1fms nbytes=%zu",
+                              seq, net_ms, nbytes);
+                },
+                [this, tensor_copy, seq, red_op, nbytes, shared_recv_buf, work_ptr]() mutable {
+                    reduce_engine_->submit(
+                        [this, tensor_copy, seq, red_op, nbytes, shared_recv_buf]() mutable {
+                            auto red_t0 = std::chrono::steady_clock::now();
+                            bool cpu_ok = tensor_cpu_accessible(tensor_copy);
+                            int64_t count = tensor_copy.numel();
+
+                            if (cpu_ok) {
+                                MPSBufferView view = extract_mps_buffer(tensor_copy);
+                                float* dst = static_cast<float*>(view.cpu_ptr);
+                                const float* src = static_cast<const float*>(shared_recv_buf->data());
+                                if (red_op == c10d::ReduceOp::AVG) {
+                                    cpu_accumulate_and_scale(dst, src, count, 0.5f);
+                                } else {
+                                    cpu_reduce_op(dst, src, count, red_op);
+                                }
+                            } else {
+                                at::Tensor incoming = torch::empty_like(tensor_copy);
+                                unstage_from_recv(incoming, shared_recv_buf->data(), nbytes);
+                                if (red_op == c10d::ReduceOp::AVG) {
+                                    metal_accumulate_and_scale(tensor_copy, incoming, 0.5);
+                                } else {
+                                    metal_reduce_op(tensor_copy, incoming, red_op);
+                                }
+                                metal_sync();
+                            }
+                            if (overlap_comm_) signal_mccl_done(next_event_value());
+
+                            auto red_t1 = std::chrono::steady_clock::now();
+                            double red_ms = std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
+                            metrics_->record_phase(seq, 0, 0, red_ms);
+                        },
+                        [this, work_ptr, seq]() {
+                            unregister_work(seq);
+                            watchdog_->complete(seq);
+                            metrics_->op_end(seq);
+                            work_ptr->markComplete();
+                        },
+                        [this, work_ptr, seq](std::exception_ptr e) {
+                            unregister_work(seq);
+                            watchdog_->complete(seq);
+                            metrics_->op_end(seq);
+                            metrics_->record_error();
+                            work_ptr->markError(e);
+                        }
+                    );
+                },
+                [this, work_ptr, seq](std::exception_ptr e) {
+                    unregister_work(seq);
+                    watchdog_->complete(seq);
+                    metrics_->op_end(seq);
+                    metrics_->record_error();
+                    work_ptr->markError(e);
                 }
-            } else if (sync_val > 0) {
-                wait_for_mps(sync_val);
-            }
-            const char* algo = "unknown";
-            if (nbytes <= transport_->config().small_msg_threshold) {
-                algo = "small";
-                allreduce_small(tensor_copy, seq, red_op);
-            } else if (ws == 2) {
-                algo = "two_rank";
-                allreduce_two_rank(tensor_copy, seq, red_op);
-            } else {
-                algo = "ring";
-                allreduce_ring(tensor_copy, seq, red_op);
-            }
-            MCCL_INFO("allreduce seq=%u: algo=%s nbytes=%zu", seq, algo, nbytes);
-        },
-        [this, work_ptr, seq]() {
-            unregister_work(seq);
-            watchdog_->complete(seq);
-            metrics_->op_end(seq);
-            work_ptr->markComplete();
-        },
-        [this, work_ptr, seq](std::exception_ptr e) {
-            unregister_work(seq);
-            watchdog_->complete(seq);
-            metrics_->op_end(seq);
-            metrics_->record_error();
-            work_ptr->markError(e);
+            );
+        } else {
+            // Small message: run entirely on net_engine (no split needed, but
+            // must use net_engine to avoid concurrent socket access with large ops)
+            net_engine_for(peer).submit(
+                [this, tensor_copy, seq, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
+                    if (defer_mps_sync_to_engine) {
+                        if (overlap_comm_ && event_sync_available()) {
+                            uint64_t v = next_event_value();
+                            commit_mps_and_signal(v);
+                            wait_for_mps(v);
+                        } else {
+                            mps_stream_sync();
+                        }
+                    } else if (sync_val > 0) {
+                        wait_for_mps(sync_val);
+                    }
+                    allreduce_small(tensor_copy, seq, red_op);
+                    MCCL_INFO("allreduce seq=%u: algo=small nbytes=%zu", seq, tensor_nbytes(tensor_copy));
+                },
+                [this, work_ptr, seq]() {
+                    unregister_work(seq);
+                    watchdog_->complete(seq);
+                    metrics_->op_end(seq);
+                    work_ptr->markComplete();
+                },
+                [this, work_ptr, seq](std::exception_ptr e) {
+                    unregister_work(seq);
+                    watchdog_->complete(seq);
+                    metrics_->op_end(seq);
+                    metrics_->record_error();
+                    work_ptr->markError(e);
+                }
+            );
         }
-    );
+    } else {
+        // ── 3+ ranks: ring algorithms on reduce_engine ──
+        reduce_engine_->submit(
+            [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
+                if (defer_mps_sync_to_engine) {
+                    if (overlap_comm_ && event_sync_available()) {
+                        uint64_t v = next_event_value();
+                        commit_mps_and_signal(v);
+                        wait_for_mps(v);
+                    } else {
+                        mps_stream_sync();
+                    }
+                } else if (sync_val > 0) {
+                    wait_for_mps(sync_val);
+                }
+                const char* algo = "unknown";
+                if (nbytes <= transport_->config().small_msg_threshold) {
+                    algo = "small";
+                    allreduce_small(tensor_copy, seq, red_op);
+                } else {
+                    algo = "ring_chunked";
+                    allreduce_ring_chunked(tensor_copy, seq, red_op);
+                }
+                MCCL_INFO("allreduce seq=%u: algo=%s nbytes=%zu", seq, algo, nbytes);
+            },
+            [this, work_ptr, seq]() {
+                unregister_work(seq);
+                watchdog_->complete(seq);
+                metrics_->op_end(seq);
+                work_ptr->markComplete();
+            },
+            [this, work_ptr, seq](std::exception_ptr e) {
+                unregister_work(seq);
+                watchdog_->complete(seq);
+                metrics_->op_end(seq);
+                metrics_->record_error();
+                work_ptr->markError(e);
+            }
+        );
+    }
 
     return work;
 }
@@ -484,11 +644,13 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
     auto tensors_copy = tensors;
     auto flat_copy = flat;
 
-    engine_->submit(
+    reduce_engine_->submit(
         [this, flat_copy, tensors_copy, seq, ws, nbytes, red_op, sync_val]() mutable {
             if (sync_val > 0) wait_for_mps(sync_val);
             if (ws == 2) {
                 allreduce_two_rank(flat_copy, seq, red_op);
+            } else if (ws >= 3) {
+                allreduce_ring_chunked(flat_copy, seq, red_op);
             } else {
                 allreduce_ring(flat_copy, seq, red_op);
             }
@@ -683,6 +845,137 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
     }
 }
 
+void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
+                                               c10d::ReduceOp::RedOpType op) {
+    // Gloo-style ring allreduce with 2P chunks for double buffering.
+    // 4*P communication steps but only 2*S bytes on wire (vs P*S for basic ring).
+    // Steps are serial (data dependencies), but the 2P chunking halves per-step
+    // data volume, improving bandwidth utilization.
+    int rank = getRank();
+    int ws = getSize();
+    size_t elem_size = tensor.element_size();
+    int64_t total_elems = tensor.numel();
+
+    int64_t chunk_elems = (total_elems + (2 * ws) - 1) / (2 * ws);
+    bool use_cpu = (tensor.scalar_type() == at::kFloat) && tensor_cpu_accessible(tensor);
+
+    int left = (rank - 1 + ws) % ws;
+    int right = (rank + 1) % ws;
+
+    at::Tensor flat = tensor.flatten();
+    std::vector<at::Tensor> chunks;
+    for (int c = 0; c < 2 * ws; c++) {
+        int64_t start = c * chunk_elems;
+        int64_t len = std::min(chunk_elems, total_elems - start);
+        if (len <= 0) {
+            chunks.push_back(torch::empty(0, tensor.options()));
+        } else {
+            chunks.push_back(flat.narrow(0, start, len));
+        }
+    }
+
+    PooledBuffer recv_buf_pool(staging_memory_pool(), chunk_elems * elem_size);
+
+    // ── Phase 1: Reduce-scatter (2*(ws-1) serial steps) ──
+    for (int step = 0; step < 2 * (ws - 1); step++) {
+        int send_chunk_idx = (rank * 2 - step + 2 * ws) % (2 * ws);
+        int recv_chunk_idx = (rank * 2 - step - 2 + 2 * ws) % (2 * ws);
+
+        at::Tensor& send_chunk = chunks[send_chunk_idx];
+        at::Tensor& recv_chunk = chunks[recv_chunk_idx];
+
+        if (send_chunk.numel() == 0 && recv_chunk.numel() == 0) continue;
+
+        size_t send_bytes = send_chunk.numel() * elem_size;
+        size_t recv_bytes = recv_chunk.numel() * elem_size;
+
+        uint32_t step_tid = (static_cast<uint32_t>(step) << 16) | send_chunk_idx;
+        uint32_t recv_tid = (static_cast<uint32_t>(step) << 16) | recv_chunk_idx;
+
+        StagingBuffer staged = {nullptr, 0};
+        if (send_bytes > 0) {
+            staged = stage_for_send_nosync(send_chunk);
+        }
+
+        MCCL_CHECK(transport_->send_recv_overlap(
+            right, OpType::ALLREDUCE, seq, step_tid,
+            staged.data, send_bytes,
+            left, OpType::ALLREDUCE, seq, recv_tid,
+            recv_buf_pool.data(), recv_bytes),
+            "allreduce_ring_chunked reduce-scatter step " + std::to_string(step) + " failed");
+
+        if (recv_bytes > 0) {
+            if (use_cpu) {
+                MPSBufferView chunk_view = extract_mps_buffer(recv_chunk);
+                cpu_reduce_op(
+                    static_cast<float*>(chunk_view.cpu_ptr),
+                    static_cast<const float*>(recv_buf_pool.data()),
+                    recv_chunk.numel(), op);
+            } else {
+                at::Tensor incoming = torch::empty_like(recv_chunk);
+                unstage_from_recv(incoming, recv_buf_pool.data(), recv_bytes);
+                metal_reduce_op(recv_chunk, incoming, op);
+            }
+        }
+
+        metrics_->record_transport_bytes(send_bytes, true);
+        metrics_->record_transport_bytes(recv_bytes, false);
+    }
+
+    // ── Phase 2: Allgather (2*(ws-1) serial steps) ──
+    for (int step = 0; step < 2 * (ws - 1); step++) {
+        int send_chunk_idx = (rank * 2 + step + 2 + 2 * ws) % (2 * ws);
+        int recv_chunk_idx = (rank * 2 + step + 2 * ws) % (2 * ws);
+
+        at::Tensor& send_chunk = chunks[send_chunk_idx];
+        at::Tensor& recv_chunk = chunks[recv_chunk_idx];
+
+        size_t send_bytes = send_chunk.numel() * elem_size;
+        size_t recv_bytes = recv_chunk.numel() * elem_size;
+
+        uint32_t ag_step = static_cast<uint32_t>(2 * (ws - 1) + step);
+        uint32_t step_tid = (ag_step << 16) | send_chunk_idx;
+        uint32_t recv_tid_ag = (ag_step << 16) | recv_chunk_idx;
+
+        StagingBuffer staged = {nullptr, 0};
+        if (send_bytes > 0) {
+            staged = stage_for_send_nosync(send_chunk);
+        }
+
+        MCCL_CHECK(transport_->send_recv_overlap(
+            right, OpType::ALLREDUCE, seq, step_tid,
+            staged.data, send_bytes,
+            left, OpType::ALLREDUCE, seq, recv_tid_ag,
+            recv_buf_pool.data(), recv_bytes),
+            "allreduce_ring_chunked allgather step " + std::to_string(step) + " failed");
+
+        if (recv_bytes > 0) {
+            if (use_cpu) {
+                MPSBufferView chunk_view = extract_mps_buffer(recv_chunk);
+                memcpy(chunk_view.cpu_ptr, recv_buf_pool.data(), recv_bytes);
+            } else {
+                unstage_from_recv(recv_chunk, recv_buf_pool.data(), recv_bytes);
+            }
+        }
+
+        metrics_->record_transport_bytes(send_bytes, true);
+        metrics_->record_transport_bytes(recv_bytes, false);
+    }
+
+    if (use_cpu) {
+        if (op == c10d::ReduceOp::AVG) {
+            MPSBufferView view = extract_mps_buffer(tensor);
+            cpu_scale_inplace(static_cast<float*>(view.cpu_ptr), total_elems, 1.0f / ws);
+        }
+        if (overlap_comm_) signal_mccl_done(next_event_value());
+    } else {
+        if (op == c10d::ReduceOp::AVG) {
+            metal_begin_batch("mccl_allreduce_ring_chunked_avg");
+            metal_scale_inplace(tensor, 1.0 / ws);
+        }
+        metal_sync();
+    }
+}
 
 void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
                                       c10d::ReduceOp::RedOpType op) {
@@ -710,7 +1003,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
 
     PooledBuffer recv_buf_pool(staging_memory_pool(), chunk_elems * elem_size);
 
-    // ── Reduce-scatter phase ──
+    // ── Reduce-scatter phase (serial steps -- data dependencies between steps) ──
     for (int step = 0; step < ws - 1; step++) {
         int send_idx = (rank - step + ws) % ws;
         int recv_idx = (rank - step - 1 + ws) % ws;
@@ -755,7 +1048,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
         metrics_->record_transport_bytes(recv_bytes, false);
     }
 
-    // ── Allgather phase ──
+    // ── Allgather phase (serial steps) ──
     for (int step = 0; step < ws - 1; step++) {
         int send_idx = (rank - step + 1 + ws) % ws;
         int recv_idx = (rank - step + ws) % ws;
@@ -930,20 +1223,78 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
 
     uint64_t sync_val_bc = sync_mps_nonblocking(overlap_comm_);
 
-    engine_->submit(
-        [this, tensor_copy, root, seq, rank, ws, sync_val_bc]() mutable {
-            if (sync_val_bc > 0) wait_for_mps(sync_val_bc);
-            if (rank == root) {
+    if (rank == root) {
+        // Root: stage data then fan out sends to per-peer NetEngines.
+        // An atomic counter tracks completion; the last send to finish
+        // submits markComplete to reduce_engine.
+        auto staged_buf = std::make_shared<PooledBuffer>(staging_memory_pool(), nbytes);
+        int num_peers = ws - 1;
+        auto sends_remaining = std::make_shared<std::atomic<int>>(num_peers);
+
+        reduce_engine_->submit(
+            [this, tensor_copy, sync_val_bc, staged_buf]() mutable {
+                if (sync_val_bc > 0) wait_for_mps(sync_val_bc);
                 StagingBuffer staged = stage_for_send_nosync(tensor_copy);
+                memcpy(staged_buf->data(), staged.data, staged.nbytes);
+            },
+            [this, staged_buf, seq, root, ws, nbytes, sends_remaining, work_ptr]() mutable {
                 for (int peer = 0; peer < ws; peer++) {
                     if (peer == root) continue;
-                    MCCL_CHECK(transport_->send_chunks(peer, OpType::BROADCAST, seq, 0,
-                                                       staged.data, staged.nbytes),
-                               "broadcast send to rank " + std::to_string(peer) + " failed");
-                    metrics_->record_transport_bytes(staged.nbytes, true);
+                    net_engine_for(peer).submit(
+                        [this, peer, seq, staged_buf, nbytes]() mutable {
+                            MCCL_CHECK(transport_->send_chunks(peer, OpType::BROADCAST, seq, 0,
+                                                               staged_buf->data(), nbytes),
+                                       "broadcast send to rank " + std::to_string(peer) + " failed");
+                            metrics_->record_transport_bytes(nbytes, true);
+                        },
+                        [this, sends_remaining, work_ptr, seq]() {
+                            if (sends_remaining->fetch_sub(1) == 1) {
+                                reduce_engine_->submit(
+                                    [this]() {
+                                        if (overlap_comm_) signal_mccl_done(next_event_value());
+                                    },
+                                    [this, work_ptr, seq]() {
+                                        unregister_work(seq);
+                                        watchdog_->complete(seq);
+                                        metrics_->op_end(seq);
+                                        work_ptr->markComplete();
+                                    },
+                                    [this, work_ptr, seq](std::exception_ptr e) {
+                                        unregister_work(seq);
+                                        watchdog_->complete(seq);
+                                        metrics_->op_end(seq);
+                                        metrics_->record_error();
+                                        work_ptr->markError(e);
+                                    }
+                                );
+                            }
+                        },
+                        [this, work_ptr, seq, sends_remaining](std::exception_ptr e) {
+                            MCCL_ERROR("broadcast send to peer failed");
+                            if (sends_remaining->fetch_sub(1) == 1) {
+                                unregister_work(seq);
+                                watchdog_->complete(seq);
+                                metrics_->op_end(seq);
+                                metrics_->record_error();
+                                work_ptr->markError(e);
+                            }
+                        }
+                    );
                 }
-            } else {
-                size_t nbytes = tensor_nbytes(tensor_copy);
+            },
+            [this, work_ptr, seq](std::exception_ptr e) {
+                unregister_work(seq);
+                watchdog_->complete(seq);
+                metrics_->op_end(seq);
+                metrics_->record_error();
+                work_ptr->markError(e);
+            }
+        );
+    } else {
+        // Non-root receives from root using root's NetEngine
+        net_engine_for(root).submit(
+            [this, tensor_copy, root, seq, nbytes, sync_val_bc]() mutable {
+                if (sync_val_bc > 0) wait_for_mps(sync_val_bc);
                 bool use_cpu = tensor_cpu_accessible(tensor_copy);
                 if (use_cpu) {
                     MPSBufferView view = extract_mps_buffer(tensor_copy);
@@ -958,23 +1309,23 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
                     unstage_from_recv(tensor_copy, recv_buf.data(), nbytes);
                 }
                 metrics_->record_transport_bytes(nbytes, false);
+                if (overlap_comm_) signal_mccl_done(next_event_value());
+            },
+            [this, work_ptr, seq]() {
+                unregister_work(seq);
+                watchdog_->complete(seq);
+                metrics_->op_end(seq);
+                work_ptr->markComplete();
+            },
+            [this, work_ptr, seq](std::exception_ptr e) {
+                unregister_work(seq);
+                watchdog_->complete(seq);
+                metrics_->op_end(seq);
+                metrics_->record_error();
+                work_ptr->markError(e);
             }
-            if (overlap_comm_) signal_mccl_done(next_event_value());
-        },
-        [this, work_ptr, seq]() {
-            unregister_work(seq);
-            watchdog_->complete(seq);
-            metrics_->op_end(seq);
-            work_ptr->markComplete();
-        },
-        [this, work_ptr, seq](std::exception_ptr e) {
-            unregister_work(seq);
-            watchdog_->complete(seq);
-            metrics_->op_end(seq);
-            metrics_->record_error();
-            work_ptr->markError(e);
-        }
-    );
+        );
+    }
 
     return work;
 }
@@ -993,7 +1344,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::barrier(
     watchdog_->watch(seq, "barrier");
     metrics_->op_start(seq, "barrier", 0);
 
-    engine_->submit(
+    reduce_engine_->submit(
         [this, seq]() {
             rendezvous_->barrier("collective_" + std::to_string(seq));
         },
@@ -1056,7 +1407,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
 
     uint64_t sync_val_ag = sync_mps_nonblocking(overlap_comm_);
 
-    engine_->submit(
+    reduce_engine_->submit(
         [this, input_copy, outputs_copy, seq, rank, ws, nbytes, sync_val_ag]() mutable {
             if (sync_val_ag > 0) wait_for_mps(sync_val_ag);
             bool use_cpu = (input_copy.scalar_type() == at::kFloat) && tensor_cpu_accessible(input_copy);
@@ -1072,7 +1423,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
             int left = (rank - 1 + ws) % ws;
             int right = (rank + 1) % ws;
 
-            // For CPU-accessible tensors, recv directly into output tensor memory
+            // Ring allgather with per-peer engines - simplified version for now
+            // TODO: Implement full per-peer engine version like allreduce_ring
             PooledBuffer recv_buf_fallback(staging_memory_pool(), use_cpu ? 0 : nbytes);
 
             for (int step = 0; step < ws - 1; step++) {
@@ -1168,7 +1520,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
 
     uint64_t sync_val_rs = sync_mps_nonblocking(overlap_comm_);
 
-    engine_->submit(
+    reduce_engine_->submit(
         [this, output_copy, inputs_copy, seq, rank, ws, nbytes, rs_op, sync_val_rs]() mutable {
             if (sync_val_rs > 0) wait_for_mps(sync_val_rs);
             int left = (rank - 1 + ws) % ws;
@@ -1220,7 +1572,14 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
             } else {
                 metal_sync();
                 output_copy.copy_(chunks[my_chunk]);
-                sync_mps_for_collective(overlap_comm_);
+                // Use event sync for better overlap
+                if (overlap_comm_ && event_sync_available()) {
+                    uint64_t val = next_event_value();
+                    commit_mps_and_signal(val);
+                    wait_for_mps(val);
+                } else {
+                    mps_stream_sync();
+                }
             }
         },
         [this, work_ptr, seq]() {
@@ -1269,7 +1628,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
 
     uint64_t sync_val_s = sync_mps_nonblocking(overlap_comm_);
 
-    engine_->submit(
+    net_engine_for(dstRank).submit(
         [this, tensor, dstRank, seq, tag, nbytes, sync_val_s]() mutable {
             if (sync_val_s > 0) wait_for_mps(sync_val_s);
             StagingBuffer staged = stage_for_send_nosync(tensor);
@@ -1321,7 +1680,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
     watchdog_->watch(seq, "recv");
     metrics_->op_start(seq, "recv", nbytes);
 
-    engine_->submit(
+    net_engine_for(srcRank).submit(
         [this, tensor, srcRank, seq, tag, nbytes]() mutable {
             bool use_cpu = tensor_cpu_accessible(tensor);
             if (use_cpu) {

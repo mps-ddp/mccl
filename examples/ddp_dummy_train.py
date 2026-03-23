@@ -234,11 +234,14 @@ def run_ddp(args) -> None:
                              args.batch_size, world_size, total_params)
         print(f"Wrote stats to {args.save_stats}", flush=True)
 
-    # Sanity check: params in sync — barrier ensures all ranks finished
-    # training before any rank issues the broadcast.
-    dist.barrier()
+    # Flush all pending GPU work and wait for all ranks to finish before
+    # reading parameters — on slower transports (TCP) the last DDP allreduce
+    # bucket may still be in-flight when the training loop exits.
     if args.backend == "mccl":
         torch.mps.synchronize()
+    dist.barrier()
+
+    # Sanity check: params in sync
     head = next(model.parameters()).detach().flatten()[:8].to(device)
     ref = head.clone()
     dist.broadcast(ref, src=0)
@@ -247,6 +250,7 @@ def run_ddp(args) -> None:
     if rank == 0:
         print("Parameters in sync across ranks.", flush=True)
 
+    dist.barrier()
     dist.destroy_process_group()
 
 

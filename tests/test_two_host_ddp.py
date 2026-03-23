@@ -87,6 +87,11 @@ def main():
         if step % 10 == 0:
             print(f"Rank {rank} | Step {step} | Loss: {loss_val:.6f}")
 
+    # Flush GPU work and synchronize all ranks before reading parameters —
+    # on slower transports (TCP) the last DDP allreduce may still be in-flight.
+    torch.mps.synchronize()
+    dist.barrier()
+
     # Final parameter checksum
     param_sum = sum(p.sum().item() for p in model.parameters())
     print(f"Rank {rank} | Final param checksum: {param_sum:.6f}")
@@ -110,6 +115,7 @@ def main():
             print("\n*** WARNING: Param divergence detected ***")
             sys.exit(1)
 
+    dist.barrier()
     dist.destroy_process_group()
 
 

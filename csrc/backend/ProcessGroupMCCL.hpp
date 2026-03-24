@@ -10,11 +10,13 @@
 #include "transport/Transport.hpp"
 #include "transport/TcpTransport.hpp"
 #include "runtime/ProgressEngine.hpp"
+#include "runtime/ThreadPool.hpp"
 #include "runtime/Rendezvous.hpp"
 #include "runtime/Watchdog.hpp"
 #include "runtime/HealthMonitor.hpp"
 #include "runtime/Metrics.hpp"
 #include "runtime/MemoryPool.hpp"
+#include "runtime/GradientValidator.hpp"
 #include "compression/Compression.hpp"
 
 #include <memory>
@@ -145,11 +147,16 @@ private:
     std::unique_ptr<ProgressEngine> reduce_engine_;
     // GPU reduce work uses std::async per slot, not a shared engine.
     std::vector<std::unique_ptr<ProgressEngine>> net_engines_;
+    // Thread pool for parallel network I/O (replaces per-peer engines when enabled)
+    std::unique_ptr<ThreadPool> net_thread_pool_;
     std::unique_ptr<Rendezvous> rendezvous_;
     std::unique_ptr<Watchdog> watchdog_;
     std::unique_ptr<HealthMonitor> health_;
     std::unique_ptr<Metrics> metrics_;
+    std::unique_ptr<GradientValidator> grad_validator_;
     std::unique_ptr<Compressor> compressor_;
+    
+    bool use_direct_dispatch_ = false;
 
     std::atomic<uint32_t> collective_seq_{0};
     bool transport_initialized_ = false;

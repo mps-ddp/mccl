@@ -156,6 +156,13 @@ Metrics::Summary Metrics::summarize() const {
     double total_avg_pipeline_depth = 0;
     uint64_t total_pipeline_samples = 0;
     uint64_t max_pipeline_depth = 0;
+    uint64_t pipeline_stall_count = 0;
+    
+    std::vector<double> queue_waits;
+    std::vector<double> backpressures;
+    queue_waits.reserve(completed_.size());
+    backpressures.reserve(completed_.size());
+    
     for (auto& m : completed_) {
         total_sync += m.sync_ms;
         total_net += m.network_ms;
@@ -171,11 +178,26 @@ Metrics::Summary Metrics::summarize() const {
         total_avg_pipeline_depth += m.pipeline_depth_sum;
         total_pipeline_samples += m.pipeline_depth_samples;
         max_pipeline_depth = std::max(max_pipeline_depth, m.max_pipeline_depth);
+        
+        queue_waits.push_back(m.queue_wait_ms);
+        backpressures.push_back(m.backpressure_ms);
+        
+        // Count as stall if backpressure > 1ms (significant wait)
+        if (m.backpressure_ms > 1.0) {
+            pipeline_stall_count++;
+        }
     }
+    
+    std::sort(queue_waits.begin(), queue_waits.end());
+    std::sort(backpressures.begin(), backpressures.end());
+    
     s.avg_sync_ms = total_sync / n;
     s.avg_network_ms = total_net / n;
     s.avg_reduce_ms = total_reduce / n;
     s.avg_queue_wait_ms = total_queue_wait / n;
+    s.p50_queue_wait_ms = queue_waits[n / 2];
+    s.p95_queue_wait_ms = queue_waits[std::min(n - 1, (size_t)(n * 0.95))];
+    s.p99_queue_wait_ms = queue_waits[std::min(n - 1, (size_t)(n * 0.99))];
     s.avg_send_queue_wait_ms = total_send_queue_wait / n;
     s.avg_recv_queue_wait_ms = total_recv_queue_wait / n;
     s.avg_send_ms = total_send_ms / n;
@@ -183,6 +205,9 @@ Metrics::Summary Metrics::summarize() const {
     s.avg_stage_ms = total_stage_ms / n;
     s.avg_writeback_ms = total_writeback_ms / n;
     s.avg_backpressure_ms = total_backpressure_ms / n;
+    s.p95_backpressure_ms = backpressures[std::min(n - 1, (size_t)(n * 0.95))];
+    s.p99_backpressure_ms = backpressures[std::min(n - 1, (size_t)(n * 0.99))];
+    s.pipeline_stall_count = pipeline_stall_count;
     s.avg_pipeline_depth = total_pipeline_samples > 0
         ? (total_avg_pipeline_depth / static_cast<double>(total_pipeline_samples))
         : 0.0;
@@ -224,19 +249,23 @@ void Metrics::log_summary() const {
     MCCL_INFO("  Errors:           %llu", (unsigned long long)s.total_errors);
     MCCL_INFO("  Avg latency:      %.3f ms", s.avg_latency_ms);
     MCCL_INFO("  P50 latency:      %.3f ms", s.p50_latency_ms);
+    MCCL_INFO("  P95 latency:      %.3f ms", s.p95_latency_ms);
     MCCL_INFO("  P99 latency:      %.3f ms", s.p99_latency_ms);
     MCCL_INFO("  Peak throughput:  %.2f Gbps", s.peak_throughput_gbps);
     MCCL_INFO("  Avg sync:         %.3f ms", s.avg_sync_ms);
     MCCL_INFO("  Avg network:      %.3f ms", s.avg_network_ms);
     MCCL_INFO("  Avg reduce:       %.3f ms", s.avg_reduce_ms);
-    MCCL_INFO("  Avg queue wait:   %.3f ms", s.avg_queue_wait_ms);
+    MCCL_INFO("  Queue wait:       avg=%.3f p50=%.3f p95=%.3f p99=%.3f ms", 
+              s.avg_queue_wait_ms, s.p50_queue_wait_ms, s.p95_queue_wait_ms, s.p99_queue_wait_ms);
     MCCL_INFO("  Avg send q wait:  %.3f ms", s.avg_send_queue_wait_ms);
     MCCL_INFO("  Avg recv q wait:  %.3f ms", s.avg_recv_queue_wait_ms);
     MCCL_INFO("  Avg send wire:    %.3f ms", s.avg_send_ms);
     MCCL_INFO("  Avg recv wire:    %.3f ms", s.avg_recv_ms);
     MCCL_INFO("  Avg stage:        %.3f ms", s.avg_stage_ms);
     MCCL_INFO("  Avg writeback:    %.3f ms", s.avg_writeback_ms);
-    MCCL_INFO("  Avg backpressure: %.3f ms", s.avg_backpressure_ms);
+    MCCL_INFO("  Backpressure:     avg=%.3f p95=%.3f p99=%.3f ms (stalls=%llu)", 
+              s.avg_backpressure_ms, s.p95_backpressure_ms, s.p99_backpressure_ms,
+              (unsigned long long)s.pipeline_stall_count);
     MCCL_INFO("  Avg pipe depth:   %.3f", s.avg_pipeline_depth);
     MCCL_INFO("  Max pipe depth:   %llu", (unsigned long long)s.max_pipeline_depth);
     MCCL_INFO("  Avg overlap eff:  %.3f", s.avg_overlap_efficiency);

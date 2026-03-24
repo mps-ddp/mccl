@@ -90,12 +90,16 @@ public:
         double avg_latency_ms;
         double avg_wall_ms;
         double p50_latency_ms;
+        double p95_latency_ms;
         double p99_latency_ms;
         double peak_throughput_gbps;
         double avg_sync_ms;
         double avg_network_ms;
         double avg_reduce_ms;
         double avg_queue_wait_ms;
+        double p50_queue_wait_ms;
+        double p95_queue_wait_ms;
+        double p99_queue_wait_ms;
         double avg_send_queue_wait_ms;
         double avg_recv_queue_wait_ms;
         double avg_send_ms;
@@ -103,6 +107,9 @@ public:
         double avg_stage_ms;
         double avg_writeback_ms;
         double avg_backpressure_ms;
+        double p95_backpressure_ms;
+        double p99_backpressure_ms;
+        uint64_t pipeline_stall_count;
         double avg_pipeline_depth;
         uint64_t max_pipeline_depth;
         double avg_overlap_efficiency;

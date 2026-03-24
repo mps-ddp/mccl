@@ -154,6 +154,7 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     event_sync_init();
 
     metrics_ = std::make_unique<Metrics>();
+    grad_validator_ = std::make_unique<GradientValidator>();
 
     // Compression from env: MCCL_COMPRESSION=none|fp16|topk
     CompressionMode comp_mode = CompressionMode::NONE;
@@ -194,9 +195,16 @@ ProcessGroupMCCL::ProcessGroupMCCL(
         ring_pipeline_window_ = default_ring_pipeline_window(world_size);
     }
 
-    size_t queue_depth = 1024;
+    size_t queue_depth = 4096;  // Increased default from 1024 to 4096
     if (auto* v = std::getenv("MCCL_MAX_QUEUE_DEPTH"))
         queue_depth = static_cast<size_t>(std::atoll(v));
+    
+    // Check if direct dispatch mode is enabled (default: true for production)
+    use_direct_dispatch_ = true;
+    if (auto* v = std::getenv("MCCL_USE_LEGACY_ENGINES")) {
+        std::string s(v);
+        use_direct_dispatch_ = !(s == "1" || s == "true" || s == "yes");
+    }
     
     // Create reduce engine
     reduce_engine_ = std::make_unique<ProgressEngine>(queue_depth);
@@ -204,15 +212,28 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     // pipeline_reduce_engine_ is no longer used; GPU reduce work now uses
     // std::async to avoid single-queue contention across concurrent DDP buckets.
     
-    // Create net engines (one per peer rank, excluding self)
-    net_engines_.resize(world_size);
-    pending_ring_sends_.resize(world_size);
-    for (int i = 0; i < world_size; i++) {
-        if (i != rank) {
-            net_engines_[i] = std::make_unique<ProgressEngine>(queue_depth);
-            net_engines_[i]->start();
+    if (use_direct_dispatch_) {
+        // Use thread pool for parallel network I/O (eliminates queue bottleneck)
+        size_t num_threads = std::max(4, std::min(8, world_size * 2));
+        if (auto* v = std::getenv("MCCL_NET_THREADS")) {
+            num_threads = static_cast<size_t>(std::atoll(v));
         }
+        net_thread_pool_ = std::make_unique<ThreadPool>(num_threads, queue_depth);
+        net_thread_pool_->start();
+        MCCL_INFO("Direct dispatch enabled with %zu network threads", num_threads);
+    } else {
+        // Legacy: Create net engines (one per peer rank, excluding self)
+        net_engines_.resize(world_size);
+        for (int i = 0; i < world_size; i++) {
+            if (i != rank) {
+                net_engines_[i] = std::make_unique<ProgressEngine>(queue_depth);
+                net_engines_[i]->start();
+            }
+        }
+        MCCL_INFO("Using legacy per-peer ProgressEngine (MCCL_USE_LEGACY_ENGINES=1)");
     }
+    
+    pending_ring_sends_.resize(world_size);
 
     auto wd_timeout = timeout;
     if (auto* v = std::getenv("MCCL_WATCHDOG_TIMEOUT_MS"))
@@ -287,9 +308,11 @@ ProcessGroupMCCL::ProcessGroupMCCL(
 
 int ProcessGroupMCCL::default_ring_pipeline_window(int world_size) const {
     if (world_size < 3 || !overlap_comm_) return 1;
-    // Conservative adaptive default: keep low in-flight depth for small rings.
-    if (world_size >= 10) return 4;
-    if (world_size >= 5) return 3;
+    // Aggressive pipeline defaults for production: allow more in-flight steps
+    // to maximize overlap and reduce queue wait times.
+    if (world_size >= 10) return 8;
+    if (world_size >= 5) return 6;
+    if (world_size >= 3) return 4;
     return 2;
 }
 
@@ -350,6 +373,76 @@ void ProcessGroupMCCL::ring_send_recv(
 
     if (send_nbytes == 0 && recv_nbytes == 0) return;
 
+    // Direct dispatch path: use thread pool for parallel execution
+    if (use_direct_dispatch_ && net_thread_pool_) {
+        if (send_nbytes == 0) {
+            // Recv only - direct call (already thread-safe)
+            auto recv_t0 = std::chrono::steady_clock::now();
+            MCCL_CHECK(transport_->recv_chunks(recv_peer, op, seq, recv_tid,
+                                               recv_data, recv_nbytes),
+                       "ring_send_recv recv failed");
+            auto recv_t1 = std::chrono::steady_clock::now();
+            metrics_->record_ring_io(
+                seq, 0.0,
+                std::chrono::duration<double, std::milli>(recv_t1 - recv_t0).count());
+            return;
+        }
+        if (recv_nbytes == 0) {
+            // Send only - direct call (already thread-safe)
+            auto send_t0 = std::chrono::steady_clock::now();
+            MCCL_CHECK(transport_->send_chunks(send_peer, op, seq, send_tid,
+                                               send_data, send_nbytes),
+                       "ring_send_recv send failed");
+            auto send_t1 = std::chrono::steady_clock::now();
+            metrics_->record_ring_io(
+                seq,
+                std::chrono::duration<double, std::milli>(send_t1 - send_t0).count(),
+                0.0);
+            return;
+        }
+
+        // Same-peer full-duplex: use transport's overlap path
+        if (send_peer == recv_peer) {
+            MCCL_CHECK(transport_->send_recv_overlap(
+                send_peer, op, seq, send_tid, send_data, send_nbytes,
+                recv_peer, op, seq, recv_tid, recv_data, recv_nbytes),
+                "ring_send_recv same-peer overlap failed");
+            return;
+        }
+
+        // Both send and recv: parallel dispatch via thread pool
+        auto send_future = net_thread_pool_->submit(
+            [this, send_peer, op, seq, send_tid, send_data, send_nbytes]() {
+                auto send_t0 = std::chrono::steady_clock::now();
+                MCCL_CHECK(transport_->send_chunks(send_peer, op, seq, send_tid,
+                                                   send_data, send_nbytes),
+                           "ring_send_recv send failed");
+                auto send_t1 = std::chrono::steady_clock::now();
+                metrics_->record_ring_io(
+                    seq,
+                    std::chrono::duration<double, std::milli>(send_t1 - send_t0).count(),
+                    0.0);
+            });
+
+        auto recv_future = net_thread_pool_->submit(
+            [this, recv_peer, op, seq, recv_tid, recv_data, recv_nbytes]() {
+                auto recv_t0 = std::chrono::steady_clock::now();
+                MCCL_CHECK(transport_->recv_chunks(recv_peer, op, seq, recv_tid,
+                                                   recv_data, recv_nbytes),
+                           "ring_send_recv recv failed");
+                auto recv_t1 = std::chrono::steady_clock::now();
+                metrics_->record_ring_io(
+                    seq, 0.0,
+                    std::chrono::duration<double, std::milli>(recv_t1 - recv_t0).count());
+            });
+
+        // Wait for both to complete (no queue wait overhead!)
+        recv_future.get();
+        send_future.get();
+        return;
+    }
+
+    // Legacy path: use per-peer ProgressEngine (kept for rollback)
     if (send_nbytes == 0) {
         net_engine_for(recv_peer).submit_sync(
             [this, recv_peer, op, seq, recv_tid, recv_data, recv_nbytes]() {
@@ -369,9 +462,6 @@ void ProcessGroupMCCL::ring_send_recv(
         return;
     }
 
-    // Same-peer full-duplex (ws=2 allgather/reduce_scatter): do NOT split
-    // into two tasks on one single-threaded net engine, which can deadlock.
-    // Use the transport's proven one-socket overlap path instead.
     if (send_peer == recv_peer) {
         MCCL_CHECK(transport_->send_recv_overlap(
             send_peer, op, seq, send_tid, send_data, send_nbytes,
@@ -460,6 +550,9 @@ ProcessGroupMCCL::~ProcessGroupMCCL() {
         if (watchdog_) watchdog_->stop();
         if (reduce_engine_) reduce_engine_->stop();
         // pipeline_reduce_engine_ removed; GPU reduce uses std::async now.
+        if (net_thread_pool_) {
+            net_thread_pool_->stop();
+        }
         for (auto& engine : net_engines_) {
             if (engine) engine->stop();
         }
@@ -653,7 +746,15 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     size_t nbytes = tensor_nbytes(tensor);
 
     c10d::ReduceOp::RedOpType red_op = opts.reduceOp;
-    const bool defer_mps_sync_to_engine = opts.asyncOp;
+    // Production default: defer MPS sync to engine/thread pool for better overlap
+    // Unless explicitly disabled via env var or opts.asyncOp is explicitly false
+    bool defer_mps_sync_to_engine = opts.asyncOp;
+    if (auto* v = std::getenv("MCCL_FORCE_ASYNC_MPS_SYNC")) {
+        std::string s(v);
+        if (s == "1" || s == "true" || s == "yes") {
+            defer_mps_sync_to_engine = true;
+        }
+    }
 
     register_work(seq, work);
     watchdog_->watch(seq, "allreduce");
@@ -669,7 +770,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     metrics_->record_phase(seq, sync_ms, 0, 0);
 
     if (defer_mps_sync_to_engine) {
-        MCCL_DEBUG("allreduce seq=%u: asyncOp=true, MPS sync deferred to ProgressEngine", seq);
+        MCCL_DEBUG("allreduce seq=%u: asyncOp=true, MPS sync deferred to engine/thread", seq);
     }
 
     if (ws == 2) {
@@ -1162,6 +1263,27 @@ void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint3
         [&](uint32_t send_tid, SharedPooledBuffer send_buf, size_t send_nbytes)
         -> std::shared_ptr<std::future<void>> {
             if (send_nbytes == 0) return make_ready_future();
+            
+            if (use_direct_dispatch_ && net_thread_pool_) {
+                // Direct dispatch via thread pool - no queue wait!
+                auto future = net_thread_pool_->submit(
+                    [this, right, seq, send_tid, send_buf, send_nbytes]() {
+                        auto send_t0 = std::chrono::steady_clock::now();
+                        MCCL_CHECK(transport_->send_chunks(
+                            right, OpType::ALLREDUCE, seq, send_tid,
+                            send_buf->data(), send_nbytes),
+                            "ring pipeline send failed");
+                        auto send_t1 = std::chrono::steady_clock::now();
+                        metrics_->record_transport_bytes(send_nbytes, true);
+                        metrics_->record_ring_io(
+                            seq,
+                            std::chrono::duration<double, std::milli>(send_t1 - send_t0).count(),
+                            0.0);
+                    });
+                return std::make_shared<std::future<void>>(std::move(future));
+            }
+            
+            // Legacy path: use per-peer engine
             auto send_promise = std::make_shared<std::promise<void>>();
             auto send_future = std::make_shared<std::future<void>>(send_promise->get_future());
             net_engine_for(right).submit(
@@ -1195,6 +1317,26 @@ void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint3
         [&](uint32_t recv_tid, SharedPooledBuffer recv_buf, size_t recv_nbytes)
         -> std::shared_ptr<std::future<void>> {
             if (recv_nbytes == 0) return make_ready_future();
+            
+            if (use_direct_dispatch_ && net_thread_pool_) {
+                // Direct dispatch via thread pool - no queue wait!
+                auto future = net_thread_pool_->submit(
+                    [this, left, seq, recv_tid, recv_buf, recv_nbytes]() {
+                        auto recv_t0 = std::chrono::steady_clock::now();
+                        MCCL_CHECK(transport_->recv_chunks(
+                            left, OpType::ALLREDUCE, seq, recv_tid,
+                            recv_buf->data(), recv_nbytes),
+                            "ring pipeline recv failed");
+                        auto recv_t1 = std::chrono::steady_clock::now();
+                        metrics_->record_transport_bytes(recv_nbytes, false);
+                        metrics_->record_ring_io(
+                            seq, 0.0,
+                            std::chrono::duration<double, std::milli>(recv_t1 - recv_t0).count());
+                    });
+                return std::make_shared<std::future<void>>(std::move(future));
+            }
+            
+            // Legacy path: use per-peer engine
             auto recv_promise = std::make_shared<std::promise<void>>();
             auto recv_future = std::make_shared<std::future<void>>(recv_promise->get_future());
             net_engine_for(left).submit(
@@ -1419,11 +1561,37 @@ void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint3
                 kick_ready_reductions();
 
                 if (!launched) {
+                    // Non-blocking poll with exponential backoff to reduce CPU spinning
+                    // while still making progress on ready operations
+                    static constexpr int MAX_SPIN_ITERS = 10;
+                    int spin_count = 0;
+                    bool progressed = false;
+                    
                     auto wait_t0 = std::chrono::steady_clock::now();
-                    bool progressed = finish_front(true);
+                    while (spin_count < MAX_SPIN_ITERS) {
+                        progressed = finish_front(false);  // Non-blocking poll
+                        if (progressed) break;
+                        
+                        // Exponential backoff: yield, then short sleep
+                        if (spin_count < 3) {
+                            std::this_thread::yield();
+                        } else {
+                            std::this_thread::sleep_for(
+                                std::chrono::microseconds(1 << (spin_count - 3)));
+                        }
+                        spin_count++;
+                    }
+                    
+                    // If still no progress after spinning, block once
+                    if (!progressed) {
+                        progressed = finish_front(true);
+                    }
+                    
                     auto wait_t1 = std::chrono::steady_clock::now();
                     double wait_ms = std::chrono::duration<double, std::milli>(wait_t1 - wait_t0).count();
-                    total_backpressure_ms += wait_ms;
+                    if (wait_ms > 0.1) {  // Only count significant waits as backpressure
+                        total_backpressure_ms += wait_ms;
+                    }
                     if (!progressed) break;
                 }
             }

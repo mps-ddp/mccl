@@ -1458,6 +1458,15 @@ void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint3
         RingPipelinePhase::ALLGATHER,
         compute_ag_indices);
 
+    // All async reduction/writeback futures have been waited on by
+    // finish_front(true), but the underlying Metal GPU work (unstage_from_recv,
+    // metal_reduce_op) may have enqueued command buffers that are not yet
+    // committed or completed.  Flush everything before reading the tensor.
+    if (!use_cpu) {
+        mps_stream_sync();
+        mccl_queue_drain();
+    }
+
     if (use_cpu) {
         if (op == c10d::ReduceOp::AVG) {
             auto red_t0 = std::chrono::steady_clock::now();

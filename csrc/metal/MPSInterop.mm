@@ -422,4 +422,60 @@ void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes)
     chunked_blit_from_staging(blit_src, nbytes, dst_buf, view.byte_offset);
 }
 
+void unstage_from_recv_threadsafe(const at::Tensor& tensor, const void* src,
+                                  size_t nbytes, void* staging_buf,
+                                  size_t staging_capacity) {
+    check_single_tensor(tensor);
+    MCCL_CHECK(nbytes == tensor_nbytes(tensor), "unstage size mismatch");
+
+    MPSBufferView view = extract_mps_buffer(tensor);
+
+    if (view.cpu_accessible && view.cpu_ptr) {
+        memcpy(view.cpu_ptr, src, nbytes);
+        return;
+    }
+
+    MCCL_CHECK(staging_buf != nullptr && staging_capacity >= nbytes,
+               "unstage_from_recv_threadsafe: staging buffer too small or null");
+
+    memcpy(staging_buf, src, nbytes);
+
+    id<MTLBuffer> dst_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
+
+    // Use the chunked blit path that creates temporary MTLBuffer wrappers
+    // from the caller-provided page-aligned buffer (no global singleton).
+    size_t max_chunk = metal_max_buffer_len();
+    size_t offset = 0;
+    const uint8_t* src_bytes = static_cast<const uint8_t*>(staging_buf);
+
+    while (offset < nbytes) {
+        size_t chunk = std::min(max_chunk, nbytes - offset);
+        size_t aligned_chunk = (chunk + PAGE - 1) & ~(PAGE - 1);
+        if (aligned_chunk > staging_capacity - offset) {
+            aligned_chunk = (staging_capacity - offset) & ~(PAGE - 1);
+            if (aligned_chunk < chunk) aligned_chunk = chunk;
+        }
+
+        @autoreleasepool {
+            id<MTLBuffer> chunk_mtl = [cached_device()
+                newBufferWithBytesNoCopy:const_cast<uint8_t*>(src_bytes + offset)
+                length:aligned_chunk
+                options:MTLResourceStorageModeShared
+                deallocator:nil];
+            MCCL_CHECK(chunk_mtl != nil,
+                       "unstage_from_recv_threadsafe: MTLBuffer wrap failed");
+
+            id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+            [blit copyFromBuffer:chunk_mtl sourceOffset:0
+                        toBuffer:dst_buf destinationOffset:view.byte_offset + offset
+                            size:chunk];
+            [blit endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+        offset += chunk;
+    }
+}
+
 } // namespace mccl

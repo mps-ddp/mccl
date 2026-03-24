@@ -912,8 +912,54 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 }
             );
         }
+    } else if (use_direct_dispatch_ && net_thread_pool_) {
+        // ── 3+ ranks: parallel dispatch via detached thread ──
+        // Each DDP bucket allreduce runs on its own thread, eliminating
+        // the single-threaded reduce_engine_ bottleneck (~975ms queue wait).
+        // We use std::thread instead of the thread pool to avoid a
+        // self-submission deadlock: the inner ring pipeline submits
+        // send/recv tasks to net_thread_pool_ and blocks waiting for them,
+        // which would starve the pool if the outer task also held a slot.
+        std::thread(
+            [this, tensor_copy, seq, ws, nbytes, red_op, sync_val,
+             defer_mps_sync_to_engine, work_ptr]() mutable {
+                try {
+                    if (defer_mps_sync_to_engine) {
+                        if (overlap_comm_ && event_sync_available()) {
+                            uint64_t v = next_event_value();
+                            commit_mps_and_signal(v);
+                            wait_for_mps(v);
+                        } else {
+                            mps_stream_sync();
+                        }
+                    } else if (sync_val > 0) {
+                        wait_for_mps(sync_val);
+                    }
+                    const char* algo = "unknown";
+                    if (nbytes <= transport_->config().small_msg_threshold) {
+                        algo = "small";
+                        allreduce_small(tensor_copy, seq, red_op);
+                    } else {
+                        algo = "ring_chunked";
+                        allreduce_ring_chunked(tensor_copy, seq, red_op);
+                    }
+                    MCCL_INFO("allreduce seq=%u: algo=%s nbytes=%zu", seq, algo, nbytes);
+
+                    unregister_work(seq);
+                    watchdog_->complete(seq);
+                    metrics_->op_end(seq);
+                    work_ptr->markComplete();
+                } catch (...) {
+                    unregister_work(seq);
+                    watchdog_->complete(seq);
+                    metrics_->op_end(seq);
+                    metrics_->record_error();
+                    work_ptr->markError(std::current_exception());
+                }
+            }
+        ).detach();
     } else {
-        // ── 3+ ranks: ring algorithms on reduce_engine ──
+        // ── 3+ ranks: legacy serialized path via reduce_engine ──
         reduce_engine_->submit(
             [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
                 if (defer_mps_sync_to_engine) {
@@ -1442,15 +1488,23 @@ void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint3
                 } else {
                     at::Tensor recv_chunk = slot.recv_chunk;
                     SharedPooledBuffer recv_buf = slot.recv_buf;
+                    // Allocate a per-task page-aligned staging buffer for the
+                    // blit path so we never touch the global StagingPool singleton.
+                    size_t page_aligned = (slot.recv_bytes + 16383) & ~size_t(16383);
+                    auto blit_staging = std::make_shared<PooledBuffer>(
+                        staging_memory_pool(), page_aligned);
                     slot.reduce_future = std::async(
                         std::launch::async,
-                        [recv_chunk, recv_buf, recv_bytes = slot.recv_bytes, op, phase]() {
+                        [recv_chunk, recv_buf, recv_bytes = slot.recv_bytes, op, phase,
+                         blit_staging, page_aligned]() {
                             RingReduceResult result;
                             if (recv_bytes > 0) {
                                 if (phase == RingPipelinePhase::REDUCE_SCATTER) {
                                     auto wb_t0 = std::chrono::steady_clock::now();
                                     at::Tensor incoming = torch::empty_like(recv_chunk);
-                                    unstage_from_recv(incoming, recv_buf->data(), recv_bytes);
+                                    unstage_from_recv_threadsafe(
+                                        incoming, recv_buf->data(), recv_bytes,
+                                        blit_staging->data(), page_aligned);
                                     auto wb_t1 = std::chrono::steady_clock::now();
                                     result.writeback_ms += std::chrono::duration<double, std::milli>(wb_t1 - wb_t0).count();
 
@@ -1460,7 +1514,9 @@ void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint3
                                     result.reduce_ms += std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
                                 } else {
                                     auto wb_t0 = std::chrono::steady_clock::now();
-                                    unstage_from_recv(recv_chunk, recv_buf->data(), recv_bytes);
+                                    unstage_from_recv_threadsafe(
+                                        recv_chunk, recv_buf->data(), recv_bytes,
+                                        blit_staging->data(), page_aligned);
                                     auto wb_t1 = std::chrono::steady_clock::now();
                                     result.writeback_ms += std::chrono::duration<double, std::milli>(wb_t1 - wb_t0).count();
                                 }

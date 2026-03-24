@@ -1768,8 +1768,6 @@ void ProcessGroupMCCL::allreduce_ring_chunked_serial(at::Tensor& tensor, uint32_
     PooledBuffer recv_buf_pool(staging_memory_pool(), chunk_elems * elem_size);
     PooledBuffer send_stage_pool(staging_memory_pool(), chunk_elems * elem_size);
     PooledBuffer blit_stage_pool(staging_memory_pool(), chunk_elems * elem_size);
-    PooledBuffer send_stage_pool(staging_memory_pool(), chunk_elems * elem_size);
-    PooledBuffer blit_stage_pool(staging_memory_pool(), chunk_elems * elem_size);
     double total_net_ms = 0.0;
     double total_reduce_ms = 0.0;
 
@@ -1927,6 +1925,8 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
     }
 
     PooledBuffer recv_buf_pool(staging_memory_pool(), chunk_elems * elem_size);
+    PooledBuffer send_stage_pool(staging_memory_pool(), chunk_elems * elem_size);
+    PooledBuffer blit_stage_pool(staging_memory_pool(), chunk_elems * elem_size);
     double total_net_ms = 0.0;
     double total_reduce_ms = 0.0;
 

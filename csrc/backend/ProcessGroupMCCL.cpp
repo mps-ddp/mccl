@@ -42,6 +42,16 @@ SyncMode global_sync_mode() {
 
 thread_local bool tl_sync_done = false;
 
+bool use_chunked_ring_default() {
+    static bool enabled = [] {
+        auto* v = std::getenv("MCCL_RING_ALGO");
+        if (!v) return false; // default to basic ring for numerical stability
+        std::string s(v);
+        return (s == "chunked" || s == "ring_chunked" || s == "fast");
+    }();
+    return enabled;
+}
+
 // Non-blocking: encode signal + commit, return event value (0 = already synced).
 // The engine thread must call wait_for_mps(val) before reading tensor data.
 inline uint64_t sync_mps_nonblocking(bool overlap) {
@@ -193,6 +203,8 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     }
     MCCL_INFO("  sync_mode           = %s",
               global_sync_mode() == SyncMode::COALESCED ? "coalesced" : "full");
+    MCCL_INFO("  ring_algo           = %s",
+              use_chunked_ring_default() ? "chunked" : "basic");
     MCCL_INFO("  compression         = %s", compressor_ ? compressor_->name().c_str() : "none");
     if (compressor_ && comp_mode == CompressionMode::TOPK) {
         MCCL_INFO("  topk_ratio          = %.4f", topk_ratio);
@@ -582,17 +594,21 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 } else if (sync_val > 0) {
                     wait_for_mps(sync_val);
                 }
-                // Algorithm selection for 3+ ranks (performance-critical)
-                // Small messages: Star topology (rank 0 bottleneck, O(P) serial steps)
-                // Large messages: Ring topology (better scaling, 4(P-1) RTT-bound steps)
-                // Tune MCCL_SMALL_MSG_THRESHOLD for multi-node: larger values prefer ring
+                // Algorithm selection for 3+ ranks.
+                // Small messages: star topology; large messages: ring topology.
+                // Default to basic ring for stability; chunked ring is opt-in.
                 const char* algo = "unknown";
                 if (nbytes <= transport_->config().small_msg_threshold) {
                     algo = "small";
                     allreduce_small(tensor_copy, seq, red_op);
                 } else {
-                    algo = "ring_chunked";
-                    allreduce_ring_chunked(tensor_copy, seq, red_op);
+                    if (use_chunked_ring_default()) {
+                        algo = "ring_chunked";
+                        allreduce_ring_chunked(tensor_copy, seq, red_op);
+                    } else {
+                        algo = "ring";
+                        allreduce_ring(tensor_copy, seq, red_op);
+                    }
                 }
                 MCCL_INFO("allreduce seq=%u: algo=%s nbytes=%zu", seq, algo, nbytes);
             },
@@ -658,7 +674,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
             if (ws == 2) {
                 allreduce_two_rank(flat_copy, seq, red_op);
             } else if (ws >= 3) {
-                allreduce_ring_chunked(flat_copy, seq, red_op);
+                if (use_chunked_ring_default()) {
+                    allreduce_ring_chunked(flat_copy, seq, red_op);
+                } else {
+                    allreduce_ring(flat_copy, seq, red_op);
+                }
             } else {
                 allreduce_ring(flat_copy, seq, red_op);
             }

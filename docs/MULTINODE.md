@@ -49,7 +49,7 @@ BASELINE_BATCH_SIZE=8 python examples/ddp_dummy_train.py --baseline
 
 Or set env **`BASELINE_BATCH_SIZE`** to that global batch before `--baseline`.
 
-Record **`mccl.get_metrics()`** on rank 0 after a DDP run: `avg_sync_ms`, `avg_network_ms`, `avg_reduce_ms`, `total_ops`, bytes.
+Record **`mccl.get_metrics()`** on rank 0 after a DDP run: `avg_sync_ms`, `avg_network_ms`, `avg_reduce_ms`, `avg_queue_wait_ms`, `avg_send_ms`, `avg_recv_ms`, `avg_stage_ms`, `avg_writeback_ms`, `avg_backpressure_ms`, `avg_pipeline_depth`, `max_pipeline_depth`, `total_ops`, bytes.
 
 ## Why 2-node often feels slower than “single training” (and not sub-second)
 
@@ -98,10 +98,15 @@ From that we can see whether you’re **compute-bound** (baseline ≈ DDP), **ne
 | **`MCCL_COMPRESSION=fp16`** | Halves wire volume when compression is enabled in the build (`ProcessGroupMCCL` compressor path). |
 | **FP16 training** | `TRAIN_AUTOCAST_FP16=1` in `ddp_dummy_train.py` (or your script) uses `torch.autocast("mps", dtype=torch.float16)` where supported. |
 | **`MCCL_SYNC_MODE=full`** | Required for DDP gradient buckets. **Do not** use `coalesced` with hook-driven DDP (stale grads / broken pipe). |
+| **`MCCL_ALLOW_UNSAFE_COALESCED_DDP=1`** | Escape hatch only: allows `MCCL_SYNC_MODE=coalesced` despite DDP safety risks. Keep unset in production. |
 | **`MCCL_SOCK_BUFSIZE`** | Override kernel socket buffer (bytes); default is large in `Connection.cpp`. Set `0` to let the kernel auto-tune. |
 | **`MCCL_CHUNK_BYTES`** | Transport chunk size (see `TransportConfig::from_env()` in `TcpTransport.cpp`); affects CRC/chunked paths. |
 | **`MCCL_TRANSPORT`** | `tcp` default; RDMA when available and configured (see `transport/rdma/`). |
 | **`MCCL_LINK_PROFILE=thunderbolt`** | Production TCP defaults for Thunderbolt IP links: larger default **socket buffers** and **chunk size** (see [Production Thunderbolt profile](#production-thunderbolt-profile-tcp)). Use `scripts/thunderbolt_prod.sh` or `mccl.apply_thunderbolt_production_defaults()`. |
+| **`MCCL_RING_PIPELINE_WINDOW`** | Bounded in-flight ring send window (`1` = conservative mode, `2-4` = pipelined mode). If unset, MCCL now picks an adaptive default based on world size. |
+| **`MCCL_3PLUS_PIPELINE`** | Enabled by default for 3+ ranks. Set `0` for immediate rollback to the legacy serial 3+ ring path. |
+| **`MCCL_RING_ASSERT_ORDER=1`** | Enable strict ring step ordering assertions during canary rollouts. |
+| **`MCCL_VALIDATE_GRAD_SYNC=1`** | Enable per-step gradient checksum validation in `examples/ddp_dummy_train.py` for debug/canary runs. |
 | **Model size** | Use larger models (custom `MODEL_HIDDEN`, `MODEL_DEPTH` env vars) to see where DDP becomes worthwhile vs single GPU. |
 
 ### Example: sweep `DDP_BUCKET_MB` (local or multi-node)
@@ -116,6 +121,36 @@ done
 ```
 
 On two Macs, use the same `torchrun` line as your real job (with `MASTER_ADDR`, `nnodes`, etc.) and only vary `DDP_BUCKET_MB`. Optionally add `MCCL_COMPRESSION=fp16` and/or `TRAIN_AUTOCAST_FP16=1` per row in the benchmark table below.
+
+## 3+ node canary rollout checklist
+
+Use this sequence for production promotion of pipelined 3+ ring settings:
+
+1. Start with 3 nodes:
+   - `MCCL_RING_PIPELINE_WINDOW=1` (baseline / rollback)
+   - then adaptive default (unset `MCCL_RING_PIPELINE_WINDOW`) or explicit `2` + `MCCL_RING_ASSERT_ORDER=1`
+2. Expand to 5 nodes, then 10+ nodes only after:
+   - zero gradient/parameter checksum mismatches
+   - no increase in transport/watchdog errors
+   - stable loss curves over multiple seeds
+   - improved throughput vs baseline window `1`
+3. Keep rollback immediate:
+   - set `MCCL_RING_PIPELINE_WINDOW=1` to return to conservative mode, or
+   - set `MCCL_3PLUS_PIPELINE=0` to force the legacy serial 3+ path.
+4. Keep DDP sync safe:
+   - use `MCCL_SYNC_MODE=full` (default)
+   - do not set `MCCL_ALLOW_UNSAFE_COALESCED_DDP=1` in production
+
+Multi-host validation helpers:
+- `scripts/launch_two_host.sh` for the existing 2-host path
+- `scripts/launch_multi_host_ddp.sh` for `WORLD_SIZE >= 3` parity testing on physical multi-node runs
+
+### Recommended promotion thresholds
+
+- **Correctness**: zero gradient checksum mismatches and zero final parameter checksum mismatches.
+- **Reliability**: `metrics.total_errors == 0` and no watchdog aborts.
+- **Performance**: at least 5% better step throughput than window `1` baseline over the same seed/model/batch, with non-zero pipeline depth and no pathological backpressure growth.
+- **Stability**: no loss-curve regressions across at least 3 seeds.
 
 The dummy train example defaults to a **small** MLP where DDP is typically slower than single GPU due to communication overhead.
 

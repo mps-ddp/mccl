@@ -143,6 +143,7 @@ private:
 
     std::unique_ptr<Transport> transport_;
     std::unique_ptr<ProgressEngine> reduce_engine_;
+    std::unique_ptr<ProgressEngine> pipeline_reduce_engine_;
     std::vector<std::unique_ptr<ProgressEngine>> net_engines_;
     std::unique_ptr<Rendezvous> rendezvous_;
     std::unique_ptr<Watchdog> watchdog_;

@@ -201,6 +201,8 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     // Create reduce engine
     reduce_engine_ = std::make_unique<ProgressEngine>(queue_depth);
     reduce_engine_->start();
+    pipeline_reduce_engine_ = std::make_unique<ProgressEngine>(queue_depth);
+    pipeline_reduce_engine_->start();
     
     // Create net engines (one per peer rank, excluding self)
     net_engines_.resize(world_size);
@@ -246,6 +248,7 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     MCCL_INFO("  connect_timeout_ms  = %lld", (long long)transport_->config().connect_timeout.count());
     MCCL_INFO("  heartbeat_ms        = %lld", (long long)hb_interval.count());
     MCCL_INFO("  max_queue_depth     = %zu", queue_depth);
+    MCCL_INFO("  pipeline_reduce_q   = %s", pipeline_reduce_engine_ ? "on" : "off");
     {
         const char* crc_env = std::getenv("MCCL_TRANSPORT_CRC");
         MCCL_INFO("  transport_crc       = %s", (crc_env && std::string(crc_env) == "1") ? "on" : "off");
@@ -456,6 +459,7 @@ ProcessGroupMCCL::~ProcessGroupMCCL() {
         if (health_) health_->stop();
         if (watchdog_) watchdog_->stop();
         if (reduce_engine_) reduce_engine_->stop();
+        if (pipeline_reduce_engine_) pipeline_reduce_engine_->stop();
         for (auto& engine : net_engines_) {
             if (engine) engine->stop();
         }
@@ -1232,6 +1236,17 @@ void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint3
             std::deque<RingPipelineSlot> inflight;
             std::deque<std::shared_ptr<std::future<void>>> pending_sends;
 
+            auto complete_recv = [&](RingPipelineSlot& slot, bool block) -> bool {
+                if (slot.recv_done) return true;
+                if (!block && !future_ready(slot.recv_future)) return false;
+                auto wait_t0 = std::chrono::steady_clock::now();
+                slot.recv_future->get();
+                auto wait_t1 = std::chrono::steady_clock::now();
+                total_net_ms += std::chrono::duration<double, std::milli>(wait_t1 - wait_t0).count();
+                slot.recv_done = true;
+                return true;
+            };
+
             auto drain_send_window = [&](bool force_all) {
                 const size_t max_pending = force_all
                     ? 0
@@ -1282,6 +1297,48 @@ void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint3
                             }
                             return result;
                         });
+                } else {
+                    auto promise = std::make_shared<std::promise<RingReduceResult>>();
+                    slot.reduce_future = promise->get_future();
+                    at::Tensor recv_chunk = slot.recv_chunk;
+                    SharedPooledBuffer recv_buf = slot.recv_buf;
+                    pipeline_reduce_engine_->submit(
+                        [recv_chunk, recv_buf, recv_bytes = slot.recv_bytes, op, phase, promise]() mutable {
+                            try {
+                                RingReduceResult result;
+                                if (recv_bytes > 0) {
+                                    if (phase == RingPipelinePhase::REDUCE_SCATTER) {
+                                        auto wb_t0 = std::chrono::steady_clock::now();
+                                        at::Tensor incoming = torch::empty_like(recv_chunk);
+                                        unstage_from_recv(incoming, recv_buf->data(), recv_bytes);
+                                        auto wb_t1 = std::chrono::steady_clock::now();
+                                        result.writeback_ms += std::chrono::duration<double, std::milli>(wb_t1 - wb_t0).count();
+
+                                        auto red_t0 = std::chrono::steady_clock::now();
+                                        metal_reduce_op(recv_chunk, incoming, op);
+                                        auto red_t1 = std::chrono::steady_clock::now();
+                                        result.reduce_ms += std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
+                                    } else {
+                                        auto wb_t0 = std::chrono::steady_clock::now();
+                                        unstage_from_recv(recv_chunk, recv_buf->data(), recv_bytes);
+                                        auto wb_t1 = std::chrono::steady_clock::now();
+                                        result.writeback_ms += std::chrono::duration<double, std::milli>(wb_t1 - wb_t0).count();
+                                    }
+                                }
+                                promise->set_value(result);
+                            } catch (...) {
+                                promise->set_exception(std::current_exception());
+                            }
+                        },
+                        []() {},
+                        [promise](std::exception_ptr e) {
+                            try {
+                                promise->set_exception(e);
+                            } catch (...) {}
+                        },
+                        [this, seq](double q_ms) {
+                            metrics_->record_queue_wait(seq, q_ms);
+                        });
                 }
             };
 
@@ -1289,42 +1346,12 @@ void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint3
                 if (inflight.empty()) return false;
                 auto& slot = inflight.front();
 
-                if (!slot.recv_done) {
-                    if (!block && !future_ready(slot.recv_future)) return false;
-                    auto wait_t0 = std::chrono::steady_clock::now();
-                    slot.recv_future->get();
-                    auto wait_t1 = std::chrono::steady_clock::now();
-                    total_net_ms += std::chrono::duration<double, std::milli>(wait_t1 - wait_t0).count();
-                    slot.recv_done = true;
-                    launch_reduce(slot);
-                }
+                if (!complete_recv(slot, block)) return false;
+                if (!slot.reduce_started) launch_reduce(slot);
 
                 RingReduceResult reduce_result;
-                if (use_cpu) {
-                    if (!slot.reduce_started) launch_reduce(slot);
-                    if (!block && !future_ready(slot.reduce_future)) return false;
-                    reduce_result = slot.reduce_future.get();
-                } else {
-                    if (slot.recv_bytes > 0) {
-                        if (phase == RingPipelinePhase::REDUCE_SCATTER) {
-                            auto wb_t0 = std::chrono::steady_clock::now();
-                            at::Tensor incoming = torch::empty_like(slot.recv_chunk);
-                            unstage_from_recv(incoming, slot.recv_buf->data(), slot.recv_bytes);
-                            auto wb_t1 = std::chrono::steady_clock::now();
-                            reduce_result.writeback_ms += std::chrono::duration<double, std::milli>(wb_t1 - wb_t0).count();
-
-                            auto red_t0 = std::chrono::steady_clock::now();
-                            metal_reduce_op(slot.recv_chunk, incoming, op);
-                            auto red_t1 = std::chrono::steady_clock::now();
-                            reduce_result.reduce_ms += std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
-                        } else {
-                            auto wb_t0 = std::chrono::steady_clock::now();
-                            unstage_from_recv(slot.recv_chunk, slot.recv_buf->data(), slot.recv_bytes);
-                            auto wb_t1 = std::chrono::steady_clock::now();
-                            reduce_result.writeback_ms += std::chrono::duration<double, std::milli>(wb_t1 - wb_t0).count();
-                        }
-                    }
-                }
+                if (!block && !future_ready(slot.reduce_future)) return false;
+                reduce_result = slot.reduce_future.get();
 
                 total_reduce_ms += reduce_result.reduce_ms;
                 total_writeback_ms += reduce_result.writeback_ms;
@@ -1335,11 +1362,8 @@ void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint3
             };
 
             auto kick_ready_reductions = [&]() {
-                if (!use_cpu) return;
                 for (auto& slot : inflight) {
-                    if (slot.recv_done || !future_ready(slot.recv_future)) continue;
-                    slot.recv_future->get();
-                    slot.recv_done = true;
+                    if (!complete_recv(slot, false)) continue;
                     launch_reduce(slot);
                 }
             };

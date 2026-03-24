@@ -1,4 +1,5 @@
 #include "runtime/ThreadPool.hpp"
+#include "common/Errors.hpp"
 #include "common/Logging.hpp"
 #include <algorithm>
 

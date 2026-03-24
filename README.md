@@ -12,7 +12,7 @@ Install PyTorch, then **`pip install mccl`**. **To our knowledge**, the first **
 - **Xcode Command Line Tools** — `xcode-select --install` (needed to compile the extension).
 - **Full Xcode** — optional; speeds up Metal by emitting a `.metallib` at build time instead of JIT at runtime.
 - **Python 3.11+**
-- **`torch` (PyTorch) ≥2.5** — required dependency of the `mccl` package ([`pyproject.toml`](pyproject.toml), [`requirements.txt`](requirements.txt)); install it first when building from source so headers/libs resolve (`pip install torch` or `pip install -r requirements.txt`).
+- **`torch` (PyTorch) ≥2.5** and **`numpy` ≥1.20** — declared in [`pyproject.toml`](pyproject.toml) / [`requirements.txt`](requirements.txt); install `torch` first when building from source so headers/libs resolve.
 
 ## Install
 

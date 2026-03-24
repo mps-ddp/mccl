@@ -13,7 +13,9 @@ description = "MPS-native ProcessGroup backend for PyTorch Distributed on Apple 
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
+# CI installs torch from the PyTorch nightly index (see .github/workflows/ci.yml) to track MPS / distributed churn.
 dependencies = [
+    "numpy>=1.20",
     "torch>=2.5.0",
 ]
 classifiers = [
@@ -32,7 +34,6 @@ Repository = "https://github.com/mps-ddp/mccl"
 
 [project.optional-dependencies]
 dev = [
-    "numpy>=1.24",  # PyTorch probes NumPy at import; avoids UserWarning in CI without it
     "pytest>=7.0",
     "pytest-timeout>=2.1",
 ]

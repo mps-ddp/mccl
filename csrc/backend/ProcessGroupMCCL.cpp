@@ -124,14 +124,14 @@ ProcessGroupMCCL::ProcessGroupMCCL(
         queue_depth = static_cast<size_t>(std::atoll(v));
     
     // Create reduce engine
-    reduce_engine_ = std::make_unique<ProgressEngine>(queue_depth);
+    reduce_engine_ = std::make_unique<ProgressEngine>(queue_depth, metrics_.get());
     reduce_engine_->start();
     
     // Create net engines (one per peer rank, excluding self)
     net_engines_.resize(world_size);
     for (int i = 0; i < world_size; i++) {
         if (i != rank) {
-            net_engines_[i] = std::make_unique<ProgressEngine>(queue_depth);
+            net_engines_[i] = std::make_unique<ProgressEngine>(queue_depth, metrics_.get());
             net_engines_[i]->start();
         }
     }
@@ -565,6 +565,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         }
     } else {
         // ── 3+ ranks: ring algorithms on reduce_engine ──
+        // PERFORMANCE NOTE: All 3+ rank collectives execute serially on reduce_engine_,
+        // limiting concurrency. DDP issues many small allreduces which queue up.
+        // Consider: larger PyTorch buckets, higher MCCL_SMALL_MSG_THRESHOLD, or
+        // per-peer engines for ring (TODO ~1427) to improve scaling.
         reduce_engine_->submit(
             [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
                 if (defer_mps_sync_to_engine) {
@@ -578,6 +582,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 } else if (sync_val > 0) {
                     wait_for_mps(sync_val);
                 }
+                // Algorithm selection for 3+ ranks (performance-critical)
+                // Small messages: Star topology (rank 0 bottleneck, O(P) serial steps)
+                // Large messages: Ring topology (better scaling, 4(P-1) RTT-bound steps)
+                // Tune MCCL_SMALL_MSG_THRESHOLD for multi-node: larger values prefer ring
                 const char* algo = "unknown";
                 if (nbytes <= transport_->config().small_msg_threshold) {
                     algo = "small";
@@ -1425,6 +1433,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
 
             // Ring allgather with per-peer engines - simplified version for now
             // TODO: Implement full per-peer engine version like allreduce_ring
+            // This would use net_engines_[peer] for each ring step instead of serializing
+            // all steps on reduce_engine_, enabling better concurrency and overlap.
+            // See 2-rank split for reference pattern.
             PooledBuffer recv_buf_fallback(staging_memory_pool(), use_cpu ? 0 : nbytes);
 
             for (int step = 0; step < ws - 1; step++) {

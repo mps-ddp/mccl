@@ -15,8 +15,9 @@ struct OpMetric {
     uint32_t seq;
     std::string op_name;
     size_t bytes;
-    std::chrono::steady_clock::time_point start;
-    std::chrono::steady_clock::time_point end;
+    std::chrono::steady_clock::time_point start;          // When op was submitted
+    std::chrono::steady_clock::time_point execute_start;  // When op.execute() began
+    std::chrono::steady_clock::time_point end;            // When op completed
 
     double sync_ms = 0;
     double network_ms = 0;
@@ -24,6 +25,16 @@ struct OpMetric {
 
     double elapsed_ms() const {
         return std::chrono::duration<double, std::milli>(end - start).count();
+    }
+
+    double queue_wait_ms() const {
+        if (execute_start == std::chrono::steady_clock::time_point{}) return 0;
+        return std::chrono::duration<double, std::milli>(execute_start - start).count();
+    }
+
+    double execution_ms() const {
+        if (execute_start == std::chrono::steady_clock::time_point{}) return elapsed_ms();
+        return std::chrono::duration<double, std::milli>(end - execute_start).count();
     }
 
     double throughput_gbps() const {
@@ -43,6 +54,9 @@ public:
 
     /// Start timing an operation.
     void op_start(uint32_t seq, const std::string& op_name, size_t bytes);
+
+    /// Record when execution actually begins (after queue wait).
+    void op_execute_start(uint32_t seq);
 
     /// End timing an operation.
     void op_end(uint32_t seq);
@@ -70,6 +84,8 @@ public:
         double avg_sync_ms;
         double avg_network_ms;
         double avg_reduce_ms;
+        double avg_queue_wait_ms;
+        double avg_execution_ms;
     };
 
     Summary summarize() const;

@@ -1,4 +1,5 @@
 #include "runtime/ProgressEngine.hpp"
+#include "runtime/Metrics.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 
@@ -6,8 +7,8 @@
 
 namespace mccl {
 
-ProgressEngine::ProgressEngine(size_t max_queue_depth)
-    : max_depth_(max_queue_depth) {
+ProgressEngine::ProgressEngine(size_t max_queue_depth, Metrics* metrics)
+    : max_depth_(max_queue_depth), metrics_(metrics) {
     MCCL_CHECK(max_depth_ > 0, "max_queue_depth must be > 0");
 }
 
@@ -109,6 +110,11 @@ void ProgressEngine::worker_loop() {
         not_full_.notify_one();
 
         MCCL_TRACE("Executing op seq=%u", op.seq_num);
+
+        // Record when execution actually starts (after queue wait)
+        if (metrics_) {
+            metrics_->op_execute_start(op.seq_num);
+        }
 
         bool exec_ok = false;
         std::exception_ptr exec_ex;

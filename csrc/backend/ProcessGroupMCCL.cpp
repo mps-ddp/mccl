@@ -201,8 +201,8 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     // Create reduce engine
     reduce_engine_ = std::make_unique<ProgressEngine>(queue_depth);
     reduce_engine_->start();
-    pipeline_reduce_engine_ = std::make_unique<ProgressEngine>(queue_depth);
-    pipeline_reduce_engine_->start();
+    // pipeline_reduce_engine_ is no longer used; GPU reduce work now uses
+    // std::async to avoid single-queue contention across concurrent DDP buckets.
     
     // Create net engines (one per peer rank, excluding self)
     net_engines_.resize(world_size);
@@ -248,7 +248,7 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     MCCL_INFO("  connect_timeout_ms  = %lld", (long long)transport_->config().connect_timeout.count());
     MCCL_INFO("  heartbeat_ms        = %lld", (long long)hb_interval.count());
     MCCL_INFO("  max_queue_depth     = %zu", queue_depth);
-    MCCL_INFO("  pipeline_reduce_q   = %s", pipeline_reduce_engine_ ? "on" : "off");
+    MCCL_INFO("  pipeline_reduce     = async (per-slot)");
     {
         const char* crc_env = std::getenv("MCCL_TRANSPORT_CRC");
         MCCL_INFO("  transport_crc       = %s", (crc_env && std::string(crc_env) == "1") ? "on" : "off");
@@ -459,7 +459,7 @@ ProcessGroupMCCL::~ProcessGroupMCCL() {
         if (health_) health_->stop();
         if (watchdog_) watchdog_->stop();
         if (reduce_engine_) reduce_engine_->stop();
-        if (pipeline_reduce_engine_) pipeline_reduce_engine_->stop();
+        // pipeline_reduce_engine_ removed; GPU reduce uses std::async now.
         for (auto& engine : net_engines_) {
             if (engine) engine->stop();
         }
@@ -1277,7 +1277,7 @@ void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint3
                     SharedPooledBuffer recv_buf = slot.recv_buf;
                     slot.reduce_future = std::async(
                         std::launch::async,
-                        [recv_chunk, recv_buf, recv_bytes = slot.recv_bytes, elem_size, op, phase]() {
+                        [recv_chunk, recv_buf, recv_bytes = slot.recv_bytes, op, phase]() {
                             RingReduceResult result;
                             if (phase == RingPipelinePhase::REDUCE_SCATTER) {
                                 auto red_t0 = std::chrono::steady_clock::now();
@@ -1298,46 +1298,32 @@ void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint3
                             return result;
                         });
                 } else {
-                    auto promise = std::make_shared<std::promise<RingReduceResult>>();
-                    slot.reduce_future = promise->get_future();
                     at::Tensor recv_chunk = slot.recv_chunk;
                     SharedPooledBuffer recv_buf = slot.recv_buf;
-                    pipeline_reduce_engine_->submit(
-                        [recv_chunk, recv_buf, recv_bytes = slot.recv_bytes, op, phase, promise]() mutable {
-                            try {
-                                RingReduceResult result;
-                                if (recv_bytes > 0) {
-                                    if (phase == RingPipelinePhase::REDUCE_SCATTER) {
-                                        auto wb_t0 = std::chrono::steady_clock::now();
-                                        at::Tensor incoming = torch::empty_like(recv_chunk);
-                                        unstage_from_recv(incoming, recv_buf->data(), recv_bytes);
-                                        auto wb_t1 = std::chrono::steady_clock::now();
-                                        result.writeback_ms += std::chrono::duration<double, std::milli>(wb_t1 - wb_t0).count();
+                    slot.reduce_future = std::async(
+                        std::launch::async,
+                        [recv_chunk, recv_buf, recv_bytes = slot.recv_bytes, op, phase]() {
+                            RingReduceResult result;
+                            if (recv_bytes > 0) {
+                                if (phase == RingPipelinePhase::REDUCE_SCATTER) {
+                                    auto wb_t0 = std::chrono::steady_clock::now();
+                                    at::Tensor incoming = torch::empty_like(recv_chunk);
+                                    unstage_from_recv(incoming, recv_buf->data(), recv_bytes);
+                                    auto wb_t1 = std::chrono::steady_clock::now();
+                                    result.writeback_ms += std::chrono::duration<double, std::milli>(wb_t1 - wb_t0).count();
 
-                                        auto red_t0 = std::chrono::steady_clock::now();
-                                        metal_reduce_op(recv_chunk, incoming, op);
-                                        auto red_t1 = std::chrono::steady_clock::now();
-                                        result.reduce_ms += std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
-                                    } else {
-                                        auto wb_t0 = std::chrono::steady_clock::now();
-                                        unstage_from_recv(recv_chunk, recv_buf->data(), recv_bytes);
-                                        auto wb_t1 = std::chrono::steady_clock::now();
-                                        result.writeback_ms += std::chrono::duration<double, std::milli>(wb_t1 - wb_t0).count();
-                                    }
+                                    auto red_t0 = std::chrono::steady_clock::now();
+                                    metal_reduce_op(recv_chunk, incoming, op);
+                                    auto red_t1 = std::chrono::steady_clock::now();
+                                    result.reduce_ms += std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
+                                } else {
+                                    auto wb_t0 = std::chrono::steady_clock::now();
+                                    unstage_from_recv(recv_chunk, recv_buf->data(), recv_bytes);
+                                    auto wb_t1 = std::chrono::steady_clock::now();
+                                    result.writeback_ms += std::chrono::duration<double, std::milli>(wb_t1 - wb_t0).count();
                                 }
-                                promise->set_value(result);
-                            } catch (...) {
-                                promise->set_exception(std::current_exception());
                             }
-                        },
-                        []() {},
-                        [promise](std::exception_ptr e) {
-                            try {
-                                promise->set_exception(e);
-                            } catch (...) {}
-                        },
-                        [this, seq](double q_ms) {
-                            metrics_->record_queue_wait(seq, q_ms);
+                            return result;
                         });
                 }
             };
@@ -1410,6 +1396,16 @@ void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint3
                     slot.recv_chunk_idx = recv_chunk_idx;
                     slot.recv_bytes = recv_bytes;
                     slot.recv_chunk = recv_chunk;
+
+                    // Mark the recv chunk as in-use NOW so future steps cannot
+                    // stage it for send before this step's reduction completes.
+                    // The value is the earliest step that may safely read this
+                    // chunk again.  finish_front will re-confirm this on
+                    // completion, but setting it here is what actually prevents
+                    // the race where a pipelined step stages stale data.
+                    chunk_ready_step[recv_chunk_idx] =
+                        std::max(chunk_ready_step[recv_chunk_idx], step + 2);
+
                     if (recv_bytes > 0) {
                         slot.recv_buf = std::make_shared<PooledBuffer>(staging_memory_pool(), recv_bytes);
                     }

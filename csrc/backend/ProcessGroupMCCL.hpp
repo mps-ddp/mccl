@@ -143,7 +143,7 @@ private:
 
     std::unique_ptr<Transport> transport_;
     std::unique_ptr<ProgressEngine> reduce_engine_;
-    std::unique_ptr<ProgressEngine> pipeline_reduce_engine_;
+    // GPU reduce work uses std::async per slot, not a shared engine.
     std::vector<std::unique_ptr<ProgressEngine>> net_engines_;
     std::unique_ptr<Rendezvous> rendezvous_;
     std::unique_ptr<Watchdog> watchdog_;

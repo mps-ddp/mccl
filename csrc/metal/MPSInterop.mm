@@ -101,7 +101,7 @@ void check_command_buffer(id<MTLCommandBuffer> cmd, const char* context) {
 void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
                               void* dst, size_t nbytes) {
     StagingPool& pool = staging_pool();
-    if (pool.mtl_wrapper && nbytes <= pool.capacity) {
+    if (dst == pool.ptr && pool.mtl_wrapper && nbytes <= pool.capacity) {
         @autoreleasepool {
             id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
             id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
@@ -391,6 +391,33 @@ StagingBuffer stage_for_send_nosync(const at::Tensor& tensor) {
     chunked_blit_to_staging(src_buf, view.byte_offset, staging, view.nbytes);
 
     return StagingBuffer{staging, view.nbytes};
+}
+
+StagingBuffer stage_for_send_threadsafe(const at::Tensor& tensor, void* staging_buf,
+                                        size_t staging_capacity) {
+    check_single_tensor(tensor);
+    mps_stream_sync();
+    mccl_queue_drain();
+    return stage_for_send_nosync_threadsafe(tensor, staging_buf, staging_capacity);
+}
+
+StagingBuffer stage_for_send_nosync_threadsafe(const at::Tensor& tensor, void* staging_buf,
+                                               size_t staging_capacity) {
+    check_single_tensor(tensor);
+
+    MPSBufferView view = extract_mps_buffer(tensor);
+
+    if (view.cpu_accessible && view.cpu_ptr) {
+        MCCL_TRACE("stage_for_send_nosync_threadsafe: direct CPU path, %zu bytes", view.nbytes);
+        return StagingBuffer{view.cpu_ptr, view.nbytes};
+    }
+
+    MCCL_CHECK(staging_buf != nullptr && staging_capacity >= view.nbytes,
+               "stage_for_send_nosync_threadsafe: staging buffer too small or null");
+
+    id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
+    chunked_blit_to_staging(src_buf, view.byte_offset, staging_buf, view.nbytes);
+    return StagingBuffer{staging_buf, view.nbytes};
 }
 
 void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes) {

@@ -55,6 +55,15 @@ StagingBuffer stage_for_send(const at::Tensor& tensor);
 /// Caller MUST ensure all GPU work on the tensor is already flushed.
 StagingBuffer stage_for_send_nosync(const at::Tensor& tensor);
 
+/// Thread-safe variants that never touch the global StagingPool singleton.
+/// For CPU-accessible tensors they return the tensor's CPU pointer directly.
+/// For private-storage tensors the caller must supply a page-aligned staging
+/// buffer (e.g. a PooledBuffer) large enough for the tensor payload.
+StagingBuffer stage_for_send_threadsafe(const at::Tensor& tensor, void* staging_buf,
+                                        size_t staging_capacity);
+StagingBuffer stage_for_send_nosync_threadsafe(const at::Tensor& tensor, void* staging_buf,
+                                               size_t staging_capacity);
+
 /// Unstage received bytes back into an MPS tensor's buffer.
 /// Handles the CPU→GPU direction (write-back after network receive).
 void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes);

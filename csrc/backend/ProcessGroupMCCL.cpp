@@ -213,14 +213,23 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     // std::async to avoid single-queue contention across concurrent DDP buckets.
     
     if (use_direct_dispatch_) {
-        // Use thread pool for parallel network I/O (eliminates queue bottleneck)
-        size_t num_threads = std::max(4, std::min(8, world_size * 2));
+        // Use dedicated pools for outer collective execution and inner network
+        // I/O. Keeping them separate avoids pool self-deadlocks when the outer
+        // ring pipeline blocks on send/recv futures from the inner pool.
+        size_t net_threads = std::max(4, std::min(8, world_size * 2));
         if (auto* v = std::getenv("MCCL_NET_THREADS")) {
-            num_threads = static_cast<size_t>(std::atoll(v));
+            net_threads = static_cast<size_t>(std::atoll(v));
         }
-        net_thread_pool_ = std::make_unique<ThreadPool>(num_threads, queue_depth);
+        size_t outer_threads = std::max<size_t>(8, std::min<size_t>(16, world_size * 4));
+        if (auto* v = std::getenv("MCCL_OUTER_THREADS")) {
+            outer_threads = static_cast<size_t>(std::atoll(v));
+        }
+        outer_thread_pool_ = std::make_unique<ThreadPool>(outer_threads, queue_depth);
+        outer_thread_pool_->start();
+        net_thread_pool_ = std::make_unique<ThreadPool>(net_threads, queue_depth);
         net_thread_pool_->start();
-        MCCL_INFO("Direct dispatch enabled with %zu network threads", num_threads);
+        MCCL_INFO("Direct dispatch enabled with %zu outer threads, %zu network threads",
+                  outer_threads, net_threads);
     } else {
         // Legacy: Create net engines (one per peer rank, excluding self)
         net_engines_.resize(world_size);
@@ -550,6 +559,9 @@ ProcessGroupMCCL::~ProcessGroupMCCL() {
         if (watchdog_) watchdog_->stop();
         if (reduce_engine_) reduce_engine_->stop();
         // pipeline_reduce_engine_ removed; GPU reduce uses std::async now.
+        if (outer_thread_pool_) {
+            outer_thread_pool_->stop();
+        }
         if (net_thread_pool_) {
             net_thread_pool_->stop();
         }
@@ -651,7 +663,9 @@ void ProcessGroupMCCL::compressed_send(int peer, OpType op, uint32_t seq,
                "BFloat16 tensors are not supported with compression enabled. "
                "Disable compression (MCCL_COMPRESSION=none) or use float32/float16.");
 
-    StagingBuffer staged = stage_for_send(tensor);
+    PooledBuffer stage_buf(staging_memory_pool(), tensor_nbytes(tensor));
+    StagingBuffer staged = stage_for_send_threadsafe(
+        tensor, stage_buf.data(), stage_buf.capacity());
 
     if (compressor_) {
         size_t max_comp = compressor_->max_compressed_size(staged.nbytes);
@@ -708,13 +722,17 @@ void ProcessGroupMCCL::compressed_recv(int peer, OpType op, uint32_t seq,
             static_cast<uint8_t*>(comp_buf.data()) + sizeof(uint32_t),
             actual_comp_size, decomp_buf.data(), nbytes,
             tensor.scalar_type());
-        unstage_from_recv(tensor, decomp_buf.data(), nbytes);
+        PooledBuffer unstage_buf(staging_memory_pool(), nbytes);
+        unstage_from_recv_threadsafe(
+            tensor, decomp_buf.data(), nbytes, unstage_buf.data(), unstage_buf.capacity());
         metrics_->record_transport_bytes(max_wire, false);
     } else {
         PooledBuffer recv_buf(staging_memory_pool(), nbytes);
         MCCL_CHECK(transport_->recv_chunks(peer, op, seq, tid, recv_buf.data(), nbytes),
                    "compressed_recv recv_chunks (uncompressed) failed");
-        unstage_from_recv(tensor, recv_buf.data(), nbytes);
+        PooledBuffer unstage_buf(staging_memory_pool(), nbytes);
+        unstage_from_recv_threadsafe(
+            tensor, recv_buf.data(), nbytes, unstage_buf.data(), unstage_buf.capacity());
         metrics_->record_transport_bytes(nbytes, false);
     }
 }
@@ -912,15 +930,12 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 }
             );
         }
-    } else if (use_direct_dispatch_ && net_thread_pool_) {
-        // ── 3+ ranks: parallel dispatch via detached thread ──
-        // Each DDP bucket allreduce runs on its own thread, eliminating
-        // the single-threaded reduce_engine_ bottleneck (~975ms queue wait).
-        // We use std::thread instead of the thread pool to avoid a
-        // self-submission deadlock: the inner ring pipeline submits
-        // send/recv tasks to net_thread_pool_ and blocks waiting for them,
-        // which would starve the pool if the outer task also held a slot.
-        std::thread(
+    } else if (use_direct_dispatch_ && outer_thread_pool_ && net_thread_pool_) {
+        // ── 3+ ranks: parallel dispatch via dedicated outer worker pool ──
+        // Each DDP bucket allreduce runs on a separate outer worker. The ring
+        // pipeline's inner send/recv work goes to net_thread_pool_, so there is
+        // no self-submission deadlock and no reduce_engine_ serialization.
+        outer_thread_pool_->submit_detached(
             [this, tensor_copy, seq, ws, nbytes, red_op, sync_val,
              defer_mps_sync_to_engine, work_ptr]() mutable {
                 try {
@@ -957,7 +972,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                     work_ptr->markError(std::current_exception());
                 }
             }
-        ).detach();
+        );
     } else {
         // ── 3+ ranks: legacy serialized path via reduce_engine ──
         reduce_engine_->submit(
@@ -1293,11 +1308,8 @@ void ProcessGroupMCCL::allreduce_ring_chunked_pipeline(at::Tensor& tensor, uint3
     auto stable_stage_chunk = [&](const at::Tensor& chunk, void* dst, size_t nbytes) {
         if (nbytes == 0) return;
         auto stage_t0 = std::chrono::steady_clock::now();
-        if (tensor_cpu_accessible(chunk)) {
-            MPSBufferView view = extract_mps_buffer(chunk);
-            std::memcpy(dst, view.cpu_ptr, nbytes);
-        } else {
-            StagingBuffer staged = stage_for_send_nosync(chunk);
+        StagingBuffer staged = stage_for_send_nosync_threadsafe(chunk, dst, nbytes);
+        if (staged.data != dst) {
             std::memcpy(dst, staged.data, nbytes);
         }
         auto stage_t1 = std::chrono::steady_clock::now();
@@ -1754,6 +1766,10 @@ void ProcessGroupMCCL::allreduce_ring_chunked_serial(at::Tensor& tensor, uint32_
     }
 
     PooledBuffer recv_buf_pool(staging_memory_pool(), chunk_elems * elem_size);
+    PooledBuffer send_stage_pool(staging_memory_pool(), chunk_elems * elem_size);
+    PooledBuffer blit_stage_pool(staging_memory_pool(), chunk_elems * elem_size);
+    PooledBuffer send_stage_pool(staging_memory_pool(), chunk_elems * elem_size);
+    PooledBuffer blit_stage_pool(staging_memory_pool(), chunk_elems * elem_size);
     double total_net_ms = 0.0;
     double total_reduce_ms = 0.0;
 
@@ -1776,7 +1792,8 @@ void ProcessGroupMCCL::allreduce_ring_chunked_serial(at::Tensor& tensor, uint32_
 
         StagingBuffer staged = {nullptr, 0};
         if (send_bytes > 0) {
-            staged = stage_for_send_nosync(send_chunk);
+            staged = stage_for_send_nosync_threadsafe(
+                send_chunk, send_stage_pool.data(), send_stage_pool.capacity());
         }
 
         auto net_t0 = std::chrono::steady_clock::now();
@@ -1797,7 +1814,9 @@ void ProcessGroupMCCL::allreduce_ring_chunked_serial(at::Tensor& tensor, uint32_
                     recv_chunk.numel(), op);
             } else {
                 at::Tensor incoming = torch::empty_like(recv_chunk);
-                unstage_from_recv(incoming, recv_buf_pool.data(), recv_bytes);
+                unstage_from_recv_threadsafe(
+                    incoming, recv_buf_pool.data(), recv_bytes,
+                    blit_stage_pool.data(), blit_stage_pool.capacity());
                 metal_reduce_op(recv_chunk, incoming, op);
             }
             auto red_t1 = std::chrono::steady_clock::now();
@@ -1826,7 +1845,8 @@ void ProcessGroupMCCL::allreduce_ring_chunked_serial(at::Tensor& tensor, uint32_
 
         StagingBuffer staged = {nullptr, 0};
         if (send_bytes > 0) {
-            staged = stage_for_send_nosync(send_chunk);
+            staged = stage_for_send_nosync_threadsafe(
+                send_chunk, send_stage_pool.data(), send_stage_pool.capacity());
         }
 
         auto net_t0 = std::chrono::steady_clock::now();
@@ -1843,7 +1863,9 @@ void ProcessGroupMCCL::allreduce_ring_chunked_serial(at::Tensor& tensor, uint32_
                 MPSBufferView chunk_view = extract_mps_buffer(recv_chunk);
                 memcpy(chunk_view.cpu_ptr, recv_buf_pool.data(), recv_bytes);
             } else {
-                unstage_from_recv(recv_chunk, recv_buf_pool.data(), recv_bytes);
+                unstage_from_recv_threadsafe(
+                    recv_chunk, recv_buf_pool.data(), recv_bytes,
+                    blit_stage_pool.data(), blit_stage_pool.capacity());
             }
             auto red_t1 = std::chrono::steady_clock::now();
             total_reduce_ms += std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
@@ -1926,7 +1948,8 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
 
         StagingBuffer staged = {nullptr, 0};
         if (send_bytes > 0) {
-            staged = stage_for_send_nosync(send_chunk);
+            staged = stage_for_send_nosync_threadsafe(
+                send_chunk, send_stage_pool.data(), send_stage_pool.capacity());
         }
 
         auto net_t0 = std::chrono::steady_clock::now();
@@ -1947,7 +1970,9 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
                     recv_chunk.numel(), op);
             } else {
                 at::Tensor incoming = torch::empty_like(recv_chunk);
-                unstage_from_recv(incoming, recv_buf_pool.data(), recv_bytes);
+                unstage_from_recv_threadsafe(
+                    incoming, recv_buf_pool.data(), recv_bytes,
+                    blit_stage_pool.data(), blit_stage_pool.capacity());
                 metal_reduce_op(recv_chunk, incoming, op);
             }
             auto red_t1 = std::chrono::steady_clock::now();
@@ -1975,7 +2000,8 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
 
         StagingBuffer staged = {nullptr, 0};
         if (send_bytes > 0) {
-            staged = stage_for_send_nosync(send_chunk);
+            staged = stage_for_send_nosync_threadsafe(
+                send_chunk, send_stage_pool.data(), send_stage_pool.capacity());
         }
 
         auto net_t0 = std::chrono::steady_clock::now();
@@ -1992,7 +2018,9 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
                 MPSBufferView chunk_view = extract_mps_buffer(recv_chunk);
                 memcpy(chunk_view.cpu_ptr, recv_buf_pool.data(), recv_bytes);
             } else {
-                unstage_from_recv(recv_chunk, recv_buf_pool.data(), recv_bytes);
+                unstage_from_recv_threadsafe(
+                    recv_chunk, recv_buf_pool.data(), recv_bytes,
+                    blit_stage_pool.data(), blit_stage_pool.capacity());
             }
             auto red_t1 = std::chrono::steady_clock::now();
             total_reduce_ms += std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
@@ -2066,18 +2094,16 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
                 cpu_scale_inplace(dst, count, 1.0f / ws);
             }
 
-            StagingBuffer staged = stage_for_send_nosync(tensor);
             for (int peer = 1; peer < ws; peer++) {
                 MCCL_CHECK(transport_->send_chunks(peer, OpType::ALLREDUCE, seq, 1,
-                                                   staged.data, nbytes),
+                                                   dst, nbytes),
                            "allreduce_small send to rank " + std::to_string(peer) + " failed");
                 metrics_->record_transport_bytes(nbytes, true);
             }
             if (overlap_comm_) signal_mccl_done(next_event_value());
         } else {
-            StagingBuffer staged = stage_for_send_nosync(tensor);
             MCCL_CHECK(transport_->send_chunks(0, OpType::ALLREDUCE, seq, 0,
-                                               staged.data, nbytes),
+                                               dst, nbytes),
                        "allreduce_small send to rank 0 failed");
             metrics_->record_transport_bytes(nbytes, true);
 

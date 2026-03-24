@@ -147,6 +147,9 @@ private:
     std::unique_ptr<ProgressEngine> reduce_engine_;
     // GPU reduce work uses std::async per slot, not a shared engine.
     std::vector<std::unique_ptr<ProgressEngine>> net_engines_;
+    // Dedicated outer worker pool for 3+ collective execution. Keeps the inner
+    // network pool free for send/recv work and avoids self-submission deadlocks.
+    std::unique_ptr<ThreadPool> outer_thread_pool_;
     // Thread pool for parallel network I/O (replaces per-peer engines when enabled)
     std::unique_ptr<ThreadPool> net_thread_pool_;
     std::unique_ptr<Rendezvous> rendezvous_;

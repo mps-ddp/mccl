@@ -1,6 +1,6 @@
-#include "GradientValidator.hpp"
-#include "../common/Logging.hpp"
-#include "../metal/MPSInterop.hpp"
+#include "runtime/GradientValidator.hpp"
+#include "common/Logging.hpp"
+#include "metal/MPSInterop.hpp"
 #include <cmath>
 #include <cstdlib>
 

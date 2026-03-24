@@ -1,5 +1,5 @@
-#include "ThreadPool.hpp"
-#include "../common/Logging.hpp"
+#include "runtime/ThreadPool.hpp"
+#include "common/Logging.hpp"
 #include <algorithm>
 
 namespace mccl {

@@ -22,12 +22,17 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: |
+            pyproject.toml
+            .github/workflows/ci.yml
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install numpy "pytest>=7.0" "pytest-timeout>=2.1" "setuptools>=68.0" "wheel>=0.41"
+          # Nightly torch for MPS / c10d API coverage; build must use this env (no isolation).
+          pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
+          pip install -e . --no-deps --no-build-isolation
 
       - name: Smoke tests (build + local 2-process DDP)
         run: pytest -v tests/test_build.py tests/test_ddp.py

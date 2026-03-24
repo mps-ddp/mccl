@@ -11,6 +11,9 @@
 
 namespace mccl {
 
+// Forward declaration
+class Metrics;
+
 /// A single unit of work submitted to the progress engine.
 struct EngineOp {
     uint32_t seq_num;
@@ -23,7 +26,7 @@ struct EngineOp {
 /// caller thread, then ``submit`` transport work here (e.g. barrier, allreduce I/O).
 class ProgressEngine {
 public:
-    explicit ProgressEngine(size_t max_queue_depth = 1024);
+    explicit ProgressEngine(size_t max_queue_depth = 1024, Metrics* metrics = nullptr);
     ~ProgressEngine();
 
     ProgressEngine(const ProgressEngine&) = delete;
@@ -64,6 +67,7 @@ private:
     std::condition_variable not_full_;
 
     std::thread thread_;
+    Metrics* metrics_; // Not owned
 };
 
 } // namespace mccl

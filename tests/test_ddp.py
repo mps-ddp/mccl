@@ -18,16 +18,32 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _run_distributed(fn, world_size=2, port=29500):
-    import subprocess, sys, textwrap, inspect
+def _run_distributed(fn, world_size=2, port=None):
+    import subprocess, sys, textwrap, inspect, socket
+    
+    # Dynamically allocate free ports to avoid collisions
+    def get_free_port():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('127.0.0.1', 0))
+            return s.getsockname()[1]
+    
+    # If port not specified, get a free one; otherwise use provided port (for compatibility)
+    master_port = port if port is not None else get_free_port()
+    
+    # Allocate MCCL_PORT_BASE with sufficient spacing to avoid overlap
+    # Use a separate free port starting from master_port + 1000 to ensure no collision
+    mccl_port_base = get_free_port()
+    while mccl_port_base <= master_port + 500:  # Ensure sufficient spacing
+        mccl_port_base = get_free_port()
+    
     src = textwrap.dedent(inspect.getsource(fn))
     script = (
         "import os, sys, torch, torch.nn as nn, torch.distributed as dist\n"
         "from torch.nn.parallel import DistributedDataParallel as DDP\n"
         f"os.environ['MASTER_ADDR'] = '127.0.0.1'\n"
-        f"os.environ['MASTER_PORT'] = '{port}'\n"
+        f"os.environ['MASTER_PORT'] = '{master_port}'\n"
         f"os.environ['MCCL_LISTEN_ADDR'] = '127.0.0.1'\n"
-        f"os.environ['MCCL_PORT_BASE'] = '{port + 100}'\n"
+        f"os.environ['MCCL_PORT_BASE'] = '{mccl_port_base}'\n"
         f"os.environ['MCCL_LOG_LEVEL'] = 'DEBUG'\n"
         "rank = int(sys.argv[1])\n"
         "world_size = int(sys.argv[2])\n"
@@ -86,7 +102,7 @@ class TestDDPBasicTraining:
                 assert torch.allclose(p.data, ref, rtol=1e-4, atol=1e-4), \
                     f"Rank {rank}: params diverged after training"
 
-        _run_distributed(fn, world_size=2, port=35000)
+        _run_distributed(fn, world_size=2)
 
 
 class TestDDPGradientSync:
@@ -115,7 +131,7 @@ class TestDDPGradientSync:
                 assert torch.allclose(p.grad.data, grad_ref, rtol=1e-4, atol=1e-4), \
                     f"Rank {rank}: gradient mismatch for {name}"
 
-        _run_distributed(fn, world_size=2, port=35100)
+        _run_distributed(fn, world_size=2)
 
 
 class TestDDPMultiLayer:
@@ -156,7 +172,7 @@ class TestDDPMultiLayer:
                 assert torch.allclose(p.data, ref, rtol=1e-4, atol=1e-4), \
                     f"Rank {rank}: param {name} diverged"
 
-        _run_distributed(fn, world_size=2, port=35200)
+        _run_distributed(fn, world_size=2)
 
 
 class TestDDPThreeRank:
@@ -193,4 +209,4 @@ class TestDDPThreeRank:
                 assert torch.allclose(p.data, ref, rtol=1e-4, atol=1e-4), \
                     f"Rank {rank}: params diverged after 3-rank training"
 
-        _run_distributed(fn, world_size=3, port=35300)
+        _run_distributed(fn, world_size=3)

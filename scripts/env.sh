@@ -13,7 +13,7 @@ export MCCL_LISTEN_ADDR="${MCCL_LISTEN_ADDR:-0.0.0.0}"
 export MCCL_PORT_BASE="${MCCL_PORT_BASE:-29600}"
 export MCCL_IFNAME="${MCCL_IFNAME:-}"          # e.g. "bridge0" for Thunderbolt
 export MCCL_CHUNK_BYTES="${MCCL_CHUNK_BYTES:-4194304}"   # 4 MB
-export MCCL_SMALL_MSG_THRESHOLD="${MCCL_SMALL_MSG_THRESHOLD:-65536}"  # 64 KB
+export MCCL_SMALL_MSG_THRESHOLD="${MCCL_SMALL_MSG_THRESHOLD:-262144}"  # 256 KiB default
 export MCCL_LOG_LEVEL="${MCCL_LOG_LEVEL:-INFO}"
 
 # Metal shader path (if not installed in the standard location)

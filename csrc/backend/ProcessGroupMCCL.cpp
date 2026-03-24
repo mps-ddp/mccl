@@ -42,6 +42,16 @@ SyncMode global_sync_mode() {
 
 thread_local bool tl_sync_done = false;
 
+bool use_chunked_ring_default() {
+    static bool enabled = [] {
+        auto* v = std::getenv("MCCL_RING_ALGO");
+        if (!v) return false; // default to basic ring for numerical stability
+        std::string s(v);
+        return (s == "chunked" || s == "ring_chunked" || s == "fast");
+    }();
+    return enabled;
+}
+
 // Non-blocking: encode signal + commit, return event value (0 = already synced).
 // The engine thread must call wait_for_mps(val) before reading tensor data.
 inline uint64_t sync_mps_nonblocking(bool overlap) {
@@ -124,14 +134,14 @@ ProcessGroupMCCL::ProcessGroupMCCL(
         queue_depth = static_cast<size_t>(std::atoll(v));
     
     // Create reduce engine
-    reduce_engine_ = std::make_unique<ProgressEngine>(queue_depth);
+    reduce_engine_ = std::make_unique<ProgressEngine>(queue_depth, metrics_.get());
     reduce_engine_->start();
     
     // Create net engines (one per peer rank, excluding self)
     net_engines_.resize(world_size);
     for (int i = 0; i < world_size; i++) {
         if (i != rank) {
-            net_engines_[i] = std::make_unique<ProgressEngine>(queue_depth);
+            net_engines_[i] = std::make_unique<ProgressEngine>(queue_depth, metrics_.get());
             net_engines_[i]->start();
         }
     }
@@ -193,6 +203,8 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     }
     MCCL_INFO("  sync_mode           = %s",
               global_sync_mode() == SyncMode::COALESCED ? "coalesced" : "full");
+    MCCL_INFO("  ring_algo           = %s",
+              use_chunked_ring_default() ? "chunked" : "basic");
     MCCL_INFO("  compression         = %s", compressor_ ? compressor_->name().c_str() : "none");
     if (compressor_ && comp_mode == CompressionMode::TOPK) {
         MCCL_INFO("  topk_ratio          = %.4f", topk_ratio);
@@ -565,6 +577,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         }
     } else {
         // ── 3+ ranks: ring algorithms on reduce_engine ──
+        // PERFORMANCE NOTE: All 3+ rank collectives execute serially on reduce_engine_,
+        // limiting concurrency. DDP issues many small allreduces which queue up.
+        // Consider: larger PyTorch buckets, higher MCCL_SMALL_MSG_THRESHOLD, or
+        // per-peer engines for ring (TODO ~1427) to improve scaling.
         reduce_engine_->submit(
             [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
                 if (defer_mps_sync_to_engine) {
@@ -578,13 +594,21 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 } else if (sync_val > 0) {
                     wait_for_mps(sync_val);
                 }
+                // Algorithm selection for 3+ ranks.
+                // Small messages: star topology; large messages: ring topology.
+                // Default to basic ring for stability; chunked ring is opt-in.
                 const char* algo = "unknown";
                 if (nbytes <= transport_->config().small_msg_threshold) {
                     algo = "small";
                     allreduce_small(tensor_copy, seq, red_op);
                 } else {
-                    algo = "ring_chunked";
-                    allreduce_ring_chunked(tensor_copy, seq, red_op);
+                    if (use_chunked_ring_default()) {
+                        algo = "ring_chunked";
+                        allreduce_ring_chunked(tensor_copy, seq, red_op);
+                    } else {
+                        algo = "ring";
+                        allreduce_ring(tensor_copy, seq, red_op);
+                    }
                 }
                 MCCL_INFO("allreduce seq=%u: algo=%s nbytes=%zu", seq, algo, nbytes);
             },
@@ -650,7 +674,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
             if (ws == 2) {
                 allreduce_two_rank(flat_copy, seq, red_op);
             } else if (ws >= 3) {
-                allreduce_ring_chunked(flat_copy, seq, red_op);
+                if (use_chunked_ring_default()) {
+                    allreduce_ring_chunked(flat_copy, seq, red_op);
+                } else {
+                    allreduce_ring(flat_copy, seq, red_op);
+                }
             } else {
                 allreduce_ring(flat_copy, seq, red_op);
             }
@@ -1425,6 +1453,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
 
             // Ring allgather with per-peer engines - simplified version for now
             // TODO: Implement full per-peer engine version like allreduce_ring
+            // This would use net_engines_[peer] for each ring step instead of serializing
+            // all steps on reduce_engine_, enabling better concurrency and overlap.
+            // See 2-rank split for reference pattern.
             PooledBuffer recv_buf_fallback(staging_memory_pool(), use_cpu ? 0 : nbytes);
 
             for (int step = 0; step < ws - 1; step++) {

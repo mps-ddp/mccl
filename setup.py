@@ -2,11 +2,16 @@
 MCCL build script.
 
 Builds the C++/Obj-C++ extension that provides the ProcessGroupMCCL backend.
-Must be built on macOS with Apple Silicon and Xcode command-line tools.
+Must be built on macOS with Apple Silicon and Xcode (``metal`` / ``metallib``), not
+CLT-only, so ``mccl_shaders.metallib`` is produced next to ``_C`` for wheels.
+
+Set ``MCCL_ALLOW_NO_METALLIB=1`` only for local development without a full Xcode
+install; wheels built that way will not load Metal at runtime unless
+``shaders.metal`` is present (we always copy it beside the extension).
 """
 import os
-import sys
 import platform
+import shutil
 import subprocess
 
 from setuptools import setup, Extension
@@ -141,7 +146,9 @@ class MCCLBuildExt(build_ext):
         subprocess.check_call(cmd)
 
         self._fixup_rpath(ext_path)
-        self._compile_metallib(os.path.dirname(ext_path))
+        out_dir = os.path.dirname(ext_path)
+        self._compile_metallib(out_dir)
+        self._install_shaders_metal_next_to_extension(out_dir)
 
     @staticmethod
     def _fixup_rpath(ext_path):
@@ -171,22 +178,45 @@ class MCCLBuildExt(build_ext):
                 return "metal3.1"
         return "metal3.0"
 
+    def _install_shaders_metal_next_to_extension(self, output_dir: str) -> None:
+        """Copy ``shaders.metal`` beside ``_C`` so wheels/runtime can JIT-compile if needed."""
+        shader_src = os.path.join("csrc", "metal", "shaders.metal")
+        if not os.path.isfile(shader_src):
+            raise RuntimeError(
+                f"MCCL build requires {shader_src} in the source tree."
+            )
+        dst = os.path.join(output_dir, "shaders.metal")
+        shutil.copy2(shader_src, dst)
+        self.announce(f"Installed shaders.metal next to extension: {dst}", level=2)
+
     def _compile_metallib(self, output_dir):
-        shader_src = "csrc/metal/shaders.metal"
-        if not os.path.exists(shader_src):
-            self.announce("shaders.metal not found, skipping metallib", level=2)
-            return
+        shader_src = os.path.join("csrc", "metal", "shaders.metal")
+        if not os.path.isfile(shader_src):
+            raise RuntimeError(
+                f"MCCL build requires {shader_src} in the source tree."
+            )
+
+        allow_skip = os.environ.get("MCCL_ALLOW_NO_METALLIB", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
         try:
             subprocess.check_output(
                 ["xcrun", "--find", "metal"], text=True, stderr=subprocess.STDOUT
             )
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            self.warn(
-                "Metal shader compiler not found (requires full Xcode install). "
-                "Skipping metallib precompilation; shaders will be compiled at runtime."
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            msg = (
+                "Metal shader compiler not found — install full Xcode (not Command Line Tools "
+                "only) so `xcrun metal` exists. Release wheels must ship mccl_shaders.metallib "
+                "next to mccl._C. For local dev only, set MCCL_ALLOW_NO_METALLIB=1 to build "
+                "without a precompiled metallib (runtime will JIT from shaders.metal if present)."
             )
-            return
+            if allow_skip:
+                self.warn(msg + " Skipping metallib (MCCL_ALLOW_NO_METALLIB=1).")
+                return
+            raise RuntimeError(msg) from e
 
         air_path = os.path.join(self.build_temp, "mccl_shaders.air")
         lib_path = os.path.join(output_dir, "mccl_shaders.metallib")
@@ -214,6 +244,9 @@ class MCCLBuildExt(build_ext):
             air_path,
             "-o", lib_path,
         ])
+
+        if not os.path.isfile(lib_path):
+            raise RuntimeError(f"metallib build did not produce {lib_path}")
 
         self.announce(f"Precompiled metallib: {lib_path}", level=2)
 
@@ -256,7 +289,7 @@ ext = Extension(
 
 setup(
     name="mccl",
-    version="0.3.0",
+    version="0.3.1",
     description="MPS-native ProcessGroup backend for PyTorch Distributed on Apple Silicon",
     packages=["mccl"],
     ext_modules=[ext],

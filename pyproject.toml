@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mccl"
-version = "0.3.2"
+version = "0.3.3"
 description = "MPS-native ProcessGroup backend for PyTorch Distributed on Apple Silicon"
 readme = "README.md"
 license = {text = "MIT"}

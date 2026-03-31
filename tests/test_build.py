@@ -27,7 +27,7 @@ def _xcrun_metal_available() -> bool:
 def test_python_package_imports():
     import mccl
     assert hasattr(mccl, "__version__")
-    assert mccl.__version__ == "0.3.2"
+    assert mccl.__version__ == "0.3.3"
 
 
 def test_compatibility_matrix():
@@ -42,7 +42,7 @@ def test_compatibility_matrix():
 )
 def test_native_extension_loads():
     from mccl._C import __version__, __protocol_version__
-    assert __version__ == "0.3.2"
+    assert __version__ == "0.3.3"
     assert __protocol_version__ == 3
 
 

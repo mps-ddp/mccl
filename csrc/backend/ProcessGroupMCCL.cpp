@@ -40,14 +40,14 @@ SyncMode global_sync_mode() {
     return mode;
 }
 
-// world_size >= 3, message > small_msg_threshold: default is allreduce_ring_chunked
-// (Gloo-style double-buffered ring). Set MCCL_ALLREDUCE_ALGO=ring for plain ring.
-inline bool use_plain_ring_for_large_allreduce() {
-    static bool plain = [] {
+// world_size >= 3, message > small_msg_threshold: default is allreduce_ring (plain ring).
+// Set MCCL_ALLREDUCE_ALGO=ring_chunked for Gloo-style double-buffered ring.
+inline bool use_chunked_ring_for_large_allreduce() {
+    static bool chunked = [] {
         auto* v = std::getenv("MCCL_ALLREDUCE_ALGO");
-        return v && std::string(v) == "ring";
+        return v && std::string(v) == "ring_chunked";
     }();
-    return plain;
+    return chunked;
 }
 
 thread_local bool tl_sync_done = false;
@@ -206,7 +206,7 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     {
         const char* ara = std::getenv("MCCL_ALLREDUCE_ALGO");
         MCCL_INFO("  allreduce_algo      = %s",
-                  (ara && std::string(ara) == "ring") ? "ring" : "ring_chunked (default)");
+                  (ara && std::string(ara) == "ring_chunked") ? "ring_chunked" : "ring (default)");
     }
     MCCL_INFO("  compression         = %s", compressor_ ? compressor_->name().c_str() : "none");
     if (compressor_ && comp_mode == CompressionMode::TOPK) {
@@ -597,12 +597,12 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 if (nbytes <= transport_->config().small_msg_threshold) {
                     algo = "small";
                     allreduce_small(tensor_copy, seq, red_op);
-                } else if (use_plain_ring_for_large_allreduce()) {
-                    algo = "ring";
-                    allreduce_ring(tensor_copy, seq, red_op);
-                } else {
+                } else if (use_chunked_ring_for_large_allreduce()) {
                     algo = "ring_chunked";
                     allreduce_ring_chunked(tensor_copy, seq, red_op);
+                } else {
+                    algo = "ring";
+                    allreduce_ring(tensor_copy, seq, red_op);
                 }
                 MCCL_INFO("allreduce seq=%u: algo=%s nbytes=%zu", seq, algo, nbytes);
             },
@@ -668,10 +668,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
             if (ws == 2) {
                 allreduce_two_rank(flat_copy, seq, red_op);
             } else if (ws >= 3) {
-                if (use_plain_ring_for_large_allreduce()) {
-                    allreduce_ring(flat_copy, seq, red_op);
-                } else {
+                if (use_chunked_ring_for_large_allreduce()) {
                     allreduce_ring_chunked(flat_copy, seq, red_op);
+                } else {
+                    allreduce_ring(flat_copy, seq, red_op);
                 }
             } else {
                 allreduce_ring(flat_copy, seq, red_op);

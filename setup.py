@@ -343,7 +343,7 @@ ext = Extension(
 
 setup(
     name="mccl",
-    version="0.3.1",
+    version="0.3.2",
     description="MPS-native ProcessGroup backend for PyTorch Distributed on Apple Silicon",
     packages=["mccl"],
     ext_modules=[ext],

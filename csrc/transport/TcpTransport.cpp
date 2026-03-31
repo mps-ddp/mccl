@@ -494,7 +494,9 @@ bool TcpTransport::send_chunks(int peer_rank, OpType op, uint32_t seq,
                "Payload too large for TCP header (" + std::to_string(nbytes) +
                " bytes, max " + std::to_string(UINT32_MAX) + ")");
 
-    if (!crc_enabled_) {
+    // Always chunk to config_.chunk_bytes. A single writev with hundreds of MB
+    // (default when CRC was off) hits ENOBUFS on macOS TCP during DDP broadcast.
+    if (nbytes == 0) {
         MessageHeader hdr{};
         hdr.protocol_version = MCCL_PROTOCOL_VERSION;
         hdr.op_type = static_cast<uint8_t>(op);
@@ -502,13 +504,11 @@ bool TcpTransport::send_chunks(int peer_rank, OpType op, uint32_t seq,
         hdr.seq_num = seq;
         hdr.tensor_id = tensor_id;
         hdr.chunk_index = 0;
-        hdr.payload_bytes = static_cast<uint32_t>(nbytes);
+        hdr.payload_bytes = 0;
         hdr.checksum = 0;
-
-        return send_msg_locked(peer_rank, hdr, data, nbytes);
+        return send_msg_locked(peer_rank, hdr, data, 0);
     }
 
-    // Chunked path with per-chunk CRC (when MCCL_TRANSPORT_CRC=1)
     const uint8_t* p = static_cast<const uint8_t*>(data);
     size_t offset = 0;
     uint32_t chunk_idx = 0;
@@ -526,14 +526,15 @@ bool TcpTransport::send_chunks(int peer_rank, OpType op, uint32_t seq,
         hdr.tensor_id = tensor_id;
         hdr.chunk_index = chunk_idx;
         hdr.payload_bytes = static_cast<uint32_t>(chunk_len);
-        hdr.checksum = crc32_compute(p + offset, chunk_len);
+        hdr.checksum =
+            crc_enabled_ ? crc32_compute(p + offset, chunk_len) : 0;
 
         if (!send_msg_locked(peer_rank, hdr, p + offset, chunk_len)) {
             return false;
         }
 
         offset += chunk_len;
-        chunk_idx++;
+        ++chunk_idx;
     }
     return true;
 }
@@ -552,9 +553,8 @@ bool TcpTransport::recv_chunks(int peer_rank, OpType op, uint32_t seq,
 
     while (received < nbytes) {
         size_t remaining = nbytes - received;
-        size_t max_chunk = crc_enabled_
-            ? std::min(config_.chunk_bytes, remaining)
-            : remaining;
+        // Match send_chunks: each message is at most chunk_bytes (required when CRC is off).
+        size_t max_chunk = std::min(config_.chunk_bytes, remaining);
 
         MessageHeader hdr{};
         if (!recv_msg_locked(peer_rank, hdr, p + received, max_chunk)) {

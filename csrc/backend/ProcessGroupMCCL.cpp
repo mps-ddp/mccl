@@ -40,6 +40,16 @@ SyncMode global_sync_mode() {
     return mode;
 }
 
+// world_size >= 3, message > small_msg_threshold: default is allreduce_ring_chunked
+// (Gloo-style double-buffered ring). Set MCCL_ALLREDUCE_ALGO=ring for plain ring.
+inline bool use_plain_ring_for_large_allreduce() {
+    static bool plain = [] {
+        auto* v = std::getenv("MCCL_ALLREDUCE_ALGO");
+        return v && std::string(v) == "ring";
+    }();
+    return plain;
+}
+
 thread_local bool tl_sync_done = false;
 
 // Non-blocking: encode signal + commit, return event value (0 = already synced).
@@ -193,6 +203,11 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     }
     MCCL_INFO("  sync_mode           = %s",
               global_sync_mode() == SyncMode::COALESCED ? "coalesced" : "full");
+    {
+        const char* ara = std::getenv("MCCL_ALLREDUCE_ALGO");
+        MCCL_INFO("  allreduce_algo      = %s",
+                  (ara && std::string(ara) == "ring") ? "ring" : "ring_chunked (default)");
+    }
     MCCL_INFO("  compression         = %s", compressor_ ? compressor_->name().c_str() : "none");
     if (compressor_ && comp_mode == CompressionMode::TOPK) {
         MCCL_INFO("  topk_ratio          = %.4f", topk_ratio);
@@ -582,6 +597,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 if (nbytes <= transport_->config().small_msg_threshold) {
                     algo = "small";
                     allreduce_small(tensor_copy, seq, red_op);
+                } else if (use_plain_ring_for_large_allreduce()) {
+                    algo = "ring";
+                    allreduce_ring(tensor_copy, seq, red_op);
                 } else {
                     algo = "ring_chunked";
                     allreduce_ring_chunked(tensor_copy, seq, red_op);
@@ -650,7 +668,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
             if (ws == 2) {
                 allreduce_two_rank(flat_copy, seq, red_op);
             } else if (ws >= 3) {
-                allreduce_ring_chunked(flat_copy, seq, red_op);
+                if (use_plain_ring_for_large_allreduce()) {
+                    allreduce_ring(flat_copy, seq, red_op);
+                } else {
+                    allreduce_ring_chunked(flat_copy, seq, red_op);
+                }
             } else {
                 allreduce_ring(flat_copy, seq, red_op);
             }

@@ -3,7 +3,25 @@
 from pathlib import Path
 
 import platform
+import subprocess
 import pytest
+
+
+def _xcrun_metal_available() -> bool:
+    try:
+        subprocess.run(
+            ["xcrun", "--find", "metal"],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        return True
+    except (
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+        subprocess.TimeoutExpired,
+    ):
+        return False
 
 
 def test_python_package_imports():
@@ -33,13 +51,19 @@ def test_native_extension_loads():
     reason="Metallib is built next to the extension on macOS Apple Silicon",
 )
 def test_metallib_shipped_next_to_extension():
-    """Wheels must include mccl_shaders.metallib beside _C.so (see setup.py build_ext)."""
+    """If ``xcrun metal`` was available at build time, metallib must exist beside _C."""
     import mccl._C as mccl_c
 
     ext_dir = Path(mccl_c.__file__).resolve().parent
     mlib = ext_dir / "mccl_shaders.metallib"
-    assert mlib.is_file(), (
-        f"Expected {mlib} — build may have skipped metallib (install full Xcode / metal tools)"
+    if mlib.is_file():
+        return
+    if _xcrun_metal_available():
+        pytest.fail(
+            f"Expected {mlib} when xcrun metal is available (build should not skip metallib)"
+        )
+    pytest.skip(
+        "No mccl_shaders.metallib (metallib skipped without Xcode metal CLI; JIT uses shaders.metal)"
     )
 
 

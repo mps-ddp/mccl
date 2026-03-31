@@ -27,6 +27,8 @@ jobs:
         run: pip install --upgrade pip build
 
       - name: Build sdist and wheel
+        env:
+          MCCL_REQUIRE_METALLIB: "1"
         run: python -m build
 
       # Uses repo secret PYPI_API_TOKEN (classic API token). For OIDC instead, remove `with:` and

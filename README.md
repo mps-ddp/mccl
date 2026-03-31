@@ -10,7 +10,7 @@ Install PyTorch, then **`pip install mccl`**. **To our knowledge**, the first **
 
 - Apple Silicon Mac (arm64). No Intel.
 - **Xcode Command Line Tools** — `xcode-select --install` (needed to compile the extension).
-- **Full Xcode** — **required to build wheels / `pip install .` for distribution**: `xcrun metal` must exist so `mccl_shaders.metallib` is produced next to `_C`. Without it, set **`MCCL_ALLOW_NO_METALLIB=1`** for local dev only; the build still copies **`shaders.metal`** beside the `.so` for runtime JIT.
+- **Full Xcode** — **optional for local `pip install -e .`**: without `xcrun metal`, the build skips the precompiled `mccl_shaders.metallib` but still installs **`shaders.metal`** next to `_C` for **runtime JIT**. For **PyPI releases**, CI sets **`MCCL_REQUIRE_METALLIB=1`** so wheels always include the `.metallib` (needs Xcode on the builder).
 - **Python 3.11+**
 - **`torch` (PyTorch) ≥2.5** — required dependency of the `mccl` package ([`pyproject.toml`](pyproject.toml), [`requirements.txt`](requirements.txt)); install it first when building from source so headers/libs resolve (`pip install torch` or `pip install -r requirements.txt`).
 

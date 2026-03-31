@@ -1,13 +1,15 @@
 """
 MCCL build script.
 
-Builds the C++/Obj-C++ extension that provides the ProcessGroupMCCL backend.
-Must be built on macOS with Apple Silicon and Xcode (``metal`` / ``metallib``), not
-CLT-only, so ``mccl_shaders.metallib`` is produced next to ``_C`` for wheels.
+Builds the C++/Obj-C++ extension that provides the ProcessGroupMCCL backend on
+macOS Apple Silicon.
 
-Set ``MCCL_ALLOW_NO_METALLIB=1`` only for local development without a full Xcode
-install; wheels built that way will not load Metal at runtime unless
-``shaders.metal`` is present (we always copy it beside the extension).
+If ``xcrun metal`` is available, ``mccl_shaders.metallib`` is built next to ``_C``.
+If not (CLT-only machine), the build **warns and skips** metallib and still copies
+``shaders.metal`` beside the extension for **runtime JIT**.
+
+For **PyPI / release wheels**, set ``MCCL_REQUIRE_METALLIB=1`` so the build **fails**
+when the Metal CLI is missing (ensures every wheel ships a ``.metallib``).
 """
 import os
 import platform
@@ -196,7 +198,7 @@ class MCCLBuildExt(build_ext):
                 f"MCCL build requires {shader_src} in the source tree."
             )
 
-        allow_skip = os.environ.get("MCCL_ALLOW_NO_METALLIB", "").strip().lower() in (
+        require_metallib = os.environ.get("MCCL_REQUIRE_METALLIB", "").strip().lower() in (
             "1",
             "true",
             "yes",
@@ -208,15 +210,18 @@ class MCCLBuildExt(build_ext):
             )
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             msg = (
-                "Metal shader compiler not found — install full Xcode (not Command Line Tools "
-                "only) so `xcrun metal` exists. Release wheels must ship mccl_shaders.metallib "
-                "next to mccl._C. For local dev only, set MCCL_ALLOW_NO_METALLIB=1 to build "
-                "without a precompiled metallib (runtime will JIT from shaders.metal if present)."
+                "Metal shader compiler not found (`xcrun metal`). Skipping precompiled "
+                "mccl_shaders.metallib; shaders.metal is still installed next to _C for runtime JIT. "
+                "For PyPI wheels, build on a Mac with full Xcode and set MCCL_REQUIRE_METALLIB=1 "
+                "so this step cannot be skipped silently."
             )
-            if allow_skip:
-                self.warn(msg + " Skipping metallib (MCCL_ALLOW_NO_METALLIB=1).")
-                return
-            raise RuntimeError(msg) from e
+            if require_metallib:
+                raise RuntimeError(
+                    "MCCL_REQUIRE_METALLIB=1 but `xcrun metal` is not available — "
+                    "install full Xcode (not Command Line Tools only)."
+                ) from e
+            self.warn(msg)
+            return
 
         air_path = os.path.join(self.build_temp, "mccl_shaders.air")
         lib_path = os.path.join(output_dir, "mccl_shaders.metallib")

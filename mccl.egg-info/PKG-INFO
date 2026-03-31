@@ -1,3 +1,28 @@
+Metadata-Version: 2.4
+Name: mccl
+Version: 0.3.0
+Summary: MPS-native ProcessGroup backend for PyTorch Distributed on Apple Silicon
+License: MIT
+Project-URL: Repository, https://github.com/mps-ddp/mccl
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: MacOS :: MacOS X
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: torch>=2.5.0
+Provides-Extra: dev
+Requires-Dist: numpy>=1.24; extra == "dev"
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-timeout>=2.1; extra == "dev"
+Dynamic: license-file
+Dynamic: requires-python
+
 # MCCL
 
 [![CI](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml)
@@ -10,9 +35,9 @@ Install PyTorch, then **`pip install mccl`**. **To our knowledge**, the first **
 
 - Apple Silicon Mac (arm64). No Intel.
 - **Xcode Command Line Tools** — `xcode-select --install` (needed to compile the extension).
-- **Full Xcode** — **optional for local `pip install -e .`**: without `xcrun metal`, the build skips the precompiled `mccl_shaders.metallib` but still installs **`shaders.metal`** next to `_C` for **runtime JIT**. For **PyPI releases**, CI sets **`MCCL_REQUIRE_METALLIB=1`** so wheels always include the `.metallib` (needs Xcode on the builder).
+- **Full Xcode** — optional; speeds up Metal by emitting a `.metallib` at build time instead of JIT at runtime.
 - **Python 3.11+**
-- **`torch` (PyTorch) ≥2.5** and **`numpy` ≥1.20** — declared in [`pyproject.toml`](pyproject.toml) / [`requirements.txt`](requirements.txt); install `torch` first when building from source so headers/libs resolve.
+- **`torch` (PyTorch) ≥2.5** — required dependency of the `mccl` package ([`pyproject.toml`](pyproject.toml), [`requirements.txt`](requirements.txt)); install it first when building from source so headers/libs resolve (`pip install torch` or `pip install -r requirements.txt`).
 
 ## Install
 

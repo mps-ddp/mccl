@@ -40,6 +40,16 @@ SyncMode global_sync_mode() {
     return mode;
 }
 
+// world_size >= 3, message > small_msg_threshold: default is allreduce_ring (plain ring).
+// Set MCCL_ALLREDUCE_ALGO=ring_chunked for Gloo-style double-buffered ring.
+inline bool use_chunked_ring_for_large_allreduce() {
+    static bool chunked = [] {
+        auto* v = std::getenv("MCCL_ALLREDUCE_ALGO");
+        return v && std::string(v) == "ring_chunked";
+    }();
+    return chunked;
+}
+
 thread_local bool tl_sync_done = false;
 
 bool use_chunked_ring_default() {

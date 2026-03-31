@@ -284,11 +284,12 @@ void metal_kernels_init() {
             }
         }
 
-        // Locate the directory containing this .so via dladdr
+        // Directory containing this .so (wheel / site-packages layout)
+        NSString* soDir = nil;
         Dl_info dl_info;
         if (dladdr((void*)metal_kernels_init, &dl_info) && dl_info.dli_fname) {
             NSString* soPath = @(dl_info.dli_fname);
-            NSString* soDir = [soPath stringByDeletingLastPathComponent];
+            soDir = [soPath stringByDeletingLastPathComponent];
             [metallib_search addObject:[soDir stringByAppendingPathComponent:@"mccl_shaders.metallib"]];
         }
 
@@ -331,6 +332,14 @@ void metal_kernels_init() {
                         srcPath = p;
                         break;
                     }
+                }
+            }
+
+            // Pip wheel: setup.py installs shaders.metal next to _C.so
+            if (!srcPath && soDir) {
+                NSString* besideSo = [soDir stringByAppendingPathComponent:@"shaders.metal"];
+                if ([fm fileExistsAtPath:besideSo]) {
+                    srcPath = besideSo;
                 }
             }
 

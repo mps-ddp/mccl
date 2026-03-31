@@ -1,16 +1,38 @@
 """
 MCCL build script.
 
-Builds the C++/Obj-C++ extension that provides the ProcessGroupMCCL backend.
-Must be built on macOS with Apple Silicon and Xcode command-line tools.
+Builds the C++/Obj-C++ extension that provides the ProcessGroupMCCL backend on
+macOS Apple Silicon.
+
+If ``xcrun metal`` is available, ``mccl_shaders.metallib`` is built next to ``_C``.
+If not (CLT-only machine), the build **warns and skips** metallib and still copies
+``shaders.metal`` beside the extension for **runtime JIT**.
+
+For **PyPI / release wheels**, set ``MCCL_REQUIRE_METALLIB=1`` so the build **fails**
+when the Metal CLI is missing (ensures every wheel ships a ``.metallib``).
 """
 import os
-import sys
 import platform
+import shutil
 import subprocess
 
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
+
+# Paths relative to this file — pip/build isolation cwd is not always the repo root.
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _shaders_metal_path() -> str:
+    """Canonical shader source: ``csrc/metal/``; fallback ``mccl/shaders.metal`` (legacy copy)."""
+    for parts in (
+        ("csrc", "metal", "shaders.metal"),
+        ("mccl", "shaders.metal"),
+    ):
+        p = os.path.join(_REPO_ROOT, *parts)
+        if os.path.isfile(p):
+            return p
+    return os.path.join(_REPO_ROOT, "csrc", "metal", "shaders.metal")
 
 
 def _torch_include_dirs():
@@ -141,7 +163,12 @@ class MCCLBuildExt(build_ext):
         subprocess.check_call(cmd)
 
         self._fixup_rpath(ext_path)
-        self._compile_metallib(os.path.dirname(ext_path))
+        out_dir = os.path.dirname(ext_path)
+        # Install source shaders before metallib so this always runs even if REQUIRE+metal fails.
+        # Editable / mixed layouts may load _C from mccl/mccl/ while setuptools links under build/;
+        # deploy beside every such directory so dladdr finds shaders.metal next to the loaded .so.
+        self._install_shaders_metal_for_ext(ext, out_dir)
+        self._compile_metallib(ext, out_dir)
 
     @staticmethod
     def _fixup_rpath(ext_path):
@@ -171,21 +198,71 @@ class MCCLBuildExt(build_ext):
                 return "metal3.1"
         return "metal3.0"
 
-    def _compile_metallib(self, output_dir):
-        shader_src = "csrc/metal/shaders.metal"
-        if not os.path.exists(shader_src):
-            self.announce("shaders.metal not found, skipping metallib", level=2)
-            return
+    def _shader_bundle_dest_dirs(self, ext: Extension, primary_out_dir: str) -> list[str]:
+        """Dirs that should hold ``shaders.metal`` / ``mccl_shaders.metallib`` next to ``_C``."""
+        dirs = [os.path.normpath(primary_out_dir)]
+        parts = ext.name.split(".")
+        if len(parts) >= 2:
+            pkg_path = os.path.normpath(os.path.join(_REPO_ROOT, *parts[:-1]))
+            if os.path.isdir(pkg_path):
+                dirs.append(pkg_path)
+        seen_real: set[str] = set()
+        unique: list[str] = []
+        for d in dirs:
+            try:
+                key = os.path.realpath(d)
+            except OSError:
+                key = d
+            if key not in seen_real:
+                seen_real.add(key)
+                unique.append(d)
+        return unique
+
+    def _install_shaders_metal_for_ext(self, ext: Extension, primary_out_dir: str) -> None:
+        """Copy ``shaders.metal`` beside ``_C`` in every layout setuptools / editable may use."""
+        shader_src = _shaders_metal_path()
+        if not os.path.isfile(shader_src):
+            raise RuntimeError(
+                "MCCL build requires shaders.metal at "
+                f"{os.path.join(_REPO_ROOT, 'csrc', 'metal', 'shaders.metal')} "
+                "(restore from upstream mccl repo if missing)."
+            )
+        for d in self._shader_bundle_dest_dirs(ext, primary_out_dir):
+            os.makedirs(d, exist_ok=True)
+            dst = os.path.join(d, "shaders.metal")
+            shutil.copy2(shader_src, dst)
+            self.announce(f"Installed shaders.metal next to extension: {dst}", level=2)
+
+    def _compile_metallib(self, ext: Extension, output_dir: str) -> None:
+        shader_src = _shaders_metal_path()
+        if not os.path.isfile(shader_src):
+            raise RuntimeError(
+                f"MCCL build requires {shader_src} in the source tree."
+            )
+
+        require_metallib = os.environ.get("MCCL_REQUIRE_METALLIB", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
         try:
             subprocess.check_output(
                 ["xcrun", "--find", "metal"], text=True, stderr=subprocess.STDOUT
             )
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            self.warn(
-                "Metal shader compiler not found (requires full Xcode install). "
-                "Skipping metallib precompilation; shaders will be compiled at runtime."
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            msg = (
+                "Metal shader compiler not found (`xcrun metal`). Skipping precompiled "
+                "mccl_shaders.metallib; shaders.metal is still installed next to _C for runtime JIT. "
+                "For PyPI wheels, build on a Mac with full Xcode and set MCCL_REQUIRE_METALLIB=1 "
+                "so this step cannot be skipped silently."
             )
+            if require_metallib:
+                raise RuntimeError(
+                    "MCCL_REQUIRE_METALLIB=1 but `xcrun metal` is not available — "
+                    "install full Xcode (not Command Line Tools only)."
+                ) from e
+            self.warn(msg)
             return
 
         air_path = os.path.join(self.build_temp, "mccl_shaders.air")
@@ -215,7 +292,17 @@ class MCCLBuildExt(build_ext):
             "-o", lib_path,
         ])
 
+        if not os.path.isfile(lib_path):
+            raise RuntimeError(f"metallib build did not produce {lib_path}")
+
         self.announce(f"Precompiled metallib: {lib_path}", level=2)
+
+        for d in self._shader_bundle_dest_dirs(ext, output_dir):
+            if os.path.normpath(d) == os.path.normpath(output_dir):
+                continue
+            dup = os.path.join(d, "mccl_shaders.metallib")
+            shutil.copy2(lib_path, dup)
+            self.announce(f"Synced metallib to {dup}", level=2)
 
 
 CPP_SOURCES = [
@@ -256,7 +343,7 @@ ext = Extension(
 
 setup(
     name="mccl",
-    version="0.3.0",
+    version="0.3.3",
     description="MPS-native ProcessGroup backend for PyTorch Distributed on Apple Silicon",
     packages=["mccl"],
     ext_modules=[ext],

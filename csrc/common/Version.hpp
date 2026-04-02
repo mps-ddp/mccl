@@ -6,7 +6,7 @@
 
 #define MCCL_PROTOCOL_VERSION 3
 
-#define MCCL_VERSION_STRING "0.3.3"
+#define MCCL_VERSION_STRING "0.3.4"
 
 namespace mccl {
 

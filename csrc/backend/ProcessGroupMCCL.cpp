@@ -55,7 +55,7 @@ thread_local bool tl_sync_done = false;
 bool use_chunked_ring_default() {
     static bool enabled = [] {
         auto* v = std::getenv("MCCL_RING_ALGO");
-        if (!v) return false; // default to basic ring for numerical stability
+        if (!v) return true; // default to basic ring chunked for numerical stability
         std::string s(v);
         return (s == "chunked" || s == "ring_chunked" || s == "fast");
     }();

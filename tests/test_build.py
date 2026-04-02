@@ -42,7 +42,7 @@ def test_compatibility_matrix():
 )
 def test_native_extension_loads():
     from mccl._C import __version__, __protocol_version__
-    assert __version__ == "0.3.3"
+    assert __version__ == "0.3.4"
     assert __protocol_version__ == 3
 
 

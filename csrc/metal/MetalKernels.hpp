@@ -35,4 +35,8 @@ void metal_accumulate_and_scale(const at::Tensor& dst, const at::Tensor& src,
 /// Block until all MCCL Metal commands have completed.
 void metal_sync();
 
+/// Drain MCCL's Metal queue only (no ``torch::mps::synchronize``). Use from
+/// ProgressEngine / net threads; full ``metal_sync()`` is unsafe there.
+void metal_sync_queue_only();
+
 } // namespace mccl

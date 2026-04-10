@@ -659,4 +659,9 @@ void metal_sync() {
     mps_sync();
 }
 
+void metal_sync_queue_only() {
+    std::lock_guard<std::recursive_mutex> lock(g_metal_kernel_mutex);
+    mccl_queue_drain();
+}
+
 } // namespace mccl

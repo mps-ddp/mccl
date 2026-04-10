@@ -55,7 +55,8 @@ thread_local bool tl_sync_done = false;
 bool use_chunked_ring_default() {
     static bool enabled = [] {
         auto* v = std::getenv("MCCL_RING_ALGO");
-        if (!v) return true; // default to basic ring chunked for numerical stability
+        // Unset: prefer ring_chunked (pipelined chunks). Plain ring: MCCL_RING_ALGO=basic.
+        if (!v) return true;
         std::string s(v);
         return (s == "chunked" || s == "ring_chunked" || s == "fast");
     }();
@@ -520,7 +521,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                                 } else {
                                     metal_reduce_op(tensor_copy, incoming, red_op);
                                 }
-                                metal_sync();
+                                metal_sync_queue_only();
                             }
                             if (overlap_comm_) signal_mccl_done(next_event_value());
 
@@ -606,7 +607,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 }
                 // Algorithm selection for 3+ ranks.
                 // Small messages: star topology; large messages: ring topology.
-                // Default to basic ring for stability; chunked ring is opt-in.
+                // Default (no MCCL_RING_ALGO): ring_chunked. Set MCCL_RING_ALGO=basic
+                // for the plain serial ring (see use_chunked_ring_default()).
                 const char* algo = "unknown";
                 if (nbytes <= transport_->config().small_msg_threshold) {
                     algo = "small";
@@ -879,7 +881,7 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
         } else {
             metal_reduce_op(tensor, recv_tensor, op);
         }
-        metal_sync();
+        metal_sync_queue_only();
     }
 }
 
@@ -1010,7 +1012,7 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
         if (op == c10d::ReduceOp::AVG) {
             metal_scale_inplace(tensor, 1.0 / ws);
         }
-        metal_sync();
+        metal_sync_queue_only();
     }
 }
 
@@ -1135,7 +1137,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
         if (op == c10d::ReduceOp::AVG) {
             metal_scale_inplace(tensor, 1.0 / ws);
         }
-        metal_sync();
+        metal_sync_queue_only();
     }
 }
 
@@ -1208,7 +1210,7 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
             if (op == c10d::ReduceOp::AVG) {
                 metal_scale_inplace(tensor, 1.0 / ws);
             }
-            metal_sync();
+            metal_sync_queue_only();
 
             for (int peer = 1; peer < ws; peer++) {
                 compressed_send(peer, OpType::ALLREDUCE, seq, 1, tensor);
@@ -1219,7 +1221,7 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
             at::Tensor result = torch::empty_like(tensor);
             compressed_recv(0, OpType::ALLREDUCE, seq, 1, result);
             tensor.copy_(result);
-            metal_sync();
+            metal_sync_queue_only();
         }
     }
 }
@@ -1608,15 +1610,14 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                 memcpy(dst_view.cpu_ptr, src_view.cpu_ptr, nbytes);
                 if (overlap_comm_) signal_mccl_done(next_event_value());
             } else {
-                metal_sync();
+                metal_sync_queue_only();
                 output_copy.copy_(chunks[my_chunk]);
-                // Use event sync for better overlap
+                // Event path may touch PyTorch MPS from this thread; non-overlap relies
+                // on WorkMCCL::wait() -> mps_stream_sync() on the caller thread.
                 if (overlap_comm_ && event_sync_available()) {
                     uint64_t val = next_event_value();
                     commit_mps_and_signal(val);
                     wait_for_mps(val);
-                } else {
-                    mps_stream_sync();
                 }
             }
         },

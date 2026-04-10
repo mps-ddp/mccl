@@ -1,4 +1,5 @@
 #include "backend/WorkMCCL.hpp"
+#include "metal/MPSInterop.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 
@@ -22,6 +23,9 @@ bool WorkMCCL::wait(std::chrono::milliseconds timeout) {
 
     if (completed_) {
         if (exception_) std::rethrow_exception(exception_);
+        // Collectives may run MCCL Metal on ProgressEngine threads; sync PyTorch
+        // MPS here (waiter thread) so the default stream sees shared-buffer updates.
+        if (success_) mps_stream_sync();
         return success_;
     }
 
@@ -38,6 +42,7 @@ bool WorkMCCL::wait(std::chrono::milliseconds timeout) {
     }
 
     if (exception_) std::rethrow_exception(exception_);
+    if (success_) mps_stream_sync();
     return success_;
 }
 

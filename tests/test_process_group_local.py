@@ -86,6 +86,8 @@ THREE_RANK_PLAIN_RING_NUMEL = 70_000  # 280000 bytes
 THREE_RANK_PLAIN_RING_ENV = {"MCCL_RING_ALGO": "basic"}
 # f16: 262144 / 2 = 131072 elems minimum
 THREE_RANK_PLAIN_RING_NUMEL_F16 = 140_000
+# bf16: same 2 bytes/elem as f16 for ring threshold
+THREE_RANK_PLAIN_RING_NUMEL_BF16 = 140_000
 
 
 def _run_three_rank_parity_workers(
@@ -172,6 +174,42 @@ class TestAllreduce:
             assert not torch.allclose(tensor, local_copy)
 
         _run_distributed(fn, world_size=2, port=29700)
+
+    def test_two_rank_f32_sum_no_cpu_reduce(self):
+        """Explicit MCCL_FP32_CPU_REDUCE=0: Metal/staging (same as MCCL default since fp32 CPU is opt-in)."""
+
+        def fn(rank, world_size):
+            tensor = torch.ones(100, device="mps") * (rank + 1)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            expected = torch.ones(100, device="mps") * 3.0
+            assert torch.allclose(tensor, expected, rtol=1e-4, atol=1e-4), (
+                f"Rank {rank}: expected {expected[0].item()}, got {tensor[0].item()}"
+            )
+
+        _run_distributed(
+            fn,
+            world_size=2,
+            port=29620,
+            extra_mccl_env={"MCCL_FP32_CPU_REDUCE": "0"},
+        )
+
+    def test_two_rank_f32_sum_cpu_reduce_enabled(self):
+        """MCCL_FP32_CPU_REDUCE=1 exercises CPU unified-buffer float32 path (two-rank)."""
+
+        def fn(rank, world_size):
+            tensor = torch.ones(100, device="mps") * (rank + 1)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            expected = torch.ones(100, device="mps") * 3.0
+            assert torch.allclose(tensor, expected, rtol=1e-4, atol=1e-4), (
+                f"Rank {rank}: expected {expected[0].item()}, got {tensor[0].item()}"
+            )
+
+        _run_distributed(
+            fn,
+            world_size=2,
+            port=29621,
+            extra_mccl_env={"MCCL_FP32_CPU_REDUCE": "1"},
+        )
 
 
 class TestBroadcast:
@@ -325,6 +363,46 @@ class TestAllreduceF16:
         _run_distributed(fn, world_size=2, port=33200)
 
 
+class TestAllreduceBF16:
+    """BFloat16 tensors use the Metal / compressed reduce path (not the fp32 CPU ring)."""
+
+    def test_bf16_sum(self):
+        def fn(rank, world_size):
+            tensor = torch.ones(100, device="mps", dtype=torch.bfloat16) * (rank + 1)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            expected = torch.ones(100, device="mps", dtype=torch.bfloat16) * 3.0
+            assert torch.allclose(tensor, expected, rtol=1e-2, atol=1e-2)
+
+        _run_distributed(fn, world_size=2, port=33210)
+
+    def test_bf16_avg(self):
+        def fn(rank, world_size):
+            tensor = torch.ones(100, device="mps", dtype=torch.bfloat16) * (rank + 1)
+            dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
+            expected = torch.ones(100, device="mps", dtype=torch.bfloat16) * 1.5
+            assert torch.allclose(tensor, expected, rtol=1e-2, atol=1e-2)
+
+        _run_distributed(fn, world_size=2, port=33220)
+
+    def test_bf16_non_aligned_size(self):
+        def fn(rank, world_size):
+            tensor = torch.ones(13, device="mps", dtype=torch.bfloat16) * (rank + 1)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            expected = torch.ones(13, device="mps", dtype=torch.bfloat16) * 3.0
+            assert torch.allclose(tensor, expected, rtol=1e-2, atol=1e-2)
+
+        _run_distributed(fn, world_size=2, port=33230)
+
+    def test_bf16_large(self):
+        def fn(rank, world_size):
+            tensor = torch.randn(500_000, device="mps", dtype=torch.bfloat16)
+            local_copy = tensor.clone()
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            assert not torch.allclose(tensor, local_copy)
+
+        _run_distributed(fn, world_size=2, port=33240)
+
+
 class TestThreeRankAllreduce:
     """3-rank allreduce (not the 2-rank fast path).
 
@@ -344,6 +422,36 @@ class TestThreeRankAllreduce:
         _run_distributed(
             fn, world_size=3, port=33300, extra_mccl_env=THREE_RANK_PLAIN_RING_ENV
         )
+
+    def test_three_rank_sum_no_cpu_reduce(self):
+        """Explicit MCCL_FP32_CPU_REDUCE=0 on plain ring (matches default Metal fp32 path)."""
+
+        def fn(rank, world_size):
+            n = THREE_RANK_PLAIN_RING_NUMEL
+            tensor = torch.full((n,), float(rank + 1), device="mps", dtype=torch.float32)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            expected = torch.full((n,), 6.0, device="mps", dtype=torch.float32)
+            assert torch.allclose(tensor, expected, rtol=0.0, atol=0.0), (
+                f"Rank {rank}: max err {(tensor - expected).abs().max().item()}"
+            )
+
+        env = {**THREE_RANK_PLAIN_RING_ENV, "MCCL_FP32_CPU_REDUCE": "0"}
+        _run_distributed(fn, world_size=3, port=33310, extra_mccl_env=env)
+
+    def test_three_rank_sum_cpu_reduce_enabled(self):
+        """Plain ring with MCCL_FP32_CPU_REDUCE=1 (CPU float32 reduce on unified buffer)."""
+
+        def fn(rank, world_size):
+            n = THREE_RANK_PLAIN_RING_NUMEL
+            tensor = torch.full((n,), float(rank + 1), device="mps", dtype=torch.float32)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            expected = torch.full((n,), 6.0, device="mps", dtype=torch.float32)
+            assert torch.allclose(tensor, expected, rtol=0.0, atol=0.0), (
+                f"Rank {rank}: max err {(tensor - expected).abs().max().item()}"
+            )
+
+        env = {**THREE_RANK_PLAIN_RING_ENV, "MCCL_FP32_CPU_REDUCE": "1"}
+        _run_distributed(fn, world_size=3, port=33311, extra_mccl_env=env)
 
     def test_three_rank_avg(self):
         def fn(rank, world_size):
@@ -417,6 +525,18 @@ class TestThreeRankAllreduce:
             fn, world_size=3, port=33900, extra_mccl_env=THREE_RANK_PLAIN_RING_ENV
         )
 
+    def test_three_rank_bf16(self):
+        def fn(rank, world_size):
+            n = THREE_RANK_PLAIN_RING_NUMEL_BF16
+            tensor = torch.full((n,), float(rank + 1), device="mps", dtype=torch.bfloat16)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            expected = torch.full((n,), 6.0, device="mps", dtype=torch.bfloat16)
+            assert torch.allclose(tensor, expected, rtol=1e-2, atol=1e-2)
+
+        _run_distributed(
+            fn, world_size=3, port=33910, extra_mccl_env=THREE_RANK_PLAIN_RING_ENV
+        )
+
     def test_three_rank_sum_star_small(self):
         """Below small_msg_threshold: star hub path (regression for small 3-rank tensors)."""
 
@@ -443,6 +563,20 @@ class TestThreeRankChunkedRingNumeric:
 
         _run_distributed(
             fn, world_size=3, port=34051, extra_mccl_env={"MCCL_RING_ALGO": "ring_chunked"}
+        )
+
+    def test_chunked_ring_bf16_sum(self):
+        def fn(rank, world_size):
+            n = THREE_RANK_PLAIN_RING_NUMEL_BF16
+            tensor = torch.full((n,), float(rank + 1), device="mps", dtype=torch.bfloat16)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            expected = torch.full((n,), 6.0, device="mps", dtype=torch.bfloat16)
+            assert torch.allclose(tensor, expected, rtol=1e-2, atol=1e-2), (
+                f"Rank {rank}: max err {(tensor - expected).abs().max().item()}"
+            )
+
+        _run_distributed(
+            fn, world_size=3, port=34061, extra_mccl_env={"MCCL_RING_ALGO": "ring_chunked"}
         )
 
 

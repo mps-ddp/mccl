@@ -523,6 +523,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                                 }
                                 metal_sync_queue_only();
                             }
+                            if (cpu_ok) {
+                                mps_stream_sync_after_cpu_mps_buffer_write();
+                            }
                             if (overlap_comm_) signal_mccl_done(next_event_value());
 
                             auto red_t1 = std::chrono::steady_clock::now();
@@ -864,6 +867,7 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
 
         metrics_->record_transport_bytes(nbytes, true);
         metrics_->record_transport_bytes(nbytes, false);
+        mps_stream_sync_after_cpu_mps_buffer_write();
     } else {
         // f16/bf16 or compressed path: Metal pipeline
         at::Tensor recv_tensor = torch::empty_like(tensor);
@@ -1008,6 +1012,7 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
             cpu_scale_inplace(static_cast<float*>(view.cpu_ptr), total_elems, 1.0f / ws);
         }
         if (overlap_comm_) signal_mccl_done(next_event_value());
+        mps_stream_sync_after_cpu_mps_buffer_write();
     } else {
         if (op == c10d::ReduceOp::AVG) {
             metal_scale_inplace(tensor, 1.0 / ws);
@@ -1133,6 +1138,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
                               total_elems, 1.0f / ws);
         }
         if (overlap_comm_) signal_mccl_done(next_event_value());
+        mps_stream_sync_after_cpu_mps_buffer_write();
     } else {
         if (op == c10d::ReduceOp::AVG) {
             metal_scale_inplace(tensor, 1.0 / ws);
@@ -1198,6 +1204,7 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
             metrics_->record_transport_bytes(nbytes, false);
             if (overlap_comm_) signal_mccl_done(next_event_value());
         }
+        mps_stream_sync_after_cpu_mps_buffer_write();
     } else {
         // f16 or compressed path: existing Metal pipeline
         if (rank == 0) {
@@ -1347,6 +1354,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
                 }
                 metrics_->record_transport_bytes(nbytes, false);
                 if (overlap_comm_) signal_mccl_done(next_event_value());
+                if (use_cpu) {
+                    mps_stream_sync_after_cpu_mps_buffer_write();
+                }
             },
             [this, work_ptr, seq]() {
                 unregister_work(seq);
@@ -1498,6 +1508,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                 metrics_->record_transport_bytes(nbytes, true);
                 metrics_->record_transport_bytes(nbytes, false);
             }
+            if (use_cpu) {
+                mps_stream_sync_after_cpu_mps_buffer_write();
+            }
             if (overlap_comm_) signal_mccl_done(next_event_value());
         },
         [this, work_ptr, seq]() {
@@ -1609,6 +1622,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                 MPSBufferView dst_view = extract_mps_buffer(output_copy);
                 memcpy(dst_view.cpu_ptr, src_view.cpu_ptr, nbytes);
                 if (overlap_comm_) signal_mccl_done(next_event_value());
+                mps_stream_sync_after_cpu_mps_buffer_write();
             } else {
                 metal_sync_queue_only();
                 output_copy.copy_(chunks[my_chunk]);
@@ -1737,6 +1751,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
                 unstage_from_recv(tensor, recv_buf.data(), nbytes);
             }
             metrics_->record_transport_bytes(nbytes, false);
+            if (use_cpu) {
+                mps_stream_sync_after_cpu_mps_buffer_write();
+            }
         },
         [this, work_ptr, seq]() {
             unregister_work(seq);

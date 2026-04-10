@@ -234,12 +234,16 @@ def run_ddp(args) -> None:
                              args.batch_size, world_size, total_params)
         print(f"Wrote stats to {args.save_stats}", flush=True)
 
-    # Sanity check: params in sync
+    # Sanity check: first 8 floats of first param match rank 0 on every rank
     head = next(model.parameters()).detach().flatten()[:8].to(device)
     ref = head.clone()
     dist.broadcast(ref, src=0)
+    dist.barrier()
     if not torch.allclose(head, ref, rtol=1e-4, atol=1e-4):
-        raise RuntimeError("Parameter mismatch across ranks!")
+        max_abs = (head - ref).abs().max().item()
+        raise RuntimeError(
+            f"Parameter mismatch across ranks (rank={rank} max_abs={max_abs:.6g})"
+        )
     if rank == 0:
         print("Parameters in sync across ranks.", flush=True)
 

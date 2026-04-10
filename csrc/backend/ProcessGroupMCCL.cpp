@@ -1612,8 +1612,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
             } else {
                 metal_sync_queue_only();
                 output_copy.copy_(chunks[my_chunk]);
-                // Event path may touch PyTorch MPS from this thread; non-overlap relies
-                // on WorkMCCL::wait() -> mps_stream_sync() on the caller thread.
+                // Event path may touch PyTorch MPS from this thread. Non-overlap: MCCL
+                // queue is drained before copy_; next collective syncs MPS before use.
                 if (overlap_comm_ && event_sync_available()) {
                     uint64_t val = next_event_value();
                     commit_mps_and_signal(val);

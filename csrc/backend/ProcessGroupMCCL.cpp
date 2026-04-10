@@ -63,6 +63,26 @@ bool use_chunked_ring_default() {
     return enabled;
 }
 
+// MCCL_FP32_CPU_REDUCE: unset = Metal/staging for float32 (default, fewer full syncs).
+// Set to 1/true/on/yes for CPU-side float32 reduce into the unified buffer (often faster
+// allreduce bandwidth on UMA; more mps_stream_sync_after_cpu_mps_buffer_write tails).
+inline bool fp32_cpu_reduce_enabled() {
+    static bool enabled = [] {
+        auto* v = std::getenv("MCCL_FP32_CPU_REDUCE");
+        if (!v) return false;
+        std::string s(v);
+        return s == "1" || s == "true" || s == "on" || s == "yes";
+    }();
+    return enabled;
+}
+
+// Direct recv / staging: use shared cpu_ptr when allowed (see fp32_cpu_reduce_enabled for float32).
+inline bool prefer_cpu_unified_buffer_path(const at::Tensor& tensor) {
+    if (!tensor_cpu_accessible(tensor)) return false;
+    if (tensor.scalar_type() == at::kFloat && !fp32_cpu_reduce_enabled()) return false;
+    return true;
+}
+
 // Non-blocking: encode signal + commit, return event value (0 = already synced).
 // The engine thread must call wait_for_mps(val) before reading tensor data.
 inline uint64_t sync_mps_nonblocking(bool overlap) {
@@ -501,7 +521,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                     reduce_engine_->submit(
                         [this, tensor_copy, seq, red_op, nbytes, shared_recv_buf]() mutable {
                             auto red_t0 = std::chrono::steady_clock::now();
-                            bool cpu_ok = tensor_cpu_accessible(tensor_copy);
+                            bool cpu_ok = prefer_cpu_unified_buffer_path(tensor_copy);
                             int64_t count = tensor_copy.numel();
 
                             if (cpu_ok) {
@@ -734,7 +754,8 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
     bool cpu_ok = tensor_cpu_accessible(tensor);
     size_t nbytes = tensor_nbytes(tensor);
     int64_t count = tensor.numel();
-    bool use_fast = (tensor.scalar_type() == at::kFloat) && !compressor_;
+    bool use_fast = (tensor.scalar_type() == at::kFloat) && !compressor_ &&
+                    fp32_cpu_reduce_enabled();
 
     if (use_fast) {
         StagingBuffer staged = stage_for_send_nosync(tensor);
@@ -901,7 +922,8 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
     int64_t total_elems = tensor.numel();
 
     int64_t chunk_elems = (total_elems + (2 * ws) - 1) / (2 * ws);
-    bool use_cpu = (tensor.scalar_type() == at::kFloat) && tensor_cpu_accessible(tensor);
+    bool use_cpu = (tensor.scalar_type() == at::kFloat) &&
+                   prefer_cpu_unified_buffer_path(tensor);
 
     int left = (rank - 1 + ws) % ws;
     int right = (rank + 1) % ws;
@@ -1028,7 +1050,8 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
     size_t elem_size = tensor.element_size();
     int64_t total_elems = tensor.numel();
     int64_t chunk_elems = (total_elems + ws - 1) / ws;
-    bool use_cpu = (tensor.scalar_type() == at::kFloat) && tensor_cpu_accessible(tensor);
+    bool use_cpu = (tensor.scalar_type() == at::kFloat) &&
+                   prefer_cpu_unified_buffer_path(tensor);
 
     int left = (rank - 1 + ws) % ws;
     int right = (rank + 1) % ws;
@@ -1160,7 +1183,8 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
 
     size_t nbytes = tensor_nbytes(tensor);
 
-    bool use_cpu = (tensor.scalar_type() == at::kFloat) && !compressor_ && tensor_cpu_accessible(tensor);
+    bool use_cpu = (tensor.scalar_type() == at::kFloat) && !compressor_ &&
+                   prefer_cpu_unified_buffer_path(tensor);
 
     if (use_cpu) {
         MPSBufferView view = extract_mps_buffer(tensor);
@@ -1339,7 +1363,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
         net_engine_for(root).submit(
             [this, tensor_copy, root, seq, nbytes, sync_val_bc]() mutable {
                 if (sync_val_bc > 0) wait_for_mps(sync_val_bc);
-                bool use_cpu = tensor_cpu_accessible(tensor_copy);
+                bool use_cpu = prefer_cpu_unified_buffer_path(tensor_copy);
                 if (use_cpu) {
                     MPSBufferView view = extract_mps_buffer(tensor_copy);
                     MCCL_CHECK(transport_->recv_chunks(root, OpType::BROADCAST, seq, 0,
@@ -1457,7 +1481,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
     reduce_engine_->submit(
         [this, input_copy, outputs_copy, seq, rank, ws, nbytes, sync_val_ag]() mutable {
             if (sync_val_ag > 0) wait_for_mps(sync_val_ag);
-            bool use_cpu = (input_copy.scalar_type() == at::kFloat) && tensor_cpu_accessible(input_copy);
+            bool use_cpu = (input_copy.scalar_type() == at::kFloat) &&
+                           prefer_cpu_unified_buffer_path(input_copy);
 
             if (use_cpu) {
                 MPSBufferView in_view = extract_mps_buffer(input_copy);
@@ -1578,7 +1603,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
             if (sync_val_rs > 0) wait_for_mps(sync_val_rs);
             int left = (rank - 1 + ws) % ws;
             int right = (rank + 1) % ws;
-            bool use_cpu = (inputs_copy[0].scalar_type() == at::kFloat) && tensor_cpu_accessible(inputs_copy[0]);
+            bool use_cpu = (inputs_copy[0].scalar_type() == at::kFloat) &&
+                           prefer_cpu_unified_buffer_path(inputs_copy[0]);
 
             std::vector<at::Tensor> chunks = inputs_copy;
             PooledBuffer recv_buf(staging_memory_pool(), nbytes);
@@ -1735,7 +1761,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
 
     net_engine_for(srcRank).submit(
         [this, tensor, srcRank, seq, tag, nbytes]() mutable {
-            bool use_cpu = tensor_cpu_accessible(tensor);
+            bool use_cpu = prefer_cpu_unified_buffer_path(tensor);
             if (use_cpu) {
                 MPSBufferView view = extract_mps_buffer(tensor);
                 MCCL_CHECK(transport_->recv_chunks(srcRank, OpType::RECV, seq,

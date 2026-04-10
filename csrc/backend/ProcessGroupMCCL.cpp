@@ -1008,7 +1008,6 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
         if (overlap_comm_) signal_mccl_done(next_event_value());
     } else {
         if (op == c10d::ReduceOp::AVG) {
-            metal_begin_batch("mccl_allreduce_ring_chunked_avg");
             metal_scale_inplace(tensor, 1.0 / ws);
         }
         metal_sync();
@@ -1134,7 +1133,6 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
         if (overlap_comm_) signal_mccl_done(next_event_value());
     } else {
         if (op == c10d::ReduceOp::AVG) {
-            metal_begin_batch("mccl_allreduce_ring_avg");
             metal_scale_inplace(tensor, 1.0 / ws);
         }
         metal_sync();
@@ -1201,7 +1199,6 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
     } else {
         // f16 or compressed path: existing Metal pipeline
         if (rank == 0) {
-            metal_begin_batch("mccl_allreduce_small_gpu");
             for (int peer = 1; peer < ws; peer++) {
                 at::Tensor incoming = torch::empty_like(tensor);
                 compressed_recv(peer, OpType::ALLREDUCE, seq, 0, incoming);

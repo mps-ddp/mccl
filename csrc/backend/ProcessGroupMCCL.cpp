@@ -40,8 +40,8 @@ SyncMode global_sync_mode() {
     return mode;
 }
 
-// world_size >= 3, message > small_msg_threshold: default is allreduce_ring (plain ring).
-// Set MCCL_ALLREDUCE_ALGO=ring_chunked for Gloo-style double-buffered ring.
+// world_size >= 3, nbytes > small_msg_threshold: large messages use plain ring unless
+// MCCL_RING_ALGO=chunked|ring_chunked|fast (see use_chunked_ring_default()).
 inline bool use_chunked_ring_for_large_allreduce() {
     static bool chunked = [] {
         auto* v = std::getenv("MCCL_ALLREDUCE_ALGO");
@@ -55,8 +55,8 @@ thread_local bool tl_sync_done = false;
 bool use_chunked_ring_default() {
     static bool enabled = [] {
         auto* v = std::getenv("MCCL_RING_ALGO");
-        // Unset: prefer ring_chunked (pipelined chunks). Plain ring: MCCL_RING_ALGO=basic.
-        if (!v) return true;
+        // Unset: plain ring (allreduce_ring). Opt in: MCCL_RING_ALGO=chunked|ring_chunked|fast.
+        if (!v) return false;
         std::string s(v);
         return (s == "chunked" || s == "ring_chunked" || s == "fast");
     }();
@@ -630,8 +630,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 }
                 // Algorithm selection for 3+ ranks.
                 // Small messages: star topology; large messages: ring topology.
-                // Default (no MCCL_RING_ALGO): ring_chunked. Set MCCL_RING_ALGO=basic
-                // for the plain serial ring (see use_chunked_ring_default()).
+                // Default (no MCCL_RING_ALGO): plain ring. Set MCCL_RING_ALGO=chunked|ring_chunked|fast
+                // for Gloo-style double-buffered ring (see use_chunked_ring_default()).
                 const char* algo = "unknown";
                 if (nbytes <= transport_->config().small_msg_threshold) {
                     algo = "small";

@@ -21,7 +21,7 @@ struct TransportConfig {
     std::string ifname;              // MCCL_IFNAME — advisory interface hint
     size_t chunk_bytes = 16 * 1024 * 1024;  // 16 MB default (increased from 4MB for Gloo parity); >=16 MB if MCCL_LINK_PROFILE=thunderbolt
     // Algorithm selection for world_size >= 3: at or below threshold uses star (rank-0);
-    // above uses ring_chunked. Default 256 KiB favors ring for typical DDP buckets vs 64 KiB.
+    // above uses plain ring by default; MCCL_RING_ALGO=chunked|ring_chunked|fast for chunked ring.
     size_t small_msg_threshold = 262144;
     std::chrono::milliseconds connect_timeout{30000};
     std::chrono::milliseconds heartbeat_interval{5000};

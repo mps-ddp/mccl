@@ -406,8 +406,9 @@ class TestAllreduceBF16:
 class TestThreeRankAllreduce:
     """3-rank allreduce (not the 2-rank fast path).
 
-    Float tests use nbytes > default MCCL_SMALL_MSG_THRESHOLD and MCCL_RING_ALGO=basic
-    so they exercise **plain ring** (allreduce_ring), not the star hub path.
+    Float tests use nbytes > default MCCL_SMALL_MSG_THRESHOLD. Most set
+    ``MCCL_RING_ALGO=basic`` to pin plain ring; ``test_three_rank_sum_large_unset_ring_algo_env``
+    omits ``MCCL_RING_ALGO`` so the default (plain ring, not ``ring_chunked``) is covered.
     """
 
     def test_three_rank_sum(self):
@@ -422,6 +423,20 @@ class TestThreeRankAllreduce:
         _run_distributed(
             fn, world_size=3, port=33300, extra_mccl_env=THREE_RANK_PLAIN_RING_ENV
         )
+
+    def test_three_rank_sum_large_unset_ring_algo_env(self):
+        """Large 3-rank SUM with ``MCCL_RING_ALGO`` unset: default must stay plain ring."""
+
+        def fn(rank, world_size):
+            n = THREE_RANK_PLAIN_RING_NUMEL
+            tensor = torch.full((n,), float(rank + 1), device="mps", dtype=torch.float32)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            expected = torch.full((n,), 6.0, device="mps", dtype=torch.float32)
+            assert torch.allclose(tensor, expected, rtol=0.0, atol=0.0), (
+                f"Rank {rank}: max err {(tensor - expected).abs().max().item()}"
+            )
+
+        _run_distributed(fn, world_size=3, port=33307)
 
     def test_three_rank_sum_no_cpu_reduce(self):
         """Explicit MCCL_FP32_CPU_REDUCE=0 on plain ring (matches default Metal fp32 path)."""

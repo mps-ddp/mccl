@@ -45,3 +45,6 @@ include = ["mccl*"]
 addopts = "--tb=short --capture=no --log-cli-level=WARNING"
 log_file = "test_failures.log"
 log_file_level = "DEBUG"
+markers = [
+    "timeout: Max seconds for this test (enforced by pytest-timeout; install dev extra).",
+]

@@ -4,6 +4,7 @@
 
 #include <dlfcn.h>
 #include <atomic>
+#include <mutex>
 
 #include "metal/MetalKernels.hpp"
 #include "metal/MPSInterop.hpp"
@@ -41,8 +42,6 @@ struct KernelCache {
     id<MTLComputePipelineState> product_f16 = nil;
     id<MTLComputePipelineState> product_bf16 = nil;
 
-    id<MTLCommandBuffer> batch_cmd = nil;
-
     std::atomic<bool> initialized{false};
 };
 
@@ -50,6 +49,10 @@ KernelCache& cache() {
     static KernelCache c;
     return c;
 }
+
+/// Serializes MCCL Metal command buffer / encoder use across threads (reduce_engine,
+/// Python test hooks, etc.). Recursive: metal_reduce_op calls metal_accumulate_chunk.
+static std::recursive_mutex g_metal_kernel_mutex;
 
 id<MTLComputePipelineState> make_pipeline(id<MTLDevice> dev,
                                            id<MTLLibrary> lib,
@@ -162,16 +165,13 @@ bool should_use_small_cpu_binary_path(const at::Tensor& dst, const at::Tensor& s
 }
 
 id<MTLCommandBuffer> acquire_command_buffer(KernelCache& c, const char* label) {
-    if (c.batch_cmd != nil) return c.batch_cmd;
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
     cmd.label = @(label);
     return cmd;
 }
 
-void finish_command_buffer(KernelCache& c, id<MTLCommandBuffer> cmd) {
-    if (c.batch_cmd == nil) {
-        [cmd commit];
-    }
+void finish_command_buffer(id<MTLCommandBuffer> cmd) {
+    [cmd commit];
 }
 
 void cpu_small_reduce(const at::Tensor& dst, const at::Tensor& src,
@@ -259,6 +259,9 @@ id<MTLComputePipelineState> select_accum_scale_pipeline(KernelCache& c, at::Scal
 
 void metal_kernels_init() {
     KernelCache& c = cache();
+    if (c.initialized.load(std::memory_order_acquire)) return;
+
+    std::lock_guard<std::recursive_mutex> lock(g_metal_kernel_mutex);
     if (c.initialized.load(std::memory_order_acquire)) return;
 
     @autoreleasepool {
@@ -397,6 +400,7 @@ void metal_kernels_init() {
 
 
 void metal_accumulate_chunk(const at::Tensor& dst, const at::Tensor& src) {
+    std::lock_guard<std::recursive_mutex> lock(g_metal_kernel_mutex);
     KernelCache& c = cache();
     MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
@@ -432,12 +436,13 @@ void metal_accumulate_chunk(const at::Tensor& dst, const at::Tensor& src) {
        threadsPerThreadgroup:MTLSizeMake(dp.threadgroup_width, 1, 1)];
         [enc endEncoding];
 
-        finish_command_buffer(c, cmd);
+        finish_command_buffer(cmd);
     }
 }
 
 
 void metal_scale_inplace(const at::Tensor& buf, double scale) {
+    std::lock_guard<std::recursive_mutex> lock(g_metal_kernel_mutex);
     KernelCache& c = cache();
     MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
 
@@ -479,13 +484,14 @@ void metal_scale_inplace(const at::Tensor& buf, double scale) {
        threadsPerThreadgroup:MTLSizeMake(dp.threadgroup_width, 1, 1)];
         [enc endEncoding];
 
-        finish_command_buffer(c, cmd);
+        finish_command_buffer(cmd);
     }
 }
 
 
 void metal_accumulate_and_scale(const at::Tensor& dst, const at::Tensor& src,
                                 double scale) {
+    std::lock_guard<std::recursive_mutex> lock(g_metal_kernel_mutex);
     KernelCache& c = cache();
     MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
@@ -532,7 +538,7 @@ void metal_accumulate_and_scale(const at::Tensor& dst, const at::Tensor& src,
        threadsPerThreadgroup:MTLSizeMake(dp.threadgroup_width, 1, 1)];
         [enc endEncoding];
 
-        finish_command_buffer(c, cmd);
+        finish_command_buffer(cmd);
     }
 }
 
@@ -565,13 +571,14 @@ void dispatch_binary_op(id<MTLComputePipelineState> pso,
         [enc dispatchThreads:MTLSizeMake(dp.grid_width, 1, 1)
        threadsPerThreadgroup:MTLSizeMake(dp.threadgroup_width, 1, 1)];
         [enc endEncoding];
-        finish_command_buffer(c, cmd);
+        finish_command_buffer(cmd);
     }
 }
 
 } // anonymous namespace
 
 void metal_elementwise_min(const at::Tensor& dst, const at::Tensor& src) {
+    std::lock_guard<std::recursive_mutex> lock(g_metal_kernel_mutex);
     KernelCache& c = cache();
     MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
@@ -589,6 +596,7 @@ void metal_elementwise_min(const at::Tensor& dst, const at::Tensor& src) {
 }
 
 void metal_elementwise_max(const at::Tensor& dst, const at::Tensor& src) {
+    std::lock_guard<std::recursive_mutex> lock(g_metal_kernel_mutex);
     KernelCache& c = cache();
     MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
@@ -606,6 +614,7 @@ void metal_elementwise_max(const at::Tensor& dst, const at::Tensor& src) {
 }
 
 void metal_elementwise_product(const at::Tensor& dst, const at::Tensor& src) {
+    std::lock_guard<std::recursive_mutex> lock(g_metal_kernel_mutex);
     KernelCache& c = cache();
     MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
@@ -624,6 +633,7 @@ void metal_elementwise_product(const at::Tensor& dst, const at::Tensor& src) {
 
 void metal_reduce_op(const at::Tensor& dst, const at::Tensor& src,
                      c10d::ReduceOp::RedOpType op) {
+    std::lock_guard<std::recursive_mutex> lock(g_metal_kernel_mutex);
     switch (op) {
         case c10d::ReduceOp::SUM:
         case c10d::ReduceOp::AVG:
@@ -645,30 +655,13 @@ void metal_reduce_op(const at::Tensor& dst, const at::Tensor& src,
 }
 
 void metal_sync() {
-    if (cache().batch_cmd != nil) {
-        metal_end_batch();
-    }
+    std::lock_guard<std::recursive_mutex> lock(g_metal_kernel_mutex);
     mps_sync();
 }
 
-void metal_begin_batch(const char* label) {
-    KernelCache& c = cache();
-    MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
-    MCCL_CHECK(c.batch_cmd == nil, "Metal batch already active");
-    @autoreleasepool {
-        c.batch_cmd = [c.queue commandBuffer];
-        c.batch_cmd.label = @(label ? label : "mccl_batch");
-    }
-}
-
-void metal_end_batch() {
-    KernelCache& c = cache();
-    if (c.batch_cmd == nil) return;
-    @autoreleasepool {
-        id<MTLCommandBuffer> cmd = c.batch_cmd;
-        c.batch_cmd = nil;
-        [cmd commit];
-    }
+void metal_sync_queue_only() {
+    std::lock_guard<std::recursive_mutex> lock(g_metal_kernel_mutex);
+    mccl_queue_drain();
 }
 
 } // namespace mccl

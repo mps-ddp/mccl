@@ -308,6 +308,10 @@ void mps_stream_sync() {
     torch::mps::synchronize();
 }
 
+void mps_stream_sync_after_cpu_mps_buffer_write() {
+    mps_stream_sync();
+}
+
 void mccl_queue_drain() {
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];

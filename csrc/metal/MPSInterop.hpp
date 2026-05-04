@@ -28,6 +28,12 @@ void mps_sync();
 /// Metal compute work is pending.
 void mps_stream_sync();
 
+/// After CPU stores into an MPS tensor's shared MTLBuffer (cpu_ptr), ensure the
+/// PyTorch default MPS stream observes those bytes before the next GPU kernel
+/// reads the tensor. Call at end of CPU-finalized collectives on the engine
+/// thread (not from Work::wait).
+void mps_stream_sync_after_cpu_mps_buffer_write();
+
 /// Drain only the MCCL command queue (blocks until all committed MCCL
 /// command buffers complete). Does NOT flush the PyTorch MPS stream.
 void mccl_queue_drain();

@@ -25,11 +25,6 @@ void metal_elementwise_product(const at::Tensor& dst, const at::Tensor& src);
 void metal_reduce_op(const at::Tensor& dst, const at::Tensor& src,
                      c10d::ReduceOp::RedOpType op);
 
-/// Reuse a single command buffer across multiple GPU kernel launches.
-/// Callers must end the batch before staging tensor data back to CPU/network.
-void metal_begin_batch(const char* label = "mccl_batch");
-void metal_end_batch();
-
 /// buf *= scale element-wise on GPU via Metal compute.
 void metal_scale_inplace(const at::Tensor& buf, double scale);
 
@@ -39,5 +34,9 @@ void metal_accumulate_and_scale(const at::Tensor& dst, const at::Tensor& src,
 
 /// Block until all MCCL Metal commands have completed.
 void metal_sync();
+
+/// Drain MCCL's Metal queue only (no ``torch::mps::synchronize``). Use from
+/// ProgressEngine / net threads; full ``metal_sync()`` is unsafe there.
+void metal_sync_queue_only();
 
 } // namespace mccl

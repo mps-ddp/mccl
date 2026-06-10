@@ -9,58 +9,328 @@
 #include "common/TensorChecks.hpp"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
 
 namespace mccl {
 
 namespace {
 
-enum class SyncMode {
-    FULL,       // torch::mps::synchronize() every op (safest)
-    COALESCED,  // sync once at start of a batch; skip for subsequent ops in same batch
-};
-
-SyncMode global_sync_mode() {
-    static SyncMode mode = [] {
-        auto* v = std::getenv("MCCL_SYNC_MODE");
-        if (v) {
-            std::string s(v);
-            if (s == "coalesced" || s == "fast") return SyncMode::COALESCED;
+// MCCL_SYNC_MODE=coalesced was removed: it skipped the per-bucket MPS sync after
+// the first collective on a thread, reading stale gradients and corrupting DDP.
+// MCCL_ALLREDUCE_ALGO was dead code and is also removed.
+void warn_removed_env_knobs() {
+    static bool warned = [] {
+        if (auto* v = std::getenv("MCCL_SYNC_MODE")) {
+            if (std::string(v) == "coalesced" || std::string(v) == "fast") {
+                MCCL_WARN("MCCL_SYNC_MODE=%s is no longer supported (it corrupted "
+                          "DDP gradients); MCCL always syncs per collective", v);
+            }
         }
-        // Default FULL: DDP gradient bucketing issues many allreduce calls per
-        // backward; each must wait for that bucket's GPU work.  COALESCED skips
-        // sync after the first op in a thread, which reads stale grads and
-        // corrupts wire traffic (broken pipe on rank 2+ buckets).
-        // Use MCCL_SYNC_MODE=coalesced only with a single batched collective
-        // (e.g. one manual allreduce_coalesced), not with DDP hooks.
-        return SyncMode::FULL;
+        if (std::getenv("MCCL_ALLREDUCE_ALGO")) {
+            MCCL_WARN("MCCL_ALLREDUCE_ALGO is ignored; use MCCL_RING_ALGO=basic|chunked");
+        }
+        return true;
     }();
-    return mode;
+    (void)warned;
 }
-
-// world_size >= 3, nbytes > small_msg_threshold: large messages use plain ring unless
-// MCCL_RING_ALGO=chunked|ring_chunked|fast (see use_chunked_ring_default()).
-inline bool use_chunked_ring_for_large_allreduce() {
-    static bool chunked = [] {
-        auto* v = std::getenv("MCCL_ALLREDUCE_ALGO");
-        return v && std::string(v) == "ring_chunked";
-    }();
-    return chunked;
-}
-
-thread_local bool tl_sync_done = false;
 
 bool use_chunked_ring_default() {
     static bool enabled = [] {
         auto* v = std::getenv("MCCL_RING_ALGO");
-        // Unset: plain ring (allreduce_ring). Opt in: MCCL_RING_ALGO=chunked|ring_chunked|fast.
-        if (!v) return false;
+        // Default: Gloo-style double-buffered chunked ring (better bandwidth
+        // utilization). Opt out with MCCL_RING_ALGO=basic|ring.
+        if (!v) return true;
         std::string s(v);
-        return (s == "chunked" || s == "ring_chunked" || s == "fast");
+        if (s == "basic" || s == "ring" || s == "plain") return false;
+        return true;
     }();
     return enabled;
+}
+
+// Kernel-fence pattern for the Metal reduce path (used by the ring and
+// reduce_scatter loops): metal_reduce_op() commits its compute command buffer
+// without waiting, so a chunk it touched must not be staged for a network
+// send (or overwritten by incoming data) until its kernel completes.  The
+// MCCL command queue is serial, so signaling the shared event after a kernel
+// and waiting on that value also fences all earlier kernels.
+
+// MCCL_RING_PIPELINE: streaming TX/RX ring pipeline (default on).  Set 0 to
+// fall back to the lock-step per-step ring (debug escape hatch).
+inline bool ring_pipeline_enabled() {
+    static bool enabled = [] {
+        auto* v = std::getenv("MCCL_RING_PIPELINE");
+        if (!v) return true;
+        std::string s(v);
+        return !(s == "0" || s == "false" || s == "no" || s == "off");
+    }();
+    return enabled;
+}
+
+// In-flight posted-receive depth for the RX side of ring pipelines.
+inline int ring_pipeline_depth() {
+    static int depth = [] {
+        auto* v = std::getenv("MCCL_PIPELINE_DEPTH");
+        long n = v ? std::atol(v) : 2;
+        return static_cast<int>(std::min(8L, std::max(1L, n)));
+    }();
+    return depth;
+}
+
+// ── Streaming ring pipeline ──────────────────────────────────────────
+//
+// NCCL-style execution of a ring schedule: a TX thread streams chunks to the
+// right neighbor while the RX loop (caller thread) receives from the left
+// and reduces/stores, with `depth` receives posted ahead.  Both directions
+// of every link stay busy for the whole collective; reductions overlap both.
+//
+// Gating: the chunk sent at global step g is the chunk received at global
+// step g - lookahead (verified schedules: lookahead 2 for the 2P chunked
+// ring, 1 for the plain ring / reduce_scatter / allgather).  The first
+// `lookahead` sends are the rank's own (already-ready) data.  RX opens
+// send-gate g+lookahead after finishing recv-step g, passing along the
+// Metal fence value the TX side must wait on before staging.
+
+enum class RingRecvKind : uint8_t {
+    REDUCE,       // accumulate into chunk via vDSP/Metal (reduce-scatter phase)
+    COPY,         // incoming bytes ARE the final chunk data (allgather phase)
+};
+
+struct RingStep {
+    int send_idx;        // chunk index to send this step (-1 = no send)
+    int recv_idx;        // chunk index receiving this step (-1 = no recv)
+    uint32_t send_tid;
+    uint32_t recv_tid;
+    RingRecvKind kind;
+};
+
+struct RingGates {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<uint8_t> open;
+    std::vector<uint64_t> fence;   // MCCL fence value TX waits on (0 = none)
+    bool failed = false;
+
+    explicit RingGates(size_t n) : open(n, 0), fence(n, 0) {}
+
+    void open_gate(size_t g, uint64_t fence_val) {
+        if (g >= open.size()) return;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            open[g] = 1;
+            fence[g] = fence_val;
+        }
+        cv.notify_all();
+    }
+    void fail() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            failed = true;
+        }
+        cv.notify_all();
+    }
+    bool wait_gate(size_t g, uint64_t* fence_val) {
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait(lock, [&] { return failed || open[g]; });
+        if (failed) return false;
+        *fence_val = fence[g];
+        return true;
+    }
+};
+
+struct RingPipelineCtx {
+    Transport* transport;
+    Watchdog* watchdog;
+    Metrics* metrics;
+    uint32_t seq;
+    int left;
+    int right;
+    OpType wire_op;
+    c10d::ReduceOp::RedOpType red_op;
+    bool use_cpu;   // fp32 vDSP reduce directly in unified memory
+};
+
+void run_ring_pipeline(const RingPipelineCtx& ctx,
+                       std::vector<at::Tensor>& chunks,
+                       const std::vector<RingStep>& plan,
+                       int lookahead) {
+    const size_t nsteps = plan.size();
+    if (nsteps == 0) return;
+
+    const bool use_event_fence = !ctx.use_cpu && event_sync_available();
+    std::vector<uint64_t> chunk_pending(chunks.size(), 0);
+
+    RingGates gates(nsteps);
+    for (int g = 0; g < lookahead && g < static_cast<int>(nsteps); ++g) {
+        gates.open_gate(static_cast<size_t>(g), 0);
+    }
+
+    auto chunk_bytes = [&](int idx) -> size_t {
+        return static_cast<size_t>(chunks[idx].numel()) * chunks[idx].element_size();
+    };
+
+    // ── TX: stream chunks to the right neighbor in schedule order ──
+    std::exception_ptr tx_error;
+    std::thread tx([&] {
+        try {
+            // Caller-owned staging for the private-storage fallback so
+            // concurrent collectives never share the global StagingPool.
+            std::unique_ptr<PooledBuffer> tx_staging;
+            size_t tx_staging_size = 0;
+
+            for (size_t g = 0; g < nsteps; ++g) {
+                const RingStep& st = plan[g];
+                if (st.send_idx < 0) continue;
+                size_t send_bytes = chunk_bytes(st.send_idx);
+                if (send_bytes == 0) continue;
+
+                uint64_t fence_val = 0;
+                if (!gates.wait_gate(g, &fence_val)) return;  // RX failed
+                if (fence_val > 0) wait_for_mccl_fence(fence_val);
+
+                ctx.watchdog->touch(ctx.seq);
+
+                at::Tensor& send_chunk = chunks[st.send_idx];
+                MPSBufferView view = extract_mps_buffer(send_chunk);
+                const void* src = nullptr;
+                if (view.cpu_accessible && view.cpu_ptr) {
+                    src = view.cpu_ptr;  // zero-copy from unified memory
+                } else {
+                    if (!tx_staging || tx_staging_size < send_bytes) {
+                        tx_staging = std::make_unique<PooledBuffer>(
+                            staging_memory_pool(), send_bytes);
+                        tx_staging_size = send_bytes;
+                    }
+                    blit_tensor_to_buffer(send_chunk, tx_staging->data());
+                    src = tx_staging->data();
+                }
+
+                MCCL_CHECK(ctx.transport->send_chunks(
+                               ctx.right, ctx.wire_op, ctx.seq, st.send_tid,
+                               src, send_bytes),
+                           "ring pipeline send step " + std::to_string(g) +
+                           " (seq=" + std::to_string(ctx.seq) + ") failed");
+                ctx.metrics->record_transport_bytes(send_bytes, true);
+            }
+        } catch (...) {
+            tx_error = std::current_exception();
+            // Unblock the RX side: its posted receives will never be matched
+            // consistently once our sends stopped.
+            ctx.transport->cancel_recvs(ctx.seq, "ring pipeline TX failed");
+        }
+    });
+
+    // ── RX: post `depth` receives ahead; reduce/store; open send gates ──
+    const int depth = ring_pipeline_depth();
+    std::vector<std::unique_ptr<PooledBuffer>> scratch(depth);
+    std::vector<size_t> scratch_size(depth, 0);
+    std::vector<RecvTicket> tickets(nsteps);
+    std::vector<void*> recv_dst(nsteps, nullptr);
+    std::vector<uint8_t> recv_inplace(nsteps, 0);
+
+    std::exception_ptr rx_error;
+    try {
+        auto post_step = [&](size_t g) {
+            const RingStep& st = plan[g];
+            if (st.recv_idx < 0) return;
+            size_t rbytes = chunk_bytes(st.recv_idx);
+            if (rbytes == 0) return;
+
+            void* dst = nullptr;
+            if (st.kind == RingRecvKind::COPY) {
+                // The incoming bytes are final data for this chunk.  Fence
+                // any reduce kernel still pending on it BEFORE the reader
+                // thread may write, then receive zero-copy into unified
+                // memory.
+                if (chunk_pending[st.recv_idx]) {
+                    wait_for_mccl_fence(chunk_pending[st.recv_idx]);
+                    chunk_pending[st.recv_idx] = 0;
+                }
+                MPSBufferView view = extract_mps_buffer(chunks[st.recv_idx]);
+                if (view.cpu_accessible && view.cpu_ptr) {
+                    dst = view.cpu_ptr;
+                    recv_inplace[g] = 1;
+                }
+            }
+            if (!dst) {
+                int slot = static_cast<int>(g) % depth;
+                if (!scratch[slot] || scratch_size[slot] < rbytes) {
+                    scratch[slot] = std::make_unique<PooledBuffer>(
+                        staging_memory_pool(), rbytes);
+                    scratch_size[slot] = rbytes;
+                }
+                dst = scratch[slot]->data();
+            }
+            recv_dst[g] = dst;
+            tickets[g] = ctx.transport->post_recv(
+                ctx.left, ctx.wire_op, ctx.seq, st.recv_tid, dst, rbytes);
+        };
+
+        size_t next_post = 0;
+        for (; next_post < nsteps && next_post < static_cast<size_t>(depth);
+             ++next_post) {
+            post_step(next_post);
+        }
+
+        for (size_t g = 0; g < nsteps; ++g) {
+            const RingStep& st = plan[g];
+            uint64_t gate_fence = 0;
+
+            if (st.recv_idx >= 0 && chunk_bytes(st.recv_idx) > 0) {
+                size_t rbytes = chunk_bytes(st.recv_idx);
+                ctx.watchdog->touch(ctx.seq);
+                MCCL_CHECK(tickets[g] && ctx.transport->wait_recv(tickets[g]),
+                           "ring pipeline recv step " + std::to_string(g) +
+                           " (seq=" + std::to_string(ctx.seq) + ") failed");
+                ctx.metrics->record_transport_bytes(rbytes, false);
+
+                at::Tensor& rchunk = chunks[st.recv_idx];
+                if (st.kind == RingRecvKind::REDUCE) {
+                    if (ctx.use_cpu) {
+                        MPSBufferView view = extract_mps_buffer(rchunk);
+                        cpu_reduce_op(static_cast<float*>(view.cpu_ptr),
+                                      static_cast<const float*>(recv_dst[g]),
+                                      rchunk.numel(), ctx.red_op);
+                    } else {
+                        at::Tensor incoming = torch::empty_like(rchunk);
+                        unstage_from_recv(incoming, recv_dst[g], rbytes);
+                        metal_reduce_op(rchunk, incoming, ctx.red_op);
+                        if (use_event_fence) {
+                            uint64_t v = next_event_value();
+                            signal_mccl_fence_gpu(v);
+                            chunk_pending[st.recv_idx] = v;
+                            gate_fence = v;
+                        } else {
+                            metal_sync_queue_only();
+                        }
+                    }
+                } else {
+                    if (!recv_inplace[g]) {
+                        // Private-storage fallback: blit caller-owned scratch
+                        // into place (never the shared StagingPool).
+                        blit_buffer_to_tensor(recv_dst[g], rchunk);
+                    }
+                }
+            }
+
+            gates.open_gate(g + static_cast<size_t>(lookahead), gate_fence);
+
+            if (next_post < nsteps) {
+                post_step(next_post);
+                ++next_post;
+            }
+        }
+    } catch (...) {
+        rx_error = std::current_exception();
+        gates.fail();
+    }
+
+    tx.join();
+    if (rx_error) std::rethrow_exception(rx_error);
+    if (tx_error) std::rethrow_exception(tx_error);
 }
 
 // MCCL_FP32_CPU_REDUCE: unset = Metal/staging for float32 (default, fewer full syncs).
@@ -86,33 +356,11 @@ inline bool prefer_cpu_unified_buffer_path(const at::Tensor& tensor) {
 // Non-blocking: encode signal + commit, return event value (0 = already synced).
 // The engine thread must call wait_for_mps(val) before reading tensor data.
 inline uint64_t sync_mps_nonblocking(bool overlap) {
-    if (global_sync_mode() == SyncMode::COALESCED && tl_sync_done) {
-        return 0;
-    }
-    uint64_t val = 0;
     if (overlap) {
-        val = mps_event_sync_nonblocking();
-    } else {
-        mps_stream_sync();
+        return mps_event_sync_nonblocking();
     }
-    tl_sync_done = true;
-    return val;
-}
-
-// Blocking: for callers that don't defer the wait to an engine thread.
-// DEPRECATED: Use commit_mps_and_signal + deferred wait_for_mps in engine for better overlap.
-inline void sync_mps_for_collective(bool overlap) {
-    if (overlap && event_sync_available()) {
-        uint64_t val = next_event_value();
-        commit_mps_and_signal(val);
-        wait_for_mps(val);
-    } else {
-        mps_stream_sync();
-    }
-}
-
-inline void reset_sync_state() {
-    tl_sync_done = false;
+    mps_stream_sync();
+    return 0;
 }
 
 } // anonymous namespace
@@ -129,6 +377,7 @@ ProcessGroupMCCL::ProcessGroupMCCL(
       timeout_(timeout) {
 
     refresh_log_level();
+    warn_removed_env_knobs();
     MCCL_INFO("ProcessGroupMCCL creating: rank=%d world_size=%d timeout=%lldms",
               rank, world_size, (long long)timeout.count());
 
@@ -163,11 +412,23 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     size_t queue_depth = 1024;
     if (auto* v = std::getenv("MCCL_MAX_QUEUE_DEPTH"))
         queue_depth = static_cast<size_t>(std::atoll(v));
-    
+
     // Create reduce engine
     reduce_engine_ = std::make_unique<ProgressEngine>(queue_depth, metrics_.get());
     reduce_engine_->start();
-    
+
+    // Collective executor pool for ws>=3 ring collectives: k workers start
+    // collectives in seq order but run them concurrently (bucket overlap).
+    int coll_threads = 2;
+    if (auto* v = std::getenv("MCCL_COLLECTIVE_CONCURRENCY")) {
+        coll_threads = static_cast<int>(std::min(4L, std::max(1L, std::atol(v))));
+    }
+    if (world_size >= 3) {
+        collective_pool_ = std::make_unique<ProgressEngine>(
+            queue_depth, metrics_.get(), coll_threads);
+        collective_pool_->start();
+    }
+
     // Create net engines (one per peer rank, excluding self)
     net_engines_.resize(world_size);
     for (int i = 0; i < world_size; i++) {
@@ -189,18 +450,21 @@ ProcessGroupMCCL::ProcessGroupMCCL(
 
     init_transport();
 
-    auto hb_interval = transport_->config().heartbeat_interval;
-    health_ = std::make_unique<HealthMonitor>(
-        transport_.get(),
-        hb_interval,
-        [this](int peer) { on_peer_death(peer); });
-    health_->start();
+    if (transport_) {
+        auto hb_interval = transport_->config().heartbeat_interval;
+        health_ = std::make_unique<HealthMonitor>(
+            transport_.get(),
+            hb_interval,
+            [this](int peer) { on_peer_death(peer); });
+        health_->start();
+    }
 
     // ── Config dump ───────────────────────────────────────────────
     MCCL_INFO("=== MCCL Config (rank %d) ===", rank);
     MCCL_INFO("  world_size          = %d", world_size);
     MCCL_INFO("  timeout_ms          = %lld", (long long)timeout.count());
     MCCL_INFO("  watchdog_timeout_ms = %lld", (long long)wd_timeout.count());
+    if (transport_) {
     MCCL_INFO("  transport           = %s", transport_->config().transport.c_str());
     MCCL_INFO("  listen_addr         = %s", transport_->config().listen_addr.c_str());
     MCCL_INFO("  port_base           = %u", (unsigned)transport_->config().port_base);
@@ -209,7 +473,10 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     MCCL_INFO("  chunk_bytes         = %zu", transport_->config().chunk_bytes);
     MCCL_INFO("  small_msg_threshold = %zu", transport_->config().small_msg_threshold);
     MCCL_INFO("  connect_timeout_ms  = %lld", (long long)transport_->config().connect_timeout.count());
-    MCCL_INFO("  heartbeat_ms        = %lld", (long long)hb_interval.count());
+    MCCL_INFO("  heartbeat_ms        = %lld", (long long)transport_->config().heartbeat_interval.count());
+    } else {
+    MCCL_INFO("  transport           = none (world_size == 1)");
+    }
     MCCL_INFO("  max_queue_depth     = %zu", queue_depth);
     {
         const char* crc_env = std::getenv("MCCL_TRANSPORT_CRC");
@@ -232,10 +499,13 @@ ProcessGroupMCCL::ProcessGroupMCCL(
                    es_off ? "off (env)" :
                    event_sync_available() ? "on" : "off (unavailable)");
     }
-    MCCL_INFO("  sync_mode           = %s",
-              global_sync_mode() == SyncMode::COALESCED ? "coalesced" : "full");
     MCCL_INFO("  ring_algo           = %s",
               use_chunked_ring_default() ? "chunked" : "basic");
+    MCCL_INFO("  ring_pipeline       = %s (depth=%d)",
+              ring_pipeline_enabled() ? "on" : "off (lock-step)",
+              ring_pipeline_depth());
+    MCCL_INFO("  collective_pool     = %s",
+              collective_pool_ ? "on" : "off (ws<3)");
     MCCL_INFO("  compression         = %s", compressor_ ? compressor_->name().c_str() : "none");
     if (compressor_ && comp_mode == CompressionMode::TOPK) {
         MCCL_INFO("  topk_ratio          = %.4f", topk_ratio);
@@ -263,6 +533,7 @@ ProcessGroupMCCL::~ProcessGroupMCCL() {
         metrics_->log_summary();
         if (health_) health_->stop();
         if (watchdog_) watchdog_->stop();
+        if (collective_pool_) collective_pool_->stop();
         if (reduce_engine_) reduce_engine_->stop();
         for (auto& engine : net_engines_) {
             if (engine) engine->stop();
@@ -276,6 +547,14 @@ ProcessGroupMCCL::~ProcessGroupMCCL() {
 }
 
 void ProcessGroupMCCL::init_transport() {
+    if (getSize() == 1) {
+        // Single-rank group: every collective is a local no-op/copy; there is
+        // no peer to talk to and TcpTransport requires world_size >= 2.
+        MCCL_INFO("Rank %d: world_size == 1, transport disabled", getRank());
+        transport_initialized_ = true;
+        return;
+    }
+
     TransportConfig cfg = TransportConfig::from_env();
     warn_if_mccl_port_overlaps_master(cfg);
 
@@ -350,11 +629,58 @@ at::Tensor ProcessGroupMCCL::ensure_contiguous(const at::Tensor& tensor) {
     return tensor.contiguous();
 }
 
+namespace {
+
+// Collectives that write results in place must receive contiguous tensors.
+// Silently cloning (the old behavior) would write results into the clone and
+// drop them: the caller's tensor would never be updated.  Match NCCL and
+// reject loudly instead.
+void require_contiguous_output(const at::Tensor& tensor, const char* op_name) {
+    MCCL_CHECK_TENSOR(tensor.is_contiguous(),
+                      std::string("MCCL ") + op_name +
+                      " writes results in place and requires a contiguous tensor. "
+                      "Call .contiguous() and copy the result back yourself.");
+}
+
+// Reductions only support float dtypes (CPU vDSP + Metal kernels).  Reject at
+// validation time instead of throwing from an engine thread mid-collective.
+void require_reduce_dtype(const at::Tensor& tensor, const char* op_name) {
+    auto dtype = tensor.scalar_type();
+    MCCL_CHECK_TENSOR(
+        dtype == at::kFloat || dtype == at::kHalf || dtype == at::kBFloat16,
+        std::string("MCCL ") + op_name +
+        " supports float32/float16/bfloat16 only, got: " +
+        std::string(at::toString(dtype)));
+}
+
+} // anonymous namespace
+
+c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::make_completed_work(
+    c10d::OpType op_type, const std::vector<at::Tensor>& tensors) {
+    uint32_t seq = collective_seq_.fetch_add(1);
+    auto work = c10::make_intrusive<WorkMCCL>(op_type, seq, tensors);
+    work->markComplete();
+    return work;
+}
+
 // TODO: compressed_send/compressed_recv use the legacy serial transport path
 // (blocking stage_for_send with internal mps_sync, serial send_chunks/recv_chunks).
 // When compression is enabled, the overlapped transport and nosync staging are
 // bypassed. A future optimization would integrate compression with the
 // send_recv_overlap path.
+
+namespace {
+
+// Stable per-tensor identity for stateful compression (TopK error feedback).
+// Uses the original tensor's storage address + offset, which is stable across
+// steps for DDP gradient buckets — NOT the staging-buffer address, which is
+// shared between tensors.
+inline uint64_t compression_stable_id(const at::Tensor& tensor) {
+    return reinterpret_cast<uint64_t>(tensor.storage().data()) +
+           static_cast<uint64_t>(tensor.storage_offset()) * tensor.element_size();
+}
+
+} // anonymous namespace
 
 void ProcessGroupMCCL::compressed_send(int peer, OpType op, uint32_t seq,
                                        uint32_t tid, const at::Tensor& tensor) {
@@ -366,27 +692,24 @@ void ProcessGroupMCCL::compressed_send(int peer, OpType op, uint32_t seq,
 
     if (compressor_) {
         size_t max_comp = compressor_->max_compressed_size(staged.nbytes);
-        size_t max_wire = sizeof(uint32_t) + max_comp;
-        PooledBuffer comp_buf(staging_memory_pool(), max_wire);
+        PooledBuffer comp_buf(staging_memory_pool(), max_comp);
 
         size_t comp_size = compressor_->compress(
             staged.data, staged.nbytes,
-            static_cast<uint8_t*>(comp_buf.data()) + sizeof(uint32_t),
-            max_comp, tensor.scalar_type());
+            comp_buf.data(), max_comp, tensor.scalar_type(),
+            compression_stable_id(tensor));
 
+        // Two messages: a 4-byte size header, then EXACTLY comp_size bytes.
+        // (Padding to max_compressed_size — the old scheme — transmitted the
+        // full worst case regardless of ratio, negating TopK's savings.)
         uint32_t wire_size = static_cast<uint32_t>(comp_size);
-        memcpy(comp_buf.data(), &wire_size, sizeof(uint32_t));
-
-        // Zero-pad to max_wire so receiver gets the exact byte count it expects.
-        // The size prefix tells the receiver how many bytes are real payload.
-        if (comp_size < max_comp) {
-            memset(static_cast<uint8_t*>(comp_buf.data()) + sizeof(uint32_t) + comp_size,
-                   0, max_comp - comp_size);
-        }
-
-        MCCL_CHECK(transport_->send_chunks(peer, op, seq, tid, comp_buf.data(), max_wire),
+        MCCL_CHECK(transport_->send_chunks(peer, op, seq, tid,
+                                           &wire_size, sizeof(wire_size)),
+                   "compressed_send size header failed");
+        MCCL_CHECK(transport_->send_chunks(peer, op, seq, tid,
+                                           comp_buf.data(), comp_size),
                    "compressed_send send_chunks failed");
-        metrics_->record_transport_bytes(max_wire, true);
+        metrics_->record_transport_bytes(sizeof(wire_size) + comp_size, true);
     } else {
         MCCL_CHECK(transport_->send_chunks(peer, op, seq, tid, staged.data, staged.nbytes),
                    "compressed_send send_chunks (uncompressed) failed");
@@ -404,23 +727,26 @@ void ProcessGroupMCCL::compressed_recv(int peer, OpType op, uint32_t seq,
 
     if (compressor_) {
         size_t max_comp = compressor_->max_compressed_size(nbytes);
-        size_t max_wire = sizeof(uint32_t) + max_comp;
-        PooledBuffer comp_buf(staging_memory_pool(), max_wire);
-        MCCL_CHECK(transport_->recv_chunks(peer, op, seq, tid, comp_buf.data(), max_wire),
-                   "compressed_recv recv_chunks failed");
 
-        uint32_t actual_comp_size;
-        memcpy(&actual_comp_size, comp_buf.data(), sizeof(uint32_t));
-        MCCL_CHECK(actual_comp_size <= max_comp,
-                   "Compressed payload larger than max_compressed_size");
+        uint32_t wire_size = 0;
+        MCCL_CHECK(transport_->recv_chunks(peer, op, seq, tid,
+                                           &wire_size, sizeof(wire_size)),
+                   "compressed_recv size header failed");
+        MCCL_CHECK(wire_size > 0 && wire_size <= max_comp,
+                   "Compressed payload size " + std::to_string(wire_size) +
+                   " out of range (max " + std::to_string(max_comp) + ")");
+
+        PooledBuffer comp_buf(staging_memory_pool(), wire_size);
+        MCCL_CHECK(transport_->recv_chunks(peer, op, seq, tid,
+                                           comp_buf.data(), wire_size),
+                   "compressed_recv recv_chunks failed");
 
         PooledBuffer decomp_buf(staging_memory_pool(), nbytes);
         compressor_->decompress(
-            static_cast<uint8_t*>(comp_buf.data()) + sizeof(uint32_t),
-            actual_comp_size, decomp_buf.data(), nbytes,
+            comp_buf.data(), wire_size, decomp_buf.data(), nbytes,
             tensor.scalar_type());
         unstage_from_recv(tensor, decomp_buf.data(), nbytes);
-        metrics_->record_transport_bytes(max_wire, false);
+        metrics_->record_transport_bytes(sizeof(wire_size) + wire_size, false);
     } else {
         PooledBuffer recv_buf(staging_memory_pool(), nbytes);
         MCCL_CHECK(transport_->recv_chunks(peer, op, seq, tid, recv_buf.data(), nbytes),
@@ -444,8 +770,14 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     MCCL_CHECK_TENSOR(tensor.is_mps(),
                       "MCCL requires MPS tensors");
 
-    tensor = ensure_contiguous(tensor);
+    require_contiguous_output(tensor, "allreduce");
     check_single_tensor(tensor);
+    require_reduce_dtype(tensor, "allreduce");
+    if (tensor.numel() == 0 || getSize() == 1) {
+        // Zero elements, or single rank (reduction of one contribution is
+        // the identity for SUM/AVG/MIN/MAX/PRODUCT): nothing to do.
+        return make_completed_work(c10d::OpType::ALLREDUCE, tensors);
+    }
 
     uint32_t seq = collective_seq_.fetch_add(1);
     auto work = c10::make_intrusive<WorkMCCL>(
@@ -490,6 +822,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
             net_engine_for(peer).submit(
                 [this, tensor_copy, seq, red_op, sync_val, defer_mps_sync_to_engine,
                  peer, nbytes, shared_recv_buf]() mutable {
+                    watchdog_->touch(seq);  // clock starts at execution, not submission
                     if (defer_mps_sync_to_engine) {
                         if (overlap_comm_ && event_sync_available()) {
                             uint64_t v = next_event_value();
@@ -520,6 +853,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 [this, tensor_copy, seq, red_op, nbytes, shared_recv_buf, work_ptr]() mutable {
                     reduce_engine_->submit(
                         [this, tensor_copy, seq, red_op, nbytes, shared_recv_buf]() mutable {
+                            watchdog_->touch(seq);  // re-arm for the reduce phase
                             auto red_t0 = std::chrono::steady_clock::now();
                             bool cpu_ok = prefer_cpu_unified_buffer_path(tensor_copy);
                             int64_t count = tensor_copy.numel();
@@ -580,6 +914,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
             // must use net_engine to avoid concurrent socket access with large ops)
             net_engine_for(peer).submit(
                 [this, tensor_copy, seq, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
+                    watchdog_->touch(seq);
                     if (defer_mps_sync_to_engine) {
                         if (overlap_comm_ && event_sync_available()) {
                             uint64_t v = next_event_value();
@@ -610,13 +945,15 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
             );
         }
     } else {
-        // ── 3+ ranks: ring algorithms on reduce_engine ──
-        // PERFORMANCE NOTE: All 3+ rank collectives execute serially on reduce_engine_,
-        // limiting concurrency. DDP issues many small allreduces which queue up.
-        // Consider: larger PyTorch buckets, higher MCCL_SMALL_MSG_THRESHOLD, or
-        // per-peer engines for ring (TODO ~1427) to improve scaling.
-        reduce_engine_->submit(
+        // ── 3+ ranks: ring algorithms on the collective executor pool ──
+        // Pool workers dequeue FIFO (collectives START in seq order on every
+        // rank, keeping schedules aligned) but run concurrently, so bucket
+        // N+1's pipeline overlaps bucket N's on the wire.  The demultiplexed
+        // transport routes the interleaved traffic by (seq, tid).
+        // Small messages stay latency-optimal via the recursive-doubling tree.
+        collective_pool_->submit(
             [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
+                watchdog_->touch(seq);
                 if (defer_mps_sync_to_engine) {
                     if (overlap_comm_ && event_sync_available()) {
                         uint64_t v = next_event_value();
@@ -628,13 +965,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 } else if (sync_val > 0) {
                     wait_for_mps(sync_val);
                 }
-                // Algorithm selection for 3+ ranks.
-                // Small messages: star topology; large messages: ring topology.
-                // Default (no MCCL_RING_ALGO): plain ring. Set MCCL_RING_ALGO=chunked|ring_chunked|fast
-                // for Gloo-style double-buffered ring (see use_chunked_ring_default()).
                 const char* algo = "unknown";
                 if (nbytes <= transport_->config().small_msg_threshold) {
-                    algo = "small";
+                    algo = "tree_small";
                     allreduce_small(tensor_copy, seq, red_op);
                 } else {
                     if (use_chunked_ring_default()) {
@@ -678,7 +1011,12 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
     flat_inputs.reserve(tensors.size());
     for (auto& t : tensors) {
         MCCL_CHECK_TENSOR(t.is_mps(), "MCCL requires MPS tensors");
+        require_reduce_dtype(t, "allreduce_coalesced");
+        if (t.numel() == 0) continue;
         flat_inputs.push_back(t.flatten());
+    }
+    if (flat_inputs.empty() || getSize() == 1) {
+        return make_completed_work(c10d::OpType::ALLREDUCE, tensors);
     }
     at::Tensor flat = at::cat(flat_inputs, 0);
 
@@ -703,8 +1041,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
     auto tensors_copy = tensors;
     auto flat_copy = flat;
 
-    reduce_engine_->submit(
+    ProgressEngine& coalesced_engine =
+        (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
+    coalesced_engine.submit(
         [this, flat_copy, tensors_copy, seq, ws, nbytes, red_op, sync_val]() mutable {
+            watchdog_->touch(seq);
             if (sync_val > 0) wait_for_mps(sync_val);
             if (ws == 2) {
                 allreduce_two_rank(flat_copy, seq, red_op);
@@ -770,12 +1111,22 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
             MPSBufferView view = extract_mps_buffer(tensor);
             float* base = static_cast<float*>(view.cpu_ptr);
 
-            size_t half = nbytes / 2;
-            size_t my_off  = rank * half;
-            size_t peer_off = peer * half;
-            int64_t half_count = static_cast<int64_t>(half / sizeof(float));
+            // Split on ELEMENT boundaries.  A raw byte split (nbytes / 2) is
+            // misaligned for odd element counts: the second half would start
+            // mid-float and the boundary element would be reduced by neither
+            // rank, splicing garbage into the result.
+            int64_t half_count = count / 2;
+            // Rank 0 owns [0, half_count); rank 1 owns [half_count, count).
+            int64_t my_count   = (rank == 0) ? half_count : (count - half_count);
+            int64_t peer_count = count - my_count;
+            size_t my_off   = (rank == 0) ? 0 : static_cast<size_t>(half_count) * sizeof(float);
+            size_t peer_off = (rank == 0) ? static_cast<size_t>(half_count) * sizeof(float) : 0;
+            size_t my_len   = static_cast<size_t>(my_count) * sizeof(float);
+            size_t peer_len = static_cast<size_t>(peer_count) * sizeof(float);
 
-            size_t nchunks = (half + REDUCE_CHUNK - 1) / REDUCE_CHUNK;
+            // Chunk counts per region (regions may differ by one element).
+            size_t send_nchunks = (peer_len + REDUCE_CHUNK - 1) / REDUCE_CHUNK;
+            size_t recv_nchunks = (my_len + REDUCE_CHUNK - 1) / REDUCE_CHUNK;
             PooledBuffer recv_buf(staging_memory_pool(), REDUCE_CHUNK);
 
             auto net_t0 = std::chrono::steady_clock::now();
@@ -786,9 +1137,9 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
             std::atomic<bool> send_ok{false};
             std::thread send_thread([&]() {
                 bool ok = true;
-                for (size_t c = 0; c < nchunks && ok; ++c) {
+                for (size_t c = 0; c < send_nchunks && ok; ++c) {
                     size_t off = c * REDUCE_CHUNK;
-                    size_t len = std::min(REDUCE_CHUNK, half - off);
+                    size_t len = std::min(REDUCE_CHUNK, peer_len - off);
                     uint32_t tid = static_cast<uint32_t>(c + 1);
                     ok = transport_->send_chunks(
                         peer, OpType::ALLREDUCE, seq, tid,
@@ -797,41 +1148,53 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
                 send_ok.store(ok, std::memory_order_release);
             });
 
-            for (size_t c = 0; c < nchunks; ++c) {
-                size_t off = c * REDUCE_CHUNK;
-                size_t len = std::min(REDUCE_CHUNK, half - off);
-                int64_t chunk_count = static_cast<int64_t>(len / sizeof(float));
-                uint32_t tid = static_cast<uint32_t>(c + 1);
+            // recv_chunks/MCCL_CHECK can throw; unwinding past a joinable
+            // std::thread calls std::terminate and kills the process.
+            // Catch, join, then rethrow.
+            std::exception_ptr recv_ex;
+            try {
+                for (size_t c = 0; c < recv_nchunks; ++c) {
+                    watchdog_->touch(seq);  // per-chunk progress re-arms the deadline
+                    size_t off = c * REDUCE_CHUNK;
+                    size_t len = std::min(REDUCE_CHUNK, my_len - off);
+                    int64_t chunk_count = static_cast<int64_t>(len / sizeof(float));
+                    uint32_t tid = static_cast<uint32_t>(c + 1);
 
-                MCCL_CHECK(transport_->recv_chunks(
-                    peer, OpType::ALLREDUCE, seq, tid,
-                    recv_buf.data(), len),
-                    "allreduce_two_rank RS recv chunk failed");
+                    MCCL_CHECK(transport_->recv_chunks(
+                        peer, OpType::ALLREDUCE, seq, tid,
+                        recv_buf.data(), len),
+                        "allreduce_two_rank RS recv chunk failed");
 
-                auto rc0 = std::chrono::steady_clock::now();
-                float* chunk_dst = base + (my_off + off) / sizeof(float);
-                const float* chunk_src = static_cast<const float*>(recv_buf.data());
-                if (op == c10d::ReduceOp::AVG) {
-                    cpu_accumulate_and_scale(chunk_dst, chunk_src, chunk_count, 0.5f);
-                } else {
-                    cpu_reduce_op(chunk_dst, chunk_src, chunk_count, op);
+                    auto rc0 = std::chrono::steady_clock::now();
+                    float* chunk_dst = base + my_off / sizeof(float) + off / sizeof(float);
+                    const float* chunk_src = static_cast<const float*>(recv_buf.data());
+                    if (op == c10d::ReduceOp::AVG) {
+                        cpu_accumulate_and_scale(chunk_dst, chunk_src, chunk_count, 0.5f);
+                    } else {
+                        cpu_reduce_op(chunk_dst, chunk_src, chunk_count, op);
+                    }
+                    auto rc1 = std::chrono::steady_clock::now();
+                    red_ms_accum += std::chrono::duration<double, std::milli>(rc1 - rc0).count();
                 }
-                auto rc1 = std::chrono::steady_clock::now();
-                red_ms_accum += std::chrono::duration<double, std::milli>(rc1 - rc0).count();
+            } catch (...) {
+                recv_ex = std::current_exception();
             }
 
             send_thread.join();
+            if (recv_ex) std::rethrow_exception(recv_ex);
             MCCL_CHECK(send_ok.load(std::memory_order_acquire),
                        "allreduce_two_rank RS send failed");
 
             // ── Phase 2: allgather ──
             // Exchange reduced halves so both ranks have the full result.
-            uint32_t ag_base_tid = static_cast<uint32_t>(nchunks + 1);
+            // tid base must be identical on both ranks: derive it from both
+            // region chunk counts (symmetric on both sides).
+            uint32_t ag_base_tid = static_cast<uint32_t>(send_nchunks + recv_nchunks + 1);
             MCCL_CHECK(transport_->send_recv_overlap(
                 peer, OpType::ALLREDUCE, seq, ag_base_tid,
-                static_cast<const uint8_t*>(view.cpu_ptr) + my_off, half,
+                static_cast<const uint8_t*>(view.cpu_ptr) + my_off, my_len,
                 peer, OpType::ALLREDUCE, seq, ag_base_tid,
-                static_cast<uint8_t*>(view.cpu_ptr) + peer_off, half),
+                static_cast<uint8_t*>(view.cpu_ptr) + peer_off, peer_len),
                 "allreduce_two_rank AG send_recv_overlap failed");
 
             auto net_t1 = std::chrono::steady_clock::now();
@@ -841,7 +1204,7 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
             double gbps = (nbytes * 2.0 * 8.0) / (net_ms / 1000.0) / 1e9;
             MCCL_INFO("allreduce_two_rank(RS+AG): %zu bytes (%zu RS chunks), "
                       "wall=%.1fms (%.2f Gbps), reduce=%.1fms",
-                      nbytes, nchunks, net_ms, gbps, red_ms_accum);
+                      nbytes, recv_nchunks, net_ms, gbps, red_ms_accum);
             metrics_->record_phase(seq, 0, net_ms, red_ms_accum);
         } else {
             // Original path: full send_recv_overlap then reduce.
@@ -940,10 +1303,67 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
         }
     }
 
+    if (ring_pipeline_enabled()) {
+        // Streaming TX/RX pipeline over the same (verified) 2P-chunk
+        // schedule: both link directions and the reduce stay busy
+        // concurrently instead of lock-stepping per step.
+        std::vector<RingStep> plan;
+        plan.reserve(4 * (ws - 1));
+        for (int step = 0; step < 2 * (ws - 1); step++) {
+            RingStep st;
+            st.send_idx = (rank * 2 - step + 2 * ws) % (2 * ws);
+            st.recv_idx = (rank * 2 - step - 2 + 2 * ws) % (2 * ws);
+            st.send_tid = (static_cast<uint32_t>(step) << 16) | st.send_idx;
+            st.recv_tid = (static_cast<uint32_t>(step) << 16) | st.recv_idx;
+            st.kind = RingRecvKind::REDUCE;
+            plan.push_back(st);
+        }
+        for (int step = 0; step < 2 * (ws - 1); step++) {
+            uint32_t ag_step = static_cast<uint32_t>(2 * (ws - 1) + step);
+            RingStep st;
+            st.send_idx = (rank * 2 + 2 - step + 2 * ws) % (2 * ws);
+            st.recv_idx = (rank * 2 - step + 2 * ws) % (2 * ws);
+            st.send_tid = (ag_step << 16) | st.send_idx;
+            st.recv_tid = (ag_step << 16) | st.recv_idx;
+            st.kind = RingRecvKind::COPY;
+            plan.push_back(st);
+        }
+        // After RS, rank r holds reduced chunks {2r+1, 2r+2}: the chunk sent
+        // at global step g is the chunk received at step g-2, so lookahead=2
+        // (the first two sends are the rank's own initial chunks).
+        RingPipelineCtx ctx{transport_.get(), watchdog_.get(), metrics_.get(),
+                            seq, left, right, OpType::ALLREDUCE, op, use_cpu};
+        run_ring_pipeline(ctx, chunks, plan, /*lookahead=*/2);
+    } else {
     PooledBuffer recv_buf_pool(staging_memory_pool(), chunk_elems * elem_size);
+
+    // Per-chunk kernel fences for the Metal reduce path.  metal_reduce_op()
+    // commits without waiting; a chunk it touched must not be staged for a
+    // network send (or overwritten by an incoming allgather chunk) until its
+    // kernel completes.  The MCCL queue is serial, so waiting on a chunk's
+    // event value also fences all kernels committed before it.
+    const bool use_event_fence = !use_cpu && event_sync_available();
+    std::vector<uint64_t> chunk_pending(2 * ws, 0);
+    auto fence_chunk = [&](int idx) {
+        if (use_event_fence && chunk_pending[idx]) {
+            wait_for_mccl_fence(chunk_pending[idx]);
+            chunk_pending[idx] = 0;
+        }
+    };
+    auto arm_chunk = [&](int idx) {
+        if (use_event_fence) {
+            uint64_t v = next_event_value();
+            signal_mccl_fence_gpu(v);
+            chunk_pending[idx] = v;
+        } else if (!use_cpu) {
+            // No event sync available: fall back to a blocking queue drain.
+            metal_sync_queue_only();
+        }
+    };
 
     // ── Phase 1: Reduce-scatter (2*(ws-1) serial steps) ──
     for (int step = 0; step < 2 * (ws - 1); step++) {
+        watchdog_->touch(seq);  // per-step progress re-arms the deadline
         int send_chunk_idx = (rank * 2 - step + 2 * ws) % (2 * ws);
         int recv_chunk_idx = (rank * 2 - step - 2 + 2 * ws) % (2 * ws);
 
@@ -960,6 +1380,7 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
 
         StagingBuffer staged = {nullptr, 0};
         if (send_bytes > 0) {
+            fence_chunk(send_chunk_idx);
             staged = stage_for_send_nosync(send_chunk);
         }
 
@@ -981,6 +1402,7 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
                 at::Tensor incoming = torch::empty_like(recv_chunk);
                 unstage_from_recv(incoming, recv_buf_pool.data(), recv_bytes);
                 metal_reduce_op(recv_chunk, incoming, op);
+                arm_chunk(recv_chunk_idx);
             }
         }
 
@@ -989,9 +1411,16 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
     }
 
     // ── Phase 2: Allgather (2*(ws-1) serial steps) ──
+    // After reduce-scatter, rank r holds the fully reduced chunks
+    // {2r+1, 2r+2}.  Step 0 sends 2r+2, step 1 sends 2r+1, and each
+    // subsequent step forwards the chunk received two steps earlier:
+    // send (2r+2-step), recv (2r-step).  (The previous schedule used
+    // +step, which sent chunks that were never fully reduced and
+    // overwrote reduced ones — silent corruption for ws >= 3.)
     for (int step = 0; step < 2 * (ws - 1); step++) {
-        int send_chunk_idx = (rank * 2 + step + 2 + 2 * ws) % (2 * ws);
-        int recv_chunk_idx = (rank * 2 + step + 2 * ws) % (2 * ws);
+        watchdog_->touch(seq);
+        int send_chunk_idx = (rank * 2 + 2 - step + 2 * ws) % (2 * ws);
+        int recv_chunk_idx = (rank * 2 - step + 2 * ws) % (2 * ws);
 
         at::Tensor& send_chunk = chunks[send_chunk_idx];
         at::Tensor& recv_chunk = chunks[recv_chunk_idx];
@@ -1005,6 +1434,7 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
 
         StagingBuffer staged = {nullptr, 0};
         if (send_bytes > 0) {
+            fence_chunk(send_chunk_idx);
             staged = stage_for_send_nosync(send_chunk);
         }
 
@@ -1016,6 +1446,9 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
             "allreduce_ring_chunked allgather step " + std::to_string(step) + " failed");
 
         if (recv_bytes > 0) {
+            // The incoming chunk replaces local data; make sure no reduce
+            // kernel from the RS phase is still in flight on it.
+            fence_chunk(recv_chunk_idx);
             if (use_cpu) {
                 MPSBufferView chunk_view = extract_mps_buffer(recv_chunk);
                 memcpy(chunk_view.cpu_ptr, recv_buf_pool.data(), recv_bytes);
@@ -1027,6 +1460,7 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
         metrics_->record_transport_bytes(send_bytes, true);
         metrics_->record_transport_bytes(recv_bytes, false);
     }
+    }  // end lock-step fallback
 
     if (use_cpu) {
         if (op == c10d::ReduceOp::AVG) {
@@ -1068,10 +1502,61 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
         }
     }
 
+    if (ring_pipeline_enabled()) {
+        // Streaming TX/RX pipeline over the plain-ring schedule.  The chunk
+        // sent at step g is the chunk received at step g-1: lookahead=1.
+        std::vector<RingStep> plan;
+        plan.reserve(2 * (ws - 1));
+        for (int step = 0; step < ws - 1; step++) {
+            RingStep st;
+            st.send_idx = (rank - step + ws) % ws;
+            st.recv_idx = (rank - step - 1 + ws) % ws;
+            st.send_tid = (static_cast<uint32_t>(step) << 16) | st.send_idx;
+            st.recv_tid = (static_cast<uint32_t>(step) << 16) | st.recv_idx;
+            st.kind = RingRecvKind::REDUCE;
+            plan.push_back(st);
+        }
+        for (int step = 0; step < ws - 1; step++) {
+            uint32_t ag_step = static_cast<uint32_t>(ws - 1 + step);
+            RingStep st;
+            st.send_idx = (rank - step + 1 + ws) % ws;
+            st.recv_idx = (rank - step + ws) % ws;
+            st.send_tid = (ag_step << 16) | st.send_idx;
+            st.recv_tid = (ag_step << 16) | st.recv_idx;
+            st.kind = RingRecvKind::COPY;
+            plan.push_back(st);
+        }
+        RingPipelineCtx ctx{transport_.get(), watchdog_.get(), metrics_.get(),
+                            seq, left, right, OpType::ALLREDUCE, op, use_cpu};
+        run_ring_pipeline(ctx, chunks, plan, /*lookahead=*/1);
+    } else {
     PooledBuffer recv_buf_pool(staging_memory_pool(), chunk_elems * elem_size);
+
+    // Kernel fence for the Metal reduce path (see allreduce_ring_chunked).
+    // In the plain ring the chunk sent at step s+1 is exactly the chunk
+    // reduced at step s, so without this fence the socket can transmit
+    // pre-reduction bytes while the kernel is still in flight.
+    const bool use_event_fence = !use_cpu && event_sync_available();
+    std::vector<uint64_t> chunk_pending(ws, 0);
+    auto fence_chunk = [&](int idx) {
+        if (use_event_fence && chunk_pending[idx]) {
+            wait_for_mccl_fence(chunk_pending[idx]);
+            chunk_pending[idx] = 0;
+        }
+    };
+    auto arm_chunk = [&](int idx) {
+        if (use_event_fence) {
+            uint64_t v = next_event_value();
+            signal_mccl_fence_gpu(v);
+            chunk_pending[idx] = v;
+        } else if (!use_cpu) {
+            metal_sync_queue_only();
+        }
+    };
 
     // ── Reduce-scatter phase (serial steps -- data dependencies between steps) ──
     for (int step = 0; step < ws - 1; step++) {
+        watchdog_->touch(seq);  // per-step progress re-arms the deadline
         int send_idx = (rank - step + ws) % ws;
         int recv_idx = (rank - step - 1 + ws) % ws;
         uint32_t step_tid = (static_cast<uint32_t>(step) << 16) | send_idx;
@@ -1087,6 +1572,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
 
         StagingBuffer staged = {nullptr, 0};
         if (send_bytes > 0) {
+            fence_chunk(send_idx);
             staged = stage_for_send_nosync(send_chunk);
         }
 
@@ -1108,6 +1594,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
                 at::Tensor incoming = torch::empty_like(recv_chunk);
                 unstage_from_recv(incoming, recv_buf_pool.data(), recv_bytes);
                 metal_reduce_op(recv_chunk, incoming, op);
+                arm_chunk(recv_idx);
             }
         }
 
@@ -1117,6 +1604,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
 
     // ── Allgather phase (serial steps) ──
     for (int step = 0; step < ws - 1; step++) {
+        watchdog_->touch(seq);
         int send_idx = (rank - step + 1 + ws) % ws;
         int recv_idx = (rank - step + ws) % ws;
         uint32_t ag_step = static_cast<uint32_t>(ws - 1 + step);
@@ -1131,6 +1619,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
 
         StagingBuffer staged = {nullptr, 0};
         if (send_bytes > 0) {
+            fence_chunk(send_idx);
             staged = stage_for_send_nosync(send_chunk);
         }
 
@@ -1142,6 +1631,9 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
             "allreduce_ring allgather step " + std::to_string(step) + " failed");
 
         if (recv_bytes > 0) {
+            // The incoming chunk replaces local data; fence any reduce kernel
+            // from the RS phase still in flight on it.
+            fence_chunk(recv_idx);
             if (use_cpu) {
                 MPSBufferView chunk_view = extract_mps_buffer(recv_chunk);
                 memcpy(chunk_view.cpu_ptr, recv_buf_pool.data(), recv_bytes);
@@ -1153,6 +1645,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
         metrics_->record_transport_bytes(send_bytes, true);
         metrics_->record_transport_bytes(recv_bytes, false);
     }
+    }  // end lock-step fallback
 
     if (use_cpu) {
         if (op == c10d::ReduceOp::AVG) {
@@ -1179,6 +1672,20 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
     if (ws == 2) {
         allreduce_two_rank(tensor, seq, op);
         return;
+    }
+
+    // Recursive-doubling tree: 2 + log2 rounds instead of the rank-0 star's
+    // 2(ws-1) serial transactions (46 -> ~6 at ws=24).  Requires CPU-visible
+    // storage (Apple Silicon shared MPS = always) and no compression.
+    {
+        auto dtype = tensor.scalar_type();
+        bool tree_ok = !compressor_ && tensor_cpu_accessible(tensor) &&
+                       (dtype == at::kFloat || dtype == at::kHalf ||
+                        dtype == at::kBFloat16);
+        if (tree_ok) {
+            allreduce_tree_small(tensor, seq, op);
+            return;
+        }
     }
 
     size_t nbytes = tensor_nbytes(tensor);
@@ -1258,6 +1765,249 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
 }
 
 
+void ProcessGroupMCCL::allreduce_tree_small(at::Tensor& tensor, uint32_t seq,
+                                            c10d::ReduceOp::RedOpType op) {
+    // Recursive doubling with non-power-of-2 folding.
+    //   p = largest power of two <= ws; extra = ws - p.
+    //   Round F (fold-in):  ranks >= p send their vector to (rank - p),
+    //                       which reduces it in.
+    //   Rounds 1..log2(p):  pairwise full-vector exchange + reduce among
+    //                       ranks < p (partner = rank XOR 2^k).
+    //   Round U (unfold):   ranks < extra send the final vector to rank + p.
+    // All p participants compute identical parenthesizations modulo fp
+    // commutativity (a+b == b+a bitwise), so results are bit-identical on
+    // every rank.
+    const int rank = getRank();
+    const int ws = getSize();
+    const size_t nbytes = tensor_nbytes(tensor);
+    const int64_t count = tensor.numel();
+    const auto dtype = tensor.scalar_type();
+
+    int p = 1;
+    while (p * 2 <= ws) p *= 2;
+    const int extra = ws - p;
+
+    MPSBufferView view = extract_mps_buffer(tensor);
+    MCCL_CHECK(view.cpu_accessible && view.cpu_ptr,
+               "allreduce_tree_small requires CPU-visible storage");
+    uint8_t* mine = static_cast<uint8_t*>(view.cpu_ptr);
+
+    PooledBuffer recv_buf(staging_memory_pool(), nbytes);
+
+    auto reduce_in = [&](const void* src) {
+        if (dtype == at::kFloat) {
+            cpu_reduce_op(reinterpret_cast<float*>(mine),
+                          static_cast<const float*>(src), count, op);
+        } else if (dtype == at::kHalf) {
+            cpu_reduce_op_half(reinterpret_cast<c10::Half*>(mine),
+                               static_cast<const c10::Half*>(src), count, op);
+        } else {
+            cpu_reduce_op_bf16(reinterpret_cast<c10::BFloat16*>(mine),
+                               static_cast<const c10::BFloat16*>(src), count, op);
+        }
+    };
+    auto scale_avg = [&] {
+        if (op != c10d::ReduceOp::AVG) return;
+        const float s = 1.0f / static_cast<float>(ws);
+        if (dtype == at::kFloat) {
+            cpu_scale_inplace(reinterpret_cast<float*>(mine), count, s);
+        } else if (dtype == at::kHalf) {
+            cpu_scale_inplace_half(reinterpret_cast<c10::Half*>(mine), count, s);
+        } else {
+            cpu_scale_inplace_bf16(reinterpret_cast<c10::BFloat16*>(mine), count, s);
+        }
+    };
+
+    // tid layout: 0 = fold-in, 1..R = doubling rounds, R+1 = unfold.
+    uint32_t round_tid = 0;
+    int rounds = 0;
+    for (int m = 1; m < p; m <<= 1) rounds++;
+    const uint32_t final_tid = static_cast<uint32_t>(rounds) + 1;
+
+    if (rank >= p) {
+        // Fold into the partner, then wait for the finished result.
+        MCCL_CHECK(transport_->send_chunks(rank - p, OpType::ALLREDUCE, seq,
+                                           round_tid, mine, nbytes),
+                   "tree allreduce fold-in send failed");
+        metrics_->record_transport_bytes(nbytes, true);
+        MCCL_CHECK(transport_->recv_chunks(rank - p, OpType::ALLREDUCE, seq,
+                                           final_tid, mine, nbytes),
+                   "tree allreduce unfold recv failed");
+        metrics_->record_transport_bytes(nbytes, false);
+    } else {
+        if (rank < extra) {
+            watchdog_->touch(seq);
+            MCCL_CHECK(transport_->recv_chunks(rank + p, OpType::ALLREDUCE, seq,
+                                               round_tid, recv_buf.data(), nbytes),
+                       "tree allreduce fold-in recv failed");
+            metrics_->record_transport_bytes(nbytes, false);
+            reduce_in(recv_buf.data());
+        }
+
+        for (int mask = 1; mask < p; mask <<= 1) {
+            const int partner = rank ^ mask;
+            round_tid++;
+            watchdog_->touch(seq);
+            // Full-duplex exchange: post the receive, send, then wait.
+            RecvTicket t = transport_->post_recv(
+                partner, OpType::ALLREDUCE, seq, round_tid,
+                recv_buf.data(), nbytes);
+            MCCL_CHECK(transport_->send_chunks(partner, OpType::ALLREDUCE, seq,
+                                               round_tid, mine, nbytes),
+                       "tree allreduce round send failed");
+            MCCL_CHECK(transport_->wait_recv(t),
+                       "tree allreduce round recv failed");
+            metrics_->record_transport_bytes(nbytes, true);
+            metrics_->record_transport_bytes(nbytes, false);
+            reduce_in(recv_buf.data());
+        }
+
+        scale_avg();
+
+        if (rank < extra) {
+            MCCL_CHECK(transport_->send_chunks(rank + p, OpType::ALLREDUCE, seq,
+                                               final_tid, mine, nbytes),
+                       "tree allreduce unfold send failed");
+            metrics_->record_transport_bytes(nbytes, true);
+        }
+    }
+
+    if (overlap_comm_) signal_mccl_done(next_event_value());
+    mps_stream_sync_after_cpu_mps_buffer_write();
+}
+
+
+void ProcessGroupMCCL::broadcast_ring_pipelined(at::Tensor& tensor,
+                                                uint32_t seq, int root) {
+    // Ring broadcast rooted at `root`: rank order root -> root+1 -> ... ->
+    // root+ws-1 (mod ws).  The payload is split into slices; each rank
+    // forwards slice s while slice s+1 is arriving (depth-ahead posted
+    // receives), so per-link traffic is S bytes and the wire stays busy.
+    const int rank = getRank();
+    const int ws = getSize();
+    const size_t nbytes = tensor_nbytes(tensor);
+    const int relid = (rank - root + ws) % ws;
+    const int next = (rank + 1) % ws;
+    const int prev = (rank - 1 + ws) % ws;
+    const bool is_root = (relid == 0);
+    const bool is_tail = (relid == ws - 1);
+
+    // Slice so the pipeline has parallelism without flooding tiny messages.
+    size_t slice = std::min(transport_->config().chunk_bytes,
+                            std::max<size_t>(256 * 1024, nbytes / 8));
+    const size_t nslices = (nbytes + slice - 1) / slice;
+
+    MPSBufferView view = extract_mps_buffer(tensor);
+    uint8_t* base = static_cast<uint8_t*>(view.cpu_ptr);
+    std::unique_ptr<PooledBuffer> staged;
+    if (!view.cpu_accessible || !view.cpu_ptr) {
+        // Private-storage fallback: stage the whole tensor once.
+        staged = std::make_unique<PooledBuffer>(staging_memory_pool(), nbytes);
+        if (is_root) {
+            blit_tensor_to_buffer(tensor, staged->data());
+        }
+        base = static_cast<uint8_t*>(staged->data());
+    }
+
+    auto slice_len = [&](size_t s) {
+        return std::min(slice, nbytes - s * slice);
+    };
+
+    if (is_root) {
+        for (size_t s = 0; s < nslices; ++s) {
+            watchdog_->touch(seq);
+            MCCL_CHECK(transport_->send_chunks(
+                           next, OpType::BROADCAST, seq,
+                           static_cast<uint32_t>(s), base + s * slice,
+                           slice_len(s)),
+                       "broadcast ring send failed at slice " + std::to_string(s));
+        }
+    } else {
+        const int depth = ring_pipeline_depth();
+        std::vector<RecvTicket> tickets(nslices);
+        size_t next_post = 0;
+        for (; next_post < nslices && next_post < static_cast<size_t>(depth);
+             ++next_post) {
+            tickets[next_post] = transport_->post_recv(
+                prev, OpType::BROADCAST, seq,
+                static_cast<uint32_t>(next_post),
+                base + next_post * slice, slice_len(next_post));
+        }
+        for (size_t s = 0; s < nslices; ++s) {
+            watchdog_->touch(seq);
+            MCCL_CHECK(transport_->wait_recv(tickets[s]),
+                       "broadcast ring recv failed at slice " + std::to_string(s));
+            if (!is_tail) {
+                MCCL_CHECK(transport_->send_chunks(
+                               next, OpType::BROADCAST, seq,
+                               static_cast<uint32_t>(s), base + s * slice,
+                               slice_len(s)),
+                           "broadcast ring forward failed at slice " +
+                           std::to_string(s));
+            }
+            if (next_post < nslices) {
+                tickets[next_post] = transport_->post_recv(
+                    prev, OpType::BROADCAST, seq,
+                    static_cast<uint32_t>(next_post),
+                    base + next_post * slice, slice_len(next_post));
+                ++next_post;
+            }
+        }
+        if (staged) {
+            // Blit the staged copy into the private tensor.
+            blit_buffer_to_tensor(staged->data(), tensor);
+        }
+    }
+}
+
+
+void ProcessGroupMCCL::broadcast_tree_small(at::Tensor& tensor,
+                                            uint32_t seq, int root) {
+    // Binomial tree on relative ids (relid = (rank - root) mod ws):
+    // round k: ranks with relid < 2^k forward to relid + 2^k (if < ws);
+    // each rank receives exactly once, in round floor(log2(relid)).
+    const int rank = getRank();
+    const int ws = getSize();
+    const size_t nbytes = tensor_nbytes(tensor);
+    const int relid = (rank - root + ws) % ws;
+
+    MPSBufferView view = extract_mps_buffer(tensor);
+    uint8_t* base = static_cast<uint8_t*>(view.cpu_ptr);
+    std::unique_ptr<PooledBuffer> staged;
+    if (!view.cpu_accessible || !view.cpu_ptr) {
+        staged = std::make_unique<PooledBuffer>(staging_memory_pool(), nbytes);
+        if (relid == 0) {
+            blit_tensor_to_buffer(tensor, staged->data());
+        }
+        base = static_cast<uint8_t*>(staged->data());
+    }
+
+    bool have_data = (relid == 0);
+    for (int k = 0; (1 << k) < ws; ++k) {
+        const int bit = 1 << k;
+        watchdog_->touch(seq);
+        if (!have_data && relid >= bit && relid < 2 * bit) {
+            const int src = ((relid - bit) + root) % ws;
+            MCCL_CHECK(transport_->recv_chunks(src, OpType::BROADCAST, seq,
+                                               static_cast<uint32_t>(k),
+                                               base, nbytes),
+                       "broadcast tree recv failed at round " + std::to_string(k));
+            have_data = true;
+        } else if (have_data && relid < bit && relid + bit < ws) {
+            const int dst = ((relid + bit) + root) % ws;
+            MCCL_CHECK(transport_->send_chunks(dst, OpType::BROADCAST, seq,
+                                               static_cast<uint32_t>(k),
+                                               base, nbytes),
+                       "broadcast tree send failed at round " + std::to_string(k));
+        }
+    }
+
+    if (staged && relid != 0) {
+        blit_buffer_to_tensor(staged->data(), tensor);
+    }
+}
+
+
 // ── broadcast ───────────────────────────────────────────────────────
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
@@ -1266,13 +2016,22 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
 
     MCCL_CHECK_TENSOR(tensors.size() == 1, "MCCL broadcast expects one tensor");
     at::Tensor& tensor = tensors[0];
-    tensor = ensure_contiguous(tensor);
+    // Non-root ranks receive in place; require contiguity on all ranks for a
+    // consistent contract (silently cloning would drop received data).
+    require_contiguous_output(tensor, "broadcast");
     check_single_tensor(tensor);
 
     int root = static_cast<int>(opts.rootRank);
     MCCL_CHECK(root >= 0 && root < getSize(),
                "broadcast rootRank=" + std::to_string(root) +
                " out of range [0, " + std::to_string(getSize()) + ")");
+
+    // world_size == 1 (or empty tensor): nothing to send.  The fan-out path
+    // below would never complete at ws == 1 because the atomic send counter
+    // starts at zero and markComplete only fired from send callbacks.
+    if (getSize() == 1 || tensor.numel() == 0) {
+        return make_completed_work(c10d::OpType::BROADCAST, tensors);
+    }
 
     uint32_t seq = collective_seq_.fetch_add(1);
     size_t nbytes = tensor_nbytes(tensor);
@@ -1291,60 +2050,137 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
 
     uint64_t sync_val_bc = sync_mps_nonblocking(overlap_comm_);
 
+    // ws >= 4: scale-aware algorithms on the collective pool.
+    //   large: pipelined ring (root egress S bytes instead of (ws-1)*S);
+    //   small: binomial tree (ceil(log2 ws) rounds instead of ws-1 sends).
+    // ws <= 3 keeps the per-peer fan-out below (parallel across 1-2 links).
+    if (ws >= 4 && collective_pool_) {
+        const bool use_ring = nbytes > transport_->config().small_msg_threshold;
+        collective_pool_->submit(
+            [this, tensor_copy, seq, root, nbytes, use_ring, sync_val_bc]() mutable {
+                watchdog_->touch(seq);
+                if (sync_val_bc > 0) wait_for_mps(sync_val_bc);
+                if (use_ring) {
+                    broadcast_ring_pipelined(tensor_copy, seq, root);
+                } else {
+                    broadcast_tree_small(tensor_copy, seq, root);
+                }
+                metrics_->record_transport_bytes(nbytes, getRank() == root);
+                if (overlap_comm_) signal_mccl_done(next_event_value());
+                mps_stream_sync_after_cpu_mps_buffer_write();
+                MCCL_INFO("broadcast seq=%u: algo=%s nbytes=%zu",
+                          seq, use_ring ? "ring_pipelined" : "tree", nbytes);
+            },
+            [this, work_ptr, seq]() {
+                unregister_work(seq);
+                watchdog_->complete(seq);
+                metrics_->op_end(seq);
+                work_ptr->markComplete();
+            },
+            [this, work_ptr, seq](std::exception_ptr e) {
+                unregister_work(seq);
+                watchdog_->complete(seq);
+                metrics_->op_end(seq);
+                metrics_->record_error();
+                work_ptr->markError(e);
+            }
+        );
+        return work;
+    }
+
     if (rank == root) {
         // Root: stage data then fan out sends to per-peer NetEngines.
-        // An atomic counter tracks completion; the last send to finish
-        // submits markComplete to reduce_engine.
+        // Shared state tracks completion AND the first error: any failed
+        // peer send must fail the whole broadcast.  (Previously a failed
+        // send was swallowed whenever a later send succeeded last.)
+        struct BcastFanoutState {
+            explicit BcastFanoutState(int n) : remaining(n) {}
+            std::atomic<int> remaining;
+            std::mutex mu;
+            std::exception_ptr first_error;
+        };
         auto staged_buf = std::make_shared<PooledBuffer>(staging_memory_pool(), nbytes);
         int num_peers = ws - 1;
-        auto sends_remaining = std::make_shared<std::atomic<int>>(num_peers);
+        auto state = std::make_shared<BcastFanoutState>(num_peers);
+
+        auto finish_fanout = [this, work_ptr, seq, state]() {
+            // Called by whichever send callback decrements remaining to zero.
+            // Must not throw: a throw from a net engine's on_complete would be
+            // rerouted to that op's on_error, double-decrementing the counter.
+            std::exception_ptr err;
+            {
+                std::lock_guard<std::mutex> lock(state->mu);
+                err = state->first_error;
+            }
+            if (err) {
+                unregister_work(seq);
+                watchdog_->complete(seq);
+                metrics_->op_end(seq);
+                metrics_->record_error();
+                work_ptr->markError(err);
+                return;
+            }
+            try {
+                reduce_engine_->submit(
+                    [this]() {
+                        if (overlap_comm_) signal_mccl_done(next_event_value());
+                    },
+                    [this, work_ptr, seq]() {
+                        unregister_work(seq);
+                        watchdog_->complete(seq);
+                        metrics_->op_end(seq);
+                        work_ptr->markComplete();
+                    },
+                    [this, work_ptr, seq](std::exception_ptr e) {
+                        unregister_work(seq);
+                        watchdog_->complete(seq);
+                        metrics_->op_end(seq);
+                        metrics_->record_error();
+                        work_ptr->markError(e);
+                    }
+                );
+            } catch (...) {
+                // reduce_engine_ shutting down: complete the work with the
+                // error here so it cannot hang.
+                unregister_work(seq);
+                watchdog_->complete(seq);
+                metrics_->op_end(seq);
+                metrics_->record_error();
+                work_ptr->markError(std::current_exception());
+            }
+        };
 
         reduce_engine_->submit(
-            [this, tensor_copy, sync_val_bc, staged_buf]() mutable {
+            [this, tensor_copy, seq, sync_val_bc, staged_buf]() mutable {
+                watchdog_->touch(seq);
                 if (sync_val_bc > 0) wait_for_mps(sync_val_bc);
                 StagingBuffer staged = stage_for_send_nosync(tensor_copy);
                 memcpy(staged_buf->data(), staged.data, staged.nbytes);
             },
-            [this, staged_buf, seq, root, ws, nbytes, sends_remaining, work_ptr]() mutable {
+            [this, staged_buf, seq, root, ws, nbytes, state, finish_fanout]() mutable {
                 for (int peer = 0; peer < ws; peer++) {
                     if (peer == root) continue;
                     net_engine_for(peer).submit(
                         [this, peer, seq, staged_buf, nbytes]() mutable {
+                            watchdog_->touch(seq);  // re-arm per peer-send phase
                             MCCL_CHECK(transport_->send_chunks(peer, OpType::BROADCAST, seq, 0,
                                                                staged_buf->data(), nbytes),
                                        "broadcast send to rank " + std::to_string(peer) + " failed");
                             metrics_->record_transport_bytes(nbytes, true);
                         },
-                        [this, sends_remaining, work_ptr, seq]() {
-                            if (sends_remaining->fetch_sub(1) == 1) {
-                                reduce_engine_->submit(
-                                    [this]() {
-                                        if (overlap_comm_) signal_mccl_done(next_event_value());
-                                    },
-                                    [this, work_ptr, seq]() {
-                                        unregister_work(seq);
-                                        watchdog_->complete(seq);
-                                        metrics_->op_end(seq);
-                                        work_ptr->markComplete();
-                                    },
-                                    [this, work_ptr, seq](std::exception_ptr e) {
-                                        unregister_work(seq);
-                                        watchdog_->complete(seq);
-                                        metrics_->op_end(seq);
-                                        metrics_->record_error();
-                                        work_ptr->markError(e);
-                                    }
-                                );
+                        [state, finish_fanout]() {
+                            if (state->remaining.fetch_sub(1) == 1) {
+                                finish_fanout();
                             }
                         },
-                        [this, work_ptr, seq, sends_remaining](std::exception_ptr e) {
+                        [state, finish_fanout](std::exception_ptr e) {
                             MCCL_ERROR("broadcast send to peer failed");
-                            if (sends_remaining->fetch_sub(1) == 1) {
-                                unregister_work(seq);
-                                watchdog_->complete(seq);
-                                metrics_->op_end(seq);
-                                metrics_->record_error();
-                                work_ptr->markError(e);
+                            {
+                                std::lock_guard<std::mutex> lock(state->mu);
+                                if (!state->first_error) state->first_error = e;
+                            }
+                            if (state->remaining.fetch_sub(1) == 1) {
+                                finish_fanout();
                             }
                         }
                     );
@@ -1362,6 +2198,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
         // Non-root receives from root using root's NetEngine
         net_engine_for(root).submit(
             [this, tensor_copy, root, seq, nbytes, sync_val_bc]() mutable {
+                watchdog_->touch(seq);
                 if (sync_val_bc > 0) wait_for_mps(sync_val_bc);
                 bool use_cpu = prefer_cpu_unified_buffer_path(tensor_copy);
                 if (use_cpu) {
@@ -1407,6 +2244,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::barrier(
     const c10d::BarrierOptions& opts) {
 
+    if (getSize() == 1) {
+        return make_completed_work(c10d::OpType::BARRIER);
+    }
+
     uint32_t seq = collective_seq_.fetch_add(1);
     auto work = c10::make_intrusive<WorkMCCL>(c10d::OpType::BARRIER, seq);
     auto work_ptr = work;
@@ -1417,6 +2258,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::barrier(
 
     reduce_engine_->submit(
         [this, seq]() {
+            watchdog_->touch(seq);
             rendezvous_->barrier("collective_" + std::to_string(seq));
         },
         [this, work_ptr, seq]() {
@@ -1456,8 +2298,17 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
 
     auto& outputs = outputTensors[0];
     for (auto& t : outputs) {
-        t = ensure_contiguous(t);
+        // Outputs are written in place; a silent clone would drop results.
+        require_contiguous_output(t, "allgather");
         check_same_shape_dtype(input, t);
+    }
+
+    if (input.numel() == 0) {
+        return make_completed_work(c10d::OpType::ALLGATHER, outputs);
+    }
+    if (getSize() == 1) {
+        outputs[0].copy_(input);
+        return make_completed_work(c10d::OpType::ALLGATHER, outputs);
     }
 
     uint32_t seq = collective_seq_.fetch_add(1);
@@ -1478,8 +2329,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
 
     uint64_t sync_val_ag = sync_mps_nonblocking(overlap_comm_);
 
-    reduce_engine_->submit(
+    ProgressEngine& ag_engine =
+        (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
+    ag_engine.submit(
         [this, input_copy, outputs_copy, seq, rank, ws, nbytes, sync_val_ag]() mutable {
+            watchdog_->touch(seq);
             if (sync_val_ag > 0) wait_for_mps(sync_val_ag);
             bool use_cpu = (input_copy.scalar_type() == at::kFloat) &&
                            prefer_cpu_unified_buffer_path(input_copy);
@@ -1490,27 +2344,53 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                 memcpy(out_view.cpu_ptr, in_view.cpu_ptr, nbytes);
             } else {
                 outputs_copy[rank].copy_(input_copy);
+                // Order the copy before TX reads the bytes (engine thread).
+                if (overlap_comm_ && event_sync_available()) {
+                    uint64_t v = next_event_value();
+                    commit_mps_and_signal(v);
+                    wait_for_mps(v);
+                } else {
+                    mps_stream_sync();
+                }
             }
 
             int left = (rank - 1 + ws) % ws;
             int right = (rank + 1) % ws;
 
-            // Ring allgather with per-peer engines - simplified version for now
-            // TODO: Implement full per-peer engine version like allreduce_ring
-            // This would use net_engines_[peer] for each ring step instead of serializing
-            // all steps on reduce_engine_, enabling better concurrency and overlap.
-            // See 2-rank split for reference pattern.
+            if (ring_pipeline_enabled()) {
+                // Streaming pipeline: forward chunk s while chunk s+1 arrives.
+                // send(s) = (rank-s), recv(s) = (rank-s-1) = send(s+1):
+                // lookahead 1; receives land zero-copy in the output tensors.
+                std::vector<RingStep> plan;
+                plan.reserve(ws - 1);
+                for (int step = 0; step < ws - 1; step++) {
+                    RingStep st;
+                    st.send_idx = (rank - step + ws) % ws;
+                    st.recv_idx = (rank - step - 1 + ws) % ws;
+                    st.send_tid = (static_cast<uint32_t>(step) << 16) | st.send_idx;
+                    st.recv_tid = (static_cast<uint32_t>(step) << 16) | st.recv_idx;
+                    st.kind = RingRecvKind::COPY;
+                    plan.push_back(st);
+                }
+                RingPipelineCtx ctx{transport_.get(), watchdog_.get(),
+                                    metrics_.get(), seq, left, right,
+                                    OpType::ALLGATHER,
+                                    c10d::ReduceOp::SUM, use_cpu};
+                run_ring_pipeline(ctx, outputs_copy, plan, /*lookahead=*/1);
+            } else {
             PooledBuffer recv_buf_fallback(staging_memory_pool(), use_cpu ? 0 : nbytes);
 
             for (int step = 0; step < ws - 1; step++) {
+                watchdog_->touch(seq);  // per-step progress re-arms the deadline
                 int send_idx = (rank - step + ws) % ws;
                 int recv_idx = (rank - step - 1 + ws) % ws;
                 uint32_t step_tid = (static_cast<uint32_t>(step) << 16) | send_idx;
                 uint32_t recv_tid = (static_cast<uint32_t>(step) << 16) | recv_idx;
 
-                StagingBuffer staged = use_cpu
-                    ? stage_for_send_nosync(outputs_copy[send_idx])
-                    : stage_for_send(outputs_copy[send_idx]);
+                // nosync staging is safe here: allgather issues no async MCCL
+                // kernels, the pre-collective MPS sync already ordered
+                // PyTorch's writes, and unstage blits complete synchronously.
+                StagingBuffer staged = stage_for_send_nosync(outputs_copy[send_idx]);
 
                 void* recv_dst;
                 if (use_cpu) {
@@ -1533,6 +2413,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                 metrics_->record_transport_bytes(nbytes, true);
                 metrics_->record_transport_bytes(nbytes, false);
             }
+            }  // end lock-step fallback
             if (use_cpu) {
                 mps_stream_sync_after_cpu_mps_buffer_write();
             }
@@ -1570,12 +2451,25 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
         static_cast<int>(inputTensors[0].size()) == getSize(),
         "Input tensor list size must equal world_size");
 
-    at::Tensor output = ensure_contiguous(outputTensors[0]);
+    // Output is written in place; a silent clone would drop results.
+    at::Tensor output = outputTensors[0];
+    require_contiguous_output(output, "reduce_scatter");
+    require_reduce_dtype(output, "reduce_scatter");
     auto& inputs = inputTensors[0];
     for (auto& t : inputs) {
         t = ensure_contiguous(t);
         check_single_tensor(t);
         check_same_shape_dtype(output, t);
+    }
+
+    if (output.numel() == 0) {
+        return make_completed_work(c10d::OpType::REDUCE_SCATTER,
+                                   std::vector<at::Tensor>{output});
+    }
+    if (getSize() == 1) {
+        output.copy_(inputs[0]);
+        return make_completed_work(c10d::OpType::REDUCE_SCATTER,
+                                   std::vector<at::Tensor>{output});
     }
 
     uint32_t seq = collective_seq_.fetch_add(1);
@@ -1598,8 +2492,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
 
     uint64_t sync_val_rs = sync_mps_nonblocking(overlap_comm_);
 
-    reduce_engine_->submit(
+    ProgressEngine& rs_engine =
+        (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
+    rs_engine.submit(
         [this, output_copy, inputs_copy, seq, rank, ws, nbytes, rs_op, sync_val_rs]() mutable {
+            watchdog_->touch(seq);
             if (sync_val_rs > 0) wait_for_mps(sync_val_rs);
             int left = (rank - 1 + ws) % ws;
             int right = (rank + 1) % ws;
@@ -1607,17 +2504,61 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                            prefer_cpu_unified_buffer_path(inputs_copy[0]);
 
             std::vector<at::Tensor> chunks = inputs_copy;
+
+            if (ring_pipeline_enabled()) {
+                // Streaming pipeline: send(s) = (rank+1-s) = recv(s-1), so
+                // lookahead 1; every received chunk is reduced into place
+                // while the next is already on the wire.
+                std::vector<RingStep> plan;
+                plan.reserve(ws - 1);
+                for (int step = 0; step < ws - 1; step++) {
+                    RingStep st;
+                    st.send_idx = (rank + 1 - step + ws) % ws;
+                    st.recv_idx = (rank - step + ws) % ws;
+                    st.send_tid = (static_cast<uint32_t>(step) << 16) | st.send_idx;
+                    st.recv_tid = (static_cast<uint32_t>(step) << 16) | st.recv_idx;
+                    st.kind = RingRecvKind::REDUCE;
+                    plan.push_back(st);
+                }
+                RingPipelineCtx ctx{transport_.get(), watchdog_.get(),
+                                    metrics_.get(), seq, left, right,
+                                    OpType::REDUCE_SCATTER, rs_op, use_cpu};
+                run_ring_pipeline(ctx, chunks, plan, /*lookahead=*/1);
+            } else {
             PooledBuffer recv_buf(staging_memory_pool(), nbytes);
 
+            // Kernel fence for the Metal reduce path: the chunk sent at step
+            // s+1 is the chunk reduced at step s (send_idx_{s+1} == recv_idx_s),
+            // so the reduce kernel must complete before that chunk is staged.
+            // Event-based fencing replaces the previous per-step full queue
+            // drain inside stage_for_send().
+            const bool use_event_fence = !use_cpu && event_sync_available();
+            std::vector<uint64_t> chunk_pending(ws, 0);
+            auto fence_chunk = [&](int idx) {
+                if (use_event_fence && chunk_pending[idx]) {
+                    wait_for_mccl_fence(chunk_pending[idx]);
+                    chunk_pending[idx] = 0;
+                }
+            };
+            auto arm_chunk = [&](int idx) {
+                if (use_event_fence) {
+                    uint64_t v = next_event_value();
+                    signal_mccl_fence_gpu(v);
+                    chunk_pending[idx] = v;
+                } else if (!use_cpu) {
+                    metal_sync_queue_only();
+                }
+            };
+
             for (int step = 0; step < ws - 1; step++) {
+                watchdog_->touch(seq);  // per-step progress re-arms the deadline
                 int send_idx = (rank + 1 - step + ws) % ws;
                 int recv_idx = (rank - step + ws) % ws;
                 uint32_t step_tid = (static_cast<uint32_t>(step) << 16) | send_idx;
                 uint32_t recv_tid = (static_cast<uint32_t>(step) << 16) | recv_idx;
 
-                StagingBuffer staged = use_cpu
-                    ? stage_for_send_nosync(chunks[send_idx])
-                    : stage_for_send(chunks[send_idx]);
+                if (!use_cpu) fence_chunk(send_idx);
+                StagingBuffer staged = stage_for_send_nosync(chunks[send_idx]);
 
                 MCCL_CHECK(transport_->send_recv_overlap(
                     right, OpType::REDUCE_SCATTER, seq, step_tid,
@@ -1636,11 +2577,13 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                     at::Tensor incoming = torch::empty_like(chunks[recv_idx]);
                     unstage_from_recv(incoming, recv_buf.data(), nbytes);
                     metal_reduce_op(chunks[recv_idx], incoming, rs_op);
+                    arm_chunk(recv_idx);
                 }
 
                 metrics_->record_transport_bytes(nbytes, true);
                 metrics_->record_transport_bytes(nbytes, false);
             }
+            }  // end lock-step fallback
 
             int my_chunk = rank;
             if (use_cpu) {
@@ -1694,6 +2637,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
 
     at::Tensor tensor = ensure_contiguous(tensors[0]);
     check_single_tensor(tensor);
+    if (tensor.numel() == 0) {
+        // recv() no-ops on zero-size tensors; never put a 0-byte message on
+        // the wire or the two sides would desynchronize.
+        return make_completed_work(c10d::OpType::SEND);
+    }
 
     uint32_t seq = collective_seq_.fetch_add(1);
     size_t nbytes = tensor_nbytes(tensor);
@@ -1709,6 +2657,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
 
     net_engine_for(dstRank).submit(
         [this, tensor, dstRank, seq, tag, nbytes, sync_val_s]() mutable {
+            watchdog_->touch(seq);
             if (sync_val_s > 0) wait_for_mps(sync_val_s);
             StagingBuffer staged = stage_for_send_nosync(tensor);
             MCCL_CHECK(transport_->send_chunks(dstRank, OpType::SEND, seq,
@@ -1745,8 +2694,13 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
                "recv srcRank=" + std::to_string(srcRank) + " invalid (rank=" +
                std::to_string(getRank()) + " world=" + std::to_string(getSize()) + ")");
 
-    at::Tensor tensor = ensure_contiguous(tensors[0]);
+    at::Tensor tensor = tensors[0];
+    // Received data is written in place; a silent clone would drop it.
+    require_contiguous_output(tensor, "recv");
     check_single_tensor(tensor);
+    if (tensor.numel() == 0) {
+        return make_completed_work(c10d::OpType::RECV, tensors);
+    }
 
     uint32_t seq = collective_seq_.fetch_add(1);
     size_t nbytes = tensor_nbytes(tensor);
@@ -1761,6 +2715,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
 
     net_engine_for(srcRank).submit(
         [this, tensor, srcRank, seq, tag, nbytes]() mutable {
+            watchdog_->touch(seq);
             bool use_cpu = prefer_cpu_unified_buffer_path(tensor);
             if (use_cpu) {
                 MPSBufferView view = extract_mps_buffer(tensor);

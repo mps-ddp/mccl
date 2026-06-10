@@ -45,6 +45,15 @@ void signal_mccl_done_gpu(uint64_t value);
 /// buffer needs to wait.
 void wait_for_mccl(uint64_t value);
 
+/// Kernel-fence event: signaled ONLY from the GPU on MCCL's serial command
+/// queue, so its value is strictly monotonic.  Used by ring/reduce_scatter
+/// loops to fence in-flight reduce kernels before a chunk is staged for a
+/// network send.  Kept separate from ``mccl_event`` because
+/// ``signal_mccl_done`` performs CPU-side stores from other engine threads,
+/// which could move that event's value backwards past a fence waiter.
+void signal_mccl_fence_gpu(uint64_t value);
+void wait_for_mccl_fence(uint64_t value);
+
 /// Monotonically increasing event counter. Each collective bumps this to
 /// generate unique signal values.
 uint64_t next_event_value();

@@ -76,13 +76,16 @@ class MCCLBuildExt(build_ext):
 
             cpp_flags = [
                 "-std=c++17",
-                "-O2",
+                "-O3",
+                "-flto=thin",
                 "-Wall",
                 "-Wextra",
                 "-Wno-unused-parameter",
                 "-fvisibility=hidden",
                 "-DMCCL_BUILD",
-                "-march=armv8.5-a+crc",
+                # apple-m1 is the floor for all Apple Silicon Macs; the old
+                # -march=armv8.5-a+crc excluded M1 (ARMv8.4-A).
+                "-mcpu=apple-m1",
                 "-isysroot", sdk_path,
             ]
             objcpp_flags = cpp_flags + ["-fobjc-arc"]
@@ -91,6 +94,7 @@ class MCCLBuildExt(build_ext):
             ext._objcpp_flags = objcpp_flags
 
             ext.extra_link_args += [
+                "-flto=thin",
                 "-framework", "Metal",
                 "-framework", "Foundation",
                 "-framework", "MetalPerformanceShaders",
@@ -343,7 +347,7 @@ ext = Extension(
 
 setup(
     name="mccl",
-    version="0.3.4",
+    version="0.5.0",
     description="MPS-native ProcessGroup backend for PyTorch Distributed on Apple Silicon",
     packages=["mccl"],
     ext_modules=[ext],

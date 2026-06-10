@@ -19,9 +19,26 @@ struct IndexValue {
     float value;
 };
 
+namespace {
+
+// Persistent per-thread scratch: avoids two large allocations (plus a bit
+// vector) per compress call.
+struct TopKScratch {
+    std::vector<float> adjusted;
+    std::vector<uint32_t> indices;
+};
+
+TopKScratch& scratch() {
+    thread_local TopKScratch s;
+    return s;
+}
+
+} // anonymous namespace
+
 size_t TopKCompressor::compress(const void* src, size_t nbytes,
                                 void* dst, size_t dst_capacity,
-                                at::ScalarType dtype) {
+                                at::ScalarType dtype,
+                                uint64_t stable_id) {
     MCCL_CHECK(dtype == at::kFloat,
                "TopK compression currently supports float32 only");
 
@@ -31,35 +48,46 @@ size_t TopKCompressor::compress(const void* src, size_t nbytes,
 
     const float* data = static_cast<const float*>(src);
 
-    // Get tensor identity using data pointer (stable for DDP gradient buffers)
-    uintptr_t tensor_id = reinterpret_cast<uintptr_t>(src);
-    
-    // Ensure per-tensor error feedback buffer is sized
-    auto it = error_buffers_.find(tensor_id);
-    if (it == error_buffers_.end() || it->second.size() != count) {
-        error_buffers_[tensor_id].assign(count, 0.0f);
+    std::lock_guard<std::mutex> lock(mu_);
+
+    // Per-tensor error feedback keyed on the caller-supplied stable identity.
+    // (The old code keyed on `src`, which is the shared staging buffer for
+    // every tensor on the blit path — residuals from one gradient bucket
+    // were silently added to other buckets.)
+    if (error_buffers_.size() >= kMaxErrorBuffers &&
+        error_buffers_.find(stable_id) == error_buffers_.end()) {
+        MCCL_WARN("TopK: evicting all %zu error feedback buffers "
+                  "(unstable tensor identities?)", error_buffers_.size());
+        error_buffers_.clear();
     }
-    std::vector<float>& error_buf = error_buffers_[tensor_id];
+    auto it = error_buffers_.find(stable_id);
+    if (it == error_buffers_.end() || it->second.size() != count) {
+        error_buffers_[stable_id].assign(count, 0.0f);
+    }
+    std::vector<float>& error_buf = error_buffers_[stable_id];
 
     // Add error feedback to current gradients
-    std::vector<float> adjusted(count);
+    TopKScratch& sc = scratch();
+    sc.adjusted.resize(count);
+    float* adjusted = sc.adjusted.data();
     for (size_t i = 0; i < count; i++) {
         adjusted[i] = data[i] + error_buf[i];
     }
 
-    // Find top-k by magnitude using partial sort
-    std::vector<uint32_t> indices(count);
-    std::iota(indices.begin(), indices.end(), 0);
+    // Find top-k by magnitude using partial selection
+    sc.indices.resize(count);
+    uint32_t* indices = sc.indices.data();
+    std::iota(indices, indices + count, 0);
 
     std::nth_element(
-        indices.begin(), indices.begin() + k, indices.end(),
-        [&adjusted](uint32_t a, uint32_t b) {
+        indices, indices + k, indices + count,
+        [adjusted](uint32_t a, uint32_t b) {
             return std::fabs(adjusted[a]) > std::fabs(adjusted[b]);
         }
     );
 
     // Sort the top-k by index for cache-friendly access at receiver
-    std::sort(indices.begin(), indices.begin() + k);
+    std::sort(indices, indices + k);
 
     // Write compressed output: [k][index, value] pairs
     size_t output_size = sizeof(uint32_t) + k * sizeof(IndexValue);
@@ -69,9 +97,10 @@ size_t TopKCompressor::compress(const void* src, size_t nbytes,
     memcpy(out, &k, sizeof(uint32_t));
     out += sizeof(uint32_t);
 
-    // Update error feedback: residual = adjusted - what_we_sent
-    // Reset sent elements, keep unsent as error
-    std::vector<bool> sent(count, false);
+    // Error feedback: residual = adjusted - sent.  Copy the adjusted values
+    // wholesale, then zero exactly the k entries that went on the wire —
+    // one memcpy + k stores instead of a bit vector and a full second pass.
+    memcpy(error_buf.data(), adjusted, count * sizeof(float));
 
     for (uint32_t i = 0; i < k; i++) {
         uint32_t idx = indices[i];
@@ -80,12 +109,7 @@ size_t TopKCompressor::compress(const void* src, size_t nbytes,
         iv.value = adjusted[idx];
         memcpy(out, &iv, sizeof(IndexValue));
         out += sizeof(IndexValue);
-        sent[idx] = true;
-    }
-
-    // Error feedback: unsent values become the residual for next iteration
-    for (size_t i = 0; i < count; i++) {
-        error_buf[i] = sent[i] ? 0.0f : adjusted[i];
+        error_buf[idx] = 0.0f;
     }
 
     double sparsity = 100.0 * (1.0 - (double)k / count);
@@ -134,17 +158,24 @@ size_t TopKCompressor::max_compressed_size(size_t nbytes) const {
 }
 
 void TopKCompressor::reset_error_feedback() {
+    std::lock_guard<std::mutex> lock(mu_);
     error_buffers_.clear();
     MCCL_DEBUG("TopK: all error feedback buffers reset");
 }
 
-void TopKCompressor::reset_error_feedback_for_tensor(const void* tensor_ptr) {
-    uintptr_t tensor_id = reinterpret_cast<uintptr_t>(tensor_ptr);
-    auto it = error_buffers_.find(tensor_id);
+void TopKCompressor::reset_error_feedback_for_tensor(uint64_t stable_id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = error_buffers_.find(stable_id);
     if (it != error_buffers_.end()) {
         std::fill(it->second.begin(), it->second.end(), 0.0f);
-        MCCL_DEBUG("TopK: error feedback reset for tensor %p", tensor_ptr);
+        MCCL_DEBUG("TopK: error feedback reset for tensor id %llu",
+                   (unsigned long long)stable_id);
     }
+}
+
+size_t TopKCompressor::error_feedback_buffer_count() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return error_buffers_.size();
 }
 
 } // namespace mccl

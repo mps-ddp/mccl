@@ -36,25 +36,16 @@ public:
     /// Receive exactly `len` bytes. Returns true on success.
     bool recv_all(void* data, size_t len);
 
-    /// Send a heartbeat probe.
-    bool send_heartbeat();
-
     /// Check if connection is alive.
     bool is_alive() const;
 
+    /// Half-teardown: ::shutdown(fd, SHUT_RDWR) WITHOUT closing the fd.
+    /// Wakes a reader thread blocked in recv() so it can exit; the fd stays
+    /// valid (no fd-reuse race) until close() is called after the join.
+    void shutdown_socket();
+
     /// Graceful close.
     void close();
-
-    /// Switch socket to non-blocking / blocking mode.
-    /// Used by send_recv_overlap for poll()-based concurrent I/O.
-    void set_nonblocking();
-    void set_blocking();
-
-    /// Non-blocking send: returns bytes written, 0 if EAGAIN, -1 on error.
-    ssize_t try_send(const void* data, size_t len);
-
-    /// Non-blocking recv: returns bytes read, 0 if EAGAIN, -1 on error/close.
-    ssize_t try_recv(void* data, size_t len);
 
     int fd() const { return fd_; }
     int peer_rank() const { return peer_rank_; }

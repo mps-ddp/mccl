@@ -38,19 +38,34 @@ void f32_to_f16(const float* src, uint16_t* dst, size_t count) {
 #else
     // Portable fallback — not performance-critical, only for non-ARM builds
     for (size_t i = 0; i < count; i++) {
-        // IEEE 754 f32→f16 with round-to-nearest
+        // IEEE 754 f32→f16 with round-to-nearest-even, preserving NaN.
         uint32_t x;
         memcpy(&x, &src[i], 4);
         uint32_t sign = (x >> 16) & 0x8000;
-        int32_t exp = ((x >> 23) & 0xFF) - 127 + 15;
-        uint32_t mant = (x >> 13) & 0x3FF;
+        uint32_t f_exp = (x >> 23) & 0xFF;
+        uint32_t f_mant = x & 0x7FFFFF;
 
-        if (exp <= 0) {
-            dst[i] = static_cast<uint16_t>(sign); // flush to zero
-        } else if (exp >= 31) {
-            dst[i] = static_cast<uint16_t>(sign | 0x7C00); // inf
+        if (f_exp == 0xFF) {
+            // Inf stays Inf; NaN must stay NaN (mantissa non-zero), not Inf.
+            uint16_t h_mant = f_mant ? static_cast<uint16_t>((f_mant >> 13) | 0x200) : 0;
+            dst[i] = static_cast<uint16_t>(sign | 0x7C00 | h_mant);
+            continue;
+        }
+
+        int32_t exp = static_cast<int32_t>(f_exp) - 127 + 15;
+        if (exp >= 31) {
+            dst[i] = static_cast<uint16_t>(sign | 0x7C00); // overflow → inf
+        } else if (exp <= 0) {
+            dst[i] = static_cast<uint16_t>(sign); // flush subnormals to zero
         } else {
-            dst[i] = static_cast<uint16_t>(sign | (exp << 10) | mant);
+            // Round-to-nearest-even on the 13 truncated mantissa bits.
+            uint32_t mant = f_mant >> 13;
+            uint32_t rem = f_mant & 0x1FFF;
+            uint16_t h = static_cast<uint16_t>(sign | (exp << 10) | mant);
+            if (rem > 0x1000 || (rem == 0x1000 && (mant & 1))) {
+                h++; // carry may roll into the exponent — that is correct RNE
+            }
+            dst[i] = h;
         }
     }
 #endif
@@ -101,7 +116,8 @@ void f16_to_f32(const uint16_t* src, float* dst, size_t count) {
 
 size_t FP16Compressor::compress(const void* src, size_t nbytes,
                                 void* dst, size_t dst_capacity,
-                                at::ScalarType dtype) {
+                                at::ScalarType dtype,
+                                uint64_t /*stable_id*/) {
     if (dtype == at::kHalf) {
         MCCL_CHECK(dst_capacity >= nbytes, "FP16 compress: buffer too small");
         memcpy(dst, src, nbytes);

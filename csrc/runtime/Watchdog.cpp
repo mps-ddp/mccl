@@ -33,10 +33,26 @@ void Watchdog::watch(uint32_t seq, const std::string& op_name) {
 void Watchdog::watch(uint32_t seq, const std::string& op_name,
                      std::chrono::milliseconds timeout) {
     std::lock_guard<std::mutex> lock(mu_);
-    auto deadline = std::chrono::steady_clock::now() + timeout;
-    entries_[seq] = WatchEntry{seq, op_name, deadline};
-    MCCL_TRACE("Watchdog: watching seq=%u op=%s timeout=%lldms",
+    // Registered but NOT armed: the deadline clock starts at touch(), when
+    // the op begins executing on an engine.  Arming at submission made
+    // deep-but-healthy queues (DDP bucket backlogs) trip the watchdog purely
+    // from queue wait.  A hung op ahead in the queue still aborts the group:
+    // its own (armed) deadline fires and abort_all_inflight_works() errors
+    // every registered work, including the still-queued ones.
+    entries_[seq] = WatchEntry{seq, op_name,
+                               std::chrono::steady_clock::time_point::max(),
+                               timeout};
+    MCCL_TRACE("Watchdog: watching seq=%u op=%s timeout=%lldms (armed at execute)",
                seq, op_name.c_str(), (long long)timeout.count());
+}
+
+void Watchdog::touch(uint32_t seq) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = entries_.find(seq);
+    if (it != entries_.end()) {
+        it->second.deadline = std::chrono::steady_clock::now() + it->second.timeout;
+        MCCL_TRACE("Watchdog: armed seq=%u (execute start / phase boundary)", seq);
+    }
 }
 
 void Watchdog::complete(uint32_t seq) {

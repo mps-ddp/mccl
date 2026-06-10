@@ -54,7 +54,7 @@ python setup.py build_ext --inplace
 2. **`init_process_group(backend="mccl", device_id=mps_device)`** constructs `ProcessGroupMCCL`.
 3. **Collectives** record GPU completion via **event sync** (`commit_mps_and_signal` on PyTorch’s MPS command buffer + `wait_for_mps` on the **ProgressEngine** thread before reading tensor memory), then run **network / CPU or Metal** reduction. Legacy comment: full-stream `torch::mps::synchronize()` on the autograd thread is unsafe mid-backward; the event path serializes via `dispatch_sync` on PyTorch’s MPS dispatch queue instead.
 
-   **DDP**: `examples/ddp_dummy_train.py` uses **bucketed** allreduce during `backward()` (no `no_sync()` workaround). **`MCCL_SYNC_MODE=coalesced` must not** be used with hook-driven multi-bucket DDP (skips per-bucket GPU waits → corrupt traffic).
+   **DDP**: `examples/ddp_dummy_train.py` uses **bucketed** allreduce during `backward()` (no `no_sync()` workaround). The old `MCCL_SYNC_MODE=coalesced` knob was removed in v0.4 (it skipped per-bucket GPU waits → corrupt traffic); MCCL now always syncs per collective via the MTLSharedEvent path.
 
    **Multi-node**: see [MULTINODE.md](MULTINODE.md) for `MASTER_ADDR`, ports / firewall, and tuning.
 4. **Float32 + shared memory**: often **CPU-side reduction** via Accelerate (vDSP) reading the same pointers as MPS.

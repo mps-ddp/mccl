@@ -18,6 +18,7 @@ namespace {
 struct EventState {
     id<MTLSharedEvent> mps_event   = nil;
     id<MTLSharedEvent> mccl_event  = nil;
+    id<MTLSharedEvent> fence_event = nil;  // GPU-signaled only (monotonic)
     id<MTLDevice>      device      = nil;
     id<MTLCommandQueue> mccl_queue = nil;
     std::atomic<uint64_t> counter{0};
@@ -30,20 +31,33 @@ EventState& state() {
 }
 
 void spin_wait_event(id<MTLSharedEvent> event, uint64_t target) {
+    // Short hot spin for the common already-signaled / about-to-signal case,
+    // then a kernel-level wait.  Engine/TX/RX threads share performance cores
+    // with the vDSP reductions: burning a core in yield loops (the previous
+    // behavior) directly slowed the reduce path at high rank counts.
     constexpr int FAST_SPINS = 200;
-    constexpr int YIELD_SPINS = 2000;
     constexpr auto TIMEOUT = std::chrono::seconds(30);
 
     for (int i = 0; i < FAST_SPINS; ++i) {
         if (event.signaledValue >= target) return;
     }
 
-    for (int i = 0; i < YIELD_SPINS; ++i) {
-        std::this_thread::yield();
-        if (event.signaledValue >= target) return;
+    auto deadline = std::chrono::steady_clock::now() + TIMEOUT;
+
+    if (@available(macOS 12.0, *)) {
+        while (event.signaledValue < target) {
+            // Chunked timeout so a hung GPU still trips the 30s guard.
+            [event waitUntilSignaledValue:target timeoutMS:100];
+            MCCL_CHECK(std::chrono::steady_clock::now() < deadline ||
+                           event.signaledValue >= target,
+                       "spin_wait_event timed out after 30s waiting for event value " +
+                       std::to_string(target) + " (current=" +
+                       std::to_string(event.signaledValue) + ")");
+        }
+        return;
     }
 
-    auto deadline = std::chrono::steady_clock::now() + TIMEOUT;
+    // Pre-macOS 12 fallback: exponential backoff sleep.
     auto delay = std::chrono::microseconds(10);
     constexpr auto max_delay = std::chrono::microseconds(500);
     while (event.signaledValue < target) {
@@ -84,6 +98,14 @@ void event_sync_init() {
         if (!s.mccl_event) {
             MCCL_WARN("EventSync: MTLSharedEvent creation failed (mccl_event)");
             s.mps_event = nil;
+            return;
+        }
+
+        s.fence_event = [s.device newSharedEvent];
+        if (!s.fence_event) {
+            MCCL_WARN("EventSync: MTLSharedEvent creation failed (fence_event)");
+            s.mps_event = nil;
+            s.mccl_event = nil;
             return;
         }
 
@@ -153,6 +175,24 @@ void wait_for_mccl(uint64_t value) {
     EventState& s = state();
     MCCL_CHECK(s.initialized, "EventSync not initialized");
     spin_wait_event(s.mccl_event, value);
+}
+
+void signal_mccl_fence_gpu(uint64_t value) {
+    EventState& s = state();
+    MCCL_CHECK(s.initialized, "EventSync not initialized");
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [s.mccl_queue commandBuffer];
+        cmd.label = @"mccl_kernel_fence";
+        [cmd encodeSignalEvent:s.fence_event value:value];
+        [cmd commit];
+    }
+}
+
+void wait_for_mccl_fence(uint64_t value) {
+    EventState& s = state();
+    MCCL_CHECK(s.initialized, "EventSync not initialized");
+    spin_wait_event(s.fence_event, value);
 }
 
 uint64_t next_event_value() {

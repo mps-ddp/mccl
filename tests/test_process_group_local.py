@@ -408,7 +408,7 @@ class TestThreeRankAllreduce:
 
     Float tests use nbytes > default MCCL_SMALL_MSG_THRESHOLD. Most set
     ``MCCL_RING_ALGO=basic`` to pin plain ring; ``test_three_rank_sum_large_unset_ring_algo_env``
-    omits ``MCCL_RING_ALGO`` so the default (plain ring, not ``ring_chunked``) is covered.
+    omits ``MCCL_RING_ALGO`` so the default (chunked ring as of v0.4) is covered.
     """
 
     def test_three_rank_sum(self):
@@ -425,7 +425,7 @@ class TestThreeRankAllreduce:
         )
 
     def test_three_rank_sum_large_unset_ring_algo_env(self):
-        """Large 3-rank SUM with ``MCCL_RING_ALGO`` unset: default must stay plain ring."""
+        """Large 3-rank SUM with ``MCCL_RING_ALGO`` unset (default algo, chunked in v0.4)."""
 
         def fn(rank, world_size):
             n = THREE_RANK_PLAIN_RING_NUMEL

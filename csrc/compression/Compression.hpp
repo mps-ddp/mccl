@@ -26,9 +26,16 @@ public:
     /// Compress `src` (nbytes of original data) into `dst`.
     /// Returns the compressed size in bytes.
     /// `dst` must be pre-allocated to at least `max_compressed_size(nbytes)`.
+    ///
+    /// `stable_id` identifies the logical tensor across steps (e.g. the
+    /// original tensor's storage address).  Stateful compressors (TopK error
+    /// feedback) key their per-tensor state on it; it must NOT be a staging
+    /// buffer address, which is shared across tensors.  Pass 0 for stateless
+    /// one-off use.
     virtual size_t compress(const void* src, size_t nbytes,
                             void* dst, size_t dst_capacity,
-                            at::ScalarType dtype) = 0;
+                            at::ScalarType dtype,
+                            uint64_t stable_id = 0) = 0;
 
     /// Decompress `src` (compressed_size bytes) into `dst` (nbytes original).
     virtual void decompress(const void* src, size_t compressed_size,

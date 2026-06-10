@@ -67,6 +67,20 @@ void Connection::configure_socket() {
         if (bufsize > 0) {
             setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
             setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+
+            // macOS silently clamps to kern.ipc.maxsockbuf (often 8MB).
+            // Read back and warn so a silently-degraded link is diagnosable.
+            int actual_snd = 0, actual_rcv = 0;
+            socklen_t len = sizeof(actual_snd);
+            getsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &actual_snd, &len);
+            len = sizeof(actual_rcv);
+            getsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &actual_rcv, &len);
+            if (actual_snd < bufsize || actual_rcv < bufsize) {
+                MCCL_WARN("Socket buffers clamped by kernel: requested %d, got "
+                          "snd=%d rcv=%d. Raise with: sudo sysctl -w "
+                          "kern.ipc.maxsockbuf=%d",
+                          bufsize, actual_snd, actual_rcv, 2 * bufsize);
+            }
         }
     }
 
@@ -273,66 +287,19 @@ bool Connection::send_header_payload(const void* header, size_t hdr_len,
     return true;
 }
 
-bool Connection::send_heartbeat() {
-    uint8_t beat = 0xFF;
-    return send_all(&beat, 1);
-}
-
-void Connection::set_nonblocking() {
-    if (fd_ < 0) return;
-    int flags = fcntl(fd_, F_GETFL, 0);
-    fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
-}
-
-void Connection::set_blocking() {
-    if (fd_ < 0) return;
-    int flags = fcntl(fd_, F_GETFL, 0);
-    fcntl(fd_, F_SETFL, flags & ~O_NONBLOCK);
-}
-
-ssize_t Connection::try_send(const void* data, size_t len) {
-    if (!alive_ || fd_ < 0) {
-        MCCL_ERROR("try_send: connection dead (alive=%d fd=%d peer=%d)",
-                   (int)alive_.load(), fd_, peer_rank_);
-        return -1;
-    }
-    ssize_t n = ::send(fd_, data, len, MSG_DONTWAIT);
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        if (errno == EINTR) return 0;
-        MCCL_ERROR("try_send: errno=%d (%s) fd=%d peer=%d len=%zu",
-                   errno, strerror(errno), fd_, peer_rank_, len);
-        alive_ = false;
-        return -1;
-    }
-    return n;
-}
-
-ssize_t Connection::try_recv(void* data, size_t len) {
-    if (!alive_ || fd_ < 0) {
-        MCCL_ERROR("try_recv: connection dead (alive=%d fd=%d peer=%d)",
-                   (int)alive_.load(), fd_, peer_rank_);
-        return -1;
-    }
-    ssize_t n = ::recv(fd_, data, len, MSG_DONTWAIT);
-    if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        if (errno == EINTR) return 0;
-        MCCL_ERROR("try_recv: errno=%d (%s) fd=%d peer=%d len=%zu",
-                   errno, strerror(errno), fd_, peer_rank_, len);
-        alive_ = false;
-        return -1;
-    }
-    if (n == 0) {
-        MCCL_ERROR("try_recv: peer closed connection (fd=%d peer=%d)", fd_, peer_rank_);
-        alive_ = false;
-        return -1;
-    }
-    return n;
-}
+// send_heartbeat() was removed: it wrote a raw byte outside MessageHeader
+// framing, which would corrupt the stream for any caller.  Heartbeats, if
+// ever needed, must be proper OpType::HEARTBEAT messages.
 
 bool Connection::is_alive() const {
     return alive_.load();
+}
+
+void Connection::shutdown_socket() {
+    if (fd_ >= 0) {
+        ::shutdown(fd_, SHUT_RDWR);
+    }
+    alive_ = false;
 }
 
 void Connection::close() {

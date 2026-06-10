@@ -92,6 +92,10 @@ private:
     /// Ensure a tensor is contiguous; clone if needed.
     at::Tensor ensure_contiguous(const at::Tensor& tensor);
 
+    /// Make an already-completed Work (no-op collectives, e.g. zero-size tensors).
+    c10::intrusive_ptr<c10d::Work> make_completed_work(
+        c10d::OpType op_type, const std::vector<at::Tensor>& tensors = {});
+
     // Allreduce algorithm dispatch
     void allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
                             c10d::ReduceOp::RedOpType op);
@@ -101,6 +105,20 @@ private:
                                  c10d::ReduceOp::RedOpType op);
     void allreduce_small(at::Tensor& tensor, uint32_t seq,
                          c10d::ReduceOp::RedOpType op);
+    /// Recursive-doubling allreduce for small messages: 2 + log2(p) serial
+    /// rounds instead of the 2(ws-1) of the rank-0 star.  CPU-reduce path
+    /// (shared storage, no compression).
+    void allreduce_tree_small(at::Tensor& tensor, uint32_t seq,
+                              c10d::ReduceOp::RedOpType op);
+
+    /// Pipelined ring broadcast (large payloads, ws >= 4): root streams
+    /// slices around the ring; every rank forwards slice s while receiving
+    /// s+1.  Root egress is S bytes instead of (ws-1)*S.
+    void broadcast_ring_pipelined(at::Tensor& tensor, uint32_t seq, int root);
+
+    /// Binomial tree broadcast (small payloads, ws >= 4): ceil(log2 ws)
+    /// rounds instead of ws-1 serial root sends.
+    void broadcast_tree_small(at::Tensor& tensor, uint32_t seq, int root);
 
     // Compressed send/recv helpers
     void compressed_send(int peer, OpType op, uint32_t seq, uint32_t tid,
@@ -123,6 +141,11 @@ private:
 
     std::unique_ptr<Transport> transport_;
     std::unique_ptr<ProgressEngine> reduce_engine_;
+    /// Executor pool for ws>=3 ring collectives: MCCL_COLLECTIVE_CONCURRENCY
+    /// workers (default 2) start collectives in submission (seq) order but
+    /// run them concurrently, overlapping DDP buckets on the wire.  The
+    /// demultiplexed transport makes the interleaved traffic safe.
+    std::unique_ptr<ProgressEngine> collective_pool_;
     std::vector<std::unique_ptr<ProgressEngine>> net_engines_;
     std::unique_ptr<Rendezvous> rendezvous_;
     std::unique_ptr<Watchdog> watchdog_;

@@ -5,6 +5,8 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <mutex>
+#include <unordered_map>
 
 #include "metal/MPSInterop.hpp"
 #include "metal/EventSync.hpp"
@@ -42,8 +44,13 @@ size_t metal_max_buffer_len() {
 constexpr size_t PAGE = 16384;
 
 // Staging buffer — reused across calls to avoid repeated allocation.
-// Thread-safety: one collective at a time per process (ProgressEngine serializes I/O).
+// Thread-safety: ensure()/use is guarded by `mu` (held by the staging entry
+// points below).  Concurrent collectives must NOT route through this pool —
+// the pipelined ring paths use caller-owned buffers via blit_tensor_to_buffer
+// / blit_buffer_to_tensor instead; the pool only backs the residual serial
+// paths (legacy lock-step ring, 2-rank fallback, ensure_shared_storage).
 struct StagingPool {
+    std::mutex mu;
     void* ptr = nullptr;
     size_t capacity = 0;
     id<MTLBuffer> mtl_wrapper = nil;
@@ -101,7 +108,10 @@ void check_command_buffer(id<MTLCommandBuffer> cmd, const char* context) {
 void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
                               void* dst, size_t nbytes) {
     StagingPool& pool = staging_pool();
-    if (pool.mtl_wrapper && nbytes <= pool.capacity) {
+    // Fast path is only valid when the caller's destination IS the pool;
+    // otherwise (e.g. ensure_shared_storage passes a fresh allocation) the
+    // data would land in the pool and `dst` would stay uninitialized.
+    if (dst == pool.ptr && pool.mtl_wrapper && nbytes <= pool.capacity) {
         @autoreleasepool {
             id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
             id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
@@ -123,11 +133,18 @@ void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
     MCCL_INFO("chunked_blit_to_staging: %zu bytes in chunks of %zu (maxBuf=%zu)",
               nbytes, max_chunk, max_chunk);
 
-    while (offset < nbytes) {
-        size_t chunk = std::min(max_chunk, nbytes - offset);
-        size_t aligned_chunk = (chunk + PAGE - 1) & ~(PAGE - 1);
+    // Encode every chunk blit into ONE command buffer with a single
+    // commit + wait at the end.  Per-chunk commit/waitUntilCompleted turned
+    // a multi-chunk transfer into N CPU<->GPU round trips.
+    @autoreleasepool {
+        NSMutableArray<id<MTLBuffer>>* wrappers = [NSMutableArray array];
+        id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
 
-        @autoreleasepool {
+        while (offset < nbytes) {
+            size_t chunk = std::min(max_chunk, nbytes - offset);
+            size_t aligned_chunk = (chunk + PAGE - 1) & ~(PAGE - 1);
+
             id<MTLBuffer> chunk_mtl = [cached_device()
                 newBufferWithBytesNoCopy:dst_bytes + offset
                 length:aligned_chunk
@@ -136,18 +153,18 @@ void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
             MCCL_CHECK(chunk_mtl != nil,
                        "chunked_blit_to_staging: MTLBuffer wrap failed at offset " +
                        std::to_string(offset) + " chunk=" + std::to_string(aligned_chunk));
+            [wrappers addObject:chunk_mtl];  // keep alive until the GPU is done
 
-            id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
-            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
             [blit copyFromBuffer:src_buf sourceOffset:src_offset + offset
                         toBuffer:chunk_mtl destinationOffset:0
                             size:chunk];
-            [blit endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
-            check_command_buffer(cmd, "chunked_blit_to_staging(chunk)");
+            offset += chunk;
         }
-        offset += chunk;
+
+        [blit endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        check_command_buffer(cmd, "chunked_blit_to_staging(chunk)");
     }
 }
 
@@ -174,11 +191,16 @@ void chunked_blit_from_staging(const void* src, size_t nbytes,
     size_t offset = 0;
     const uint8_t* src_bytes = static_cast<const uint8_t*>(src);
 
-    while (offset < nbytes) {
-        size_t chunk = std::min(max_chunk, nbytes - offset);
-        size_t aligned_chunk = (chunk + PAGE - 1) & ~(PAGE - 1);
+    // Single command buffer for all chunks (see chunked_blit_to_staging).
+    @autoreleasepool {
+        NSMutableArray<id<MTLBuffer>>* wrappers = [NSMutableArray array];
+        id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
 
-        @autoreleasepool {
+        while (offset < nbytes) {
+            size_t chunk = std::min(max_chunk, nbytes - offset);
+            size_t aligned_chunk = (chunk + PAGE - 1) & ~(PAGE - 1);
+
             id<MTLBuffer> chunk_mtl = [cached_device()
                 newBufferWithBytesNoCopy:const_cast<uint8_t*>(src_bytes + offset)
                 length:aligned_chunk
@@ -187,18 +209,18 @@ void chunked_blit_from_staging(const void* src, size_t nbytes,
             MCCL_CHECK(chunk_mtl != nil,
                        "chunked_blit_from_staging: MTLBuffer wrap failed at offset " +
                        std::to_string(offset));
+            [wrappers addObject:chunk_mtl];
 
-            id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
-            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
             [blit copyFromBuffer:chunk_mtl sourceOffset:0
                         toBuffer:dst_buf destinationOffset:dst_offset + offset
                             size:chunk];
-            [blit endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
-            check_command_buffer(cmd, "chunked_blit_from_staging(chunk)");
+            offset += chunk;
         }
-        offset += chunk;
+
+        [blit endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        check_command_buffer(cmd, "chunked_blit_from_staging(chunk)");
     }
 }
 
@@ -252,22 +274,53 @@ void* get_mccl_command_queue() {
 MPSBufferView wrap_cpu_tensor_as_mps_buffer(const at::Tensor& tensor) {
     MCCL_CHECK(tensor.is_cpu(), "wrap_cpu_tensor_as_mps_buffer requires CPU tensor");
     MCCL_CHECK(tensor.is_contiguous(), "CPU tensor must be contiguous");
-    
+
     void* data_ptr = tensor.data_ptr();
     size_t nbytes = tensor_nbytes(tensor);
-    
-    id<MTLDevice> device = cached_device();
-    id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:data_ptr
-                                                      length:nbytes
-                                                     options:MTLResourceStorageModeShared
-                                                 deallocator:nil];
-    MCCL_CHECK(buffer != nil, "Failed to wrap CPU tensor as MTLBuffer");
-    
-    MCCL_TRACE("wrap_cpu_tensor: data_ptr=%p nbytes=%zu", data_ptr, nbytes);
-    
+
+    // newBufferWithBytesNoCopy requires a page-aligned pointer and a
+    // page-multiple length.  A generic CPU tensor is only malloc-aligned, so
+    // wrap the containing page range and report the intra-page offset.
+    // (Reading up to the page boundary past the allocation is safe: heap
+    // pages are mapped; the GPU never writes outside [byte_offset, +nbytes).)
+    uintptr_t addr = reinterpret_cast<uintptr_t>(data_ptr);
+    uintptr_t base = addr & ~static_cast<uintptr_t>(PAGE - 1);
+    size_t byte_offset = static_cast<size_t>(addr - base);
+    size_t wrap_len = (byte_offset + nbytes + PAGE - 1) & ~(PAGE - 1);
+
+    // Cache wrappers so (a) the returned view's buffer stays alive after this
+    // scope (ARC would otherwise release it and the view would dangle) and
+    // (b) repeated collectives on the same tensor don't allocate per call.
+    static std::mutex cache_mu;
+    static std::unordered_map<uintptr_t, std::pair<size_t, id<MTLBuffer>>> cache;
+    constexpr size_t MAX_CACHED_WRAPPERS = 256;
+
+    id<MTLBuffer> buffer = nil;
+    {
+        std::lock_guard<std::mutex> lock(cache_mu);
+        auto it = cache.find(base);
+        if (it != cache.end() && it->second.first >= wrap_len) {
+            buffer = it->second.second;
+        }
+    }
+
+    if (buffer == nil) {
+        buffer = [cached_device() newBufferWithBytesNoCopy:reinterpret_cast<void*>(base)
+                                                    length:wrap_len
+                                                   options:MTLResourceStorageModeShared
+                                               deallocator:nil];
+        MCCL_CHECK(buffer != nil, "Failed to wrap CPU tensor as MTLBuffer");
+        std::lock_guard<std::mutex> lock(cache_mu);
+        if (cache.size() >= MAX_CACHED_WRAPPERS) cache.clear();
+        cache[base] = {wrap_len, buffer};
+    }
+
+    MCCL_TRACE("wrap_cpu_tensor: data_ptr=%p nbytes=%zu base=%p offset=%zu",
+               data_ptr, nbytes, reinterpret_cast<void*>(base), byte_offset);
+
     return MPSBufferView{
         .mtl_buffer     = (__bridge void*)buffer,
-        .byte_offset    = 0,
+        .byte_offset    = byte_offset,
         .nbytes         = nbytes,
         .cpu_accessible = true,
         .cpu_ptr        = data_ptr,
@@ -309,7 +362,23 @@ void mps_stream_sync() {
 }
 
 void mps_stream_sync_after_cpu_mps_buffer_write() {
-    mps_stream_sync();
+    // CPU writes into MTLStorageModeShared buffers are coherent on Apple
+    // unified memory: any GPU kernel enqueued AFTER the collective completes
+    // observes the new data, and kernels enqueued BEFORE the collective were
+    // already ordered via the pre-collective MPS sync.  The previous
+    // implementation called torch::mps::synchronize() here — a full-stream
+    // drain (including unrelated forward/backward kernels) per collective
+    // that serialized DDP buckets and capped GPU utilization.
+    //
+    // MCCL_CPU_WRITE_SYNC=full restores the old blocking behavior for
+    // debugging suspected coherence/ordering issues.
+    static const bool full_sync = [] {
+        auto* v = std::getenv("MCCL_CPU_WRITE_SYNC");
+        return v && std::string(v) == "full";
+    }();
+    if (full_sync) {
+        mps_stream_sync();
+    }
 }
 
 void mccl_queue_drain() {
@@ -371,6 +440,7 @@ StagingBuffer stage_for_send(const at::Tensor& tensor) {
 
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
     StagingPool& pool = staging_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
     void* staging = pool.ensure(view.nbytes, cached_device());
     chunked_blit_to_staging(src_buf, view.byte_offset, staging, view.nbytes);
 
@@ -391,10 +461,35 @@ StagingBuffer stage_for_send_nosync(const at::Tensor& tensor) {
 
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
     StagingPool& pool = staging_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
     void* staging = pool.ensure(view.nbytes, cached_device());
     chunked_blit_to_staging(src_buf, view.byte_offset, staging, view.nbytes);
 
     return StagingBuffer{staging, view.nbytes};
+}
+
+void blit_tensor_to_buffer(const at::Tensor& tensor, void* dst) {
+    MPSBufferView view = extract_mps_buffer(tensor);
+    if (view.cpu_accessible && view.cpu_ptr) {
+        memcpy(dst, view.cpu_ptr, view.nbytes);
+        return;
+    }
+    MCCL_CHECK((reinterpret_cast<uintptr_t>(dst) & (PAGE - 1)) == 0,
+               "blit_tensor_to_buffer: dst must be page-aligned");
+    id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
+    chunked_blit_to_staging(src_buf, view.byte_offset, dst, view.nbytes);
+}
+
+void blit_buffer_to_tensor(const void* src, const at::Tensor& tensor) {
+    MPSBufferView view = extract_mps_buffer(tensor);
+    if (view.cpu_accessible && view.cpu_ptr) {
+        memcpy(view.cpu_ptr, src, view.nbytes);
+        return;
+    }
+    MCCL_CHECK((reinterpret_cast<uintptr_t>(src) & (PAGE - 1)) == 0,
+               "blit_buffer_to_tensor: src must be page-aligned");
+    id<MTLBuffer> dst_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
+    chunked_blit_from_staging(src, view.nbytes, dst_buf, view.byte_offset);
 }
 
 void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes) {
@@ -416,6 +511,7 @@ void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes)
 
     // Ensure staging pool has the data (may need to copy if src isn't the pool)
     StagingPool& pool = staging_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
     const void* blit_src = src;
     if (src != pool.ptr) {
         void* staging = pool.ensure(nbytes, cached_device());

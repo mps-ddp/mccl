@@ -65,6 +65,15 @@ StagingBuffer stage_for_send_nosync(const at::Tensor& tensor);
 /// Handles the CPU→GPU direction (write-back after network receive).
 void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes);
 
+/// Copy a (possibly private-storage) tensor's bytes into a caller-owned,
+/// PAGE-ALIGNED host buffer (e.g. a PooledBuffer).  Shared storage: memcpy;
+/// private: blit.  Unlike the StagingPool paths, the destination is owned by
+/// the caller, so concurrent collectives never share staging memory.
+void blit_tensor_to_buffer(const at::Tensor& tensor, void* dst);
+
+/// Inverse: copy a caller-owned, PAGE-ALIGNED host buffer into a tensor.
+void blit_buffer_to_tensor(const void* src, const at::Tensor& tensor);
+
 /// Returns true if the tensor's underlying MTLBuffer uses shared storage,
 /// meaning the CPU can read/write it directly without blit staging.
 /// Performs a lightweight runtime check (no sync, no copy).

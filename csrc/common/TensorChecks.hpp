@@ -28,10 +28,8 @@ inline void check_single_tensor(const at::Tensor& tensor) {
         std::string(at::toString(dtype))
     );
 
-    MCCL_CHECK_TENSOR(
-        tensor.numel() > 0,
-        "MCCL does not accept empty tensors"
-    );
+    // numel() == 0 tensors are allowed: collectives treat them as no-ops at the
+    // ProcessGroup entry points (matching the c10d contract).
 }
 
 inline void check_tensor_list(const std::vector<at::Tensor>& tensors) {

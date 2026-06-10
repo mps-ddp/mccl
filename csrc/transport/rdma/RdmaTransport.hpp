@@ -9,6 +9,7 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <unordered_set>
 
 namespace mccl {
 
@@ -42,6 +43,13 @@ public:
     bool recv_chunks(int peer_rank, OpType op, uint32_t seq,
                      uint32_t tensor_id, void* data, size_t nbytes) override;
 
+    RecvTicket post_recv(int peer_rank, OpType op, uint32_t seq,
+                         uint32_t tid, void* data, size_t nbytes) override;
+
+    bool wait_recv(const RecvTicket& ticket) override;
+
+    void cancel_recvs(uint32_t seq, const std::string& reason) override;
+
     bool send_recv_overlap(
         int send_peer, OpType send_op, uint32_t send_seq, uint32_t send_tid,
         const void* send_data, size_t send_nbytes,
@@ -63,20 +71,27 @@ public:
     static bool is_available();
 
 private:
-    static constexpr size_t kRdmaBufSize    = 512 * 1024;  // 512 KB per buffer
-    static constexpr int    kPipelineDepth   = 2;
+    static constexpr size_t kRdmaBufSize    = 512 * 1024;  // 512 KB per pipeline slot
+    static constexpr int    kPipelineDepth   = 4;           // outstanding WRs per direction
     static constexpr int    kCqPollBatchSize = 8;
 
     /// Try to set up RDMA connections using the TCP side channel for QP
     /// metadata exchange. Sets rdma_active_ = true on success.
     void try_init_rdma();
 
-    /// Poll a connection's CQ until a specific wr_id completes.
-    bool poll_completion(RdmaConnection& conn, uint64_t expected_wr_id);
+    /// Poll a peer's CQ until a specific wr_id completes.  The QP uses one
+    /// CQ for both directions, so completions for OTHER outstanding wr_ids
+    /// are buffered (NOT discarded — discarding desynchronized the overlap
+    /// path) and satisfied on later calls.
+    bool poll_completion(int peer_rank, RdmaConnection& conn, uint64_t expected_wr_id);
 
-    /// RDMA data path implementations.
-    bool rdma_send(int peer_rank, const void* data, size_t nbytes);
-    bool rdma_recv(int peer_rank, void* data, size_t nbytes);
+    /// RDMA data path implementations (pipelined: up to kPipelineDepth
+    /// outstanding work requests per direction).
+    /// Returns: 1 success, 0 failure before any WR was posted (safe to fall
+    /// back to TCP), -1 failure mid-transfer (peers may be desynchronized —
+    /// the collective must abort, not retry).
+    int rdma_send(int peer_rank, const void* data, size_t nbytes);
+    int rdma_recv(int peer_rank, void* data, size_t nbytes);
 
     std::unique_ptr<TcpTransport> tcp_;
     std::atomic<bool> rdma_active_{false};
@@ -84,12 +99,16 @@ private:
     std::vector<RdmaConnection> connections_;
 
     struct PeerBuffers {
-        SharedBuffer send_buf;
-        SharedBuffer recv_buf;
+        SharedBuffer send_buf;   // kPipelineDepth slots of kRdmaBufSize
+        SharedBuffer recv_buf;   // kPipelineDepth slots of kRdmaBufSize
         ibv_mr* send_mr = nullptr;
         ibv_mr* recv_mr = nullptr;
     };
     std::vector<PeerBuffers> peer_bufs_;
+
+    // Successful completions observed while polling for a different wr_id
+    // (send vs recv share one CQ).  Guarded by the per-peer rdma mutex.
+    std::vector<std::unordered_set<uint64_t>> completed_wrs_;
 
     std::vector<std::unique_ptr<std::mutex>> rdma_mu_;
 };

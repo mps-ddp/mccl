@@ -174,6 +174,30 @@ struct RingGates {
     }
 };
 
+// Keep-alive for `incoming` staging tensors consumed by ASYNC Metal reduce
+// kernels.  metal_reduce_op() only commits; destroying the tensor lets
+// PyTorch's MPS allocator recycle its buffer for the next step's
+// empty_like, whose CPU fill then races the still-running kernel —
+// silently corrupting partial sums (training still converges, just
+// slower).  This was the corruption the old per-step queue drains were
+// masking.  The destructor drains the MCCL queue before releasing the
+// tensors, so even exception paths cannot free a buffer a kernel is
+// reading.  (The normal path drains in the collective tail first, making
+// the destructor's drain a no-op.)
+struct IncomingKeepAlive {
+    std::vector<at::Tensor> tensors;
+    ~IncomingKeepAlive() {
+        if (!tensors.empty()) {
+            try {
+                metal_sync_queue_only();
+            } catch (...) {
+                // Destructor must not throw; a failed drain here means the
+                // device is already in a fatal state.
+            }
+        }
+    }
+};
+
 struct RingPipelineCtx {
     Transport* transport;
     Watchdog* watchdog;
@@ -184,6 +208,7 @@ struct RingPipelineCtx {
     OpType wire_op;
     c10d::ReduceOp::RedOpType red_op;
     bool use_cpu;   // fp32 vDSP reduce directly in unified memory
+    std::vector<at::Tensor>* incoming_keep = nullptr;  // see IncomingKeepAlive
 };
 
 void run_ring_pipeline(const RingPipelineCtx& ctx,
@@ -206,10 +231,13 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
     };
 
     // Credit flow control engages for large chunks only (see helpers above).
+    // (std::max<size_t> explicitly: element_size() is int64_t, and the
+    // mixed unsigned-long/unsigned-long-long product breaks deduction.)
     size_t max_chunk = 0;
     for (auto& c : chunks) {
-        max_chunk = std::max(max_chunk,
-                             static_cast<size_t>(c.numel()) * c.element_size());
+        max_chunk = std::max<size_t>(
+            max_chunk, static_cast<size_t>(c.numel()) *
+                       static_cast<size_t>(c.element_size()));
     }
     const bool credits_on = max_chunk >= credit_min_chunk_bytes() &&
                             credit_min_chunk_bytes() > 0;
@@ -377,12 +405,19 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
                         at::Tensor incoming = torch::empty_like(rchunk);
                         unstage_from_recv(incoming, recv_dst[g], rbytes);
                         metal_reduce_op(rchunk, incoming, ctx.red_op);
+                        // Pin until the caller's final queue drain: the
+                        // kernel reads `incoming` asynchronously.
+                        if (ctx.incoming_keep) {
+                            ctx.incoming_keep->push_back(std::move(incoming));
+                        } else {
+                            metal_sync_queue_only();
+                        }
                         if (use_event_fence) {
                             uint64_t v = next_event_value();
                             signal_mccl_fence_gpu(v);
                             chunk_pending[st.recv_idx] = v;
                             gate_fence = v;
-                        } else {
+                        } else if (ctx.incoming_keep) {
                             metal_sync_queue_only();
                         }
                     }
@@ -1428,6 +1463,10 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
         }
     }
 
+    // Staging tensors consumed by async Metal reduce kernels stay alive
+    // until the tail drain (or the guard's own drain on error paths).
+    IncomingKeepAlive incoming_keep;
+
     if (ring_pipeline_enabled()) {
         // Streaming TX/RX pipeline over the same (verified) 2P-chunk
         // schedule: both link directions and the reduce stay busy
@@ -1457,7 +1496,8 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
         // at global step g is the chunk received at step g-2, so lookahead=2
         // (the first two sends are the rank's own initial chunks).
         RingPipelineCtx ctx{transport_.get(), watchdog_.get(), metrics_.get(),
-                            seq, left, right, OpType::ALLREDUCE, op, use_cpu};
+                            seq, left, right, OpType::ALLREDUCE, op, use_cpu,
+                            &incoming_keep.tensors};
         run_ring_pipeline(ctx, chunks, plan, /*lookahead=*/2);
     } else {
     PooledBuffer recv_buf_pool(staging_memory_pool(), chunk_elems * elem_size);
@@ -1527,6 +1567,7 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
                 at::Tensor incoming = torch::empty_like(recv_chunk);
                 unstage_from_recv(incoming, recv_buf_pool.data(), recv_bytes);
                 metal_reduce_op(recv_chunk, incoming, op);
+                incoming_keep.tensors.push_back(std::move(incoming));  // kernel is async
                 arm_chunk(recv_chunk_idx);
             }
         }
@@ -1627,6 +1668,9 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
         }
     }
 
+    // Keep-alive for async-kernel staging tensors (see chunked ring).
+    IncomingKeepAlive incoming_keep;
+
     if (ring_pipeline_enabled()) {
         // Streaming TX/RX pipeline over the plain-ring schedule.  The chunk
         // sent at step g is the chunk received at step g-1: lookahead=1.
@@ -1652,7 +1696,8 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
             plan.push_back(st);
         }
         RingPipelineCtx ctx{transport_.get(), watchdog_.get(), metrics_.get(),
-                            seq, left, right, OpType::ALLREDUCE, op, use_cpu};
+                            seq, left, right, OpType::ALLREDUCE, op, use_cpu,
+                            &incoming_keep.tensors};
         run_ring_pipeline(ctx, chunks, plan, /*lookahead=*/1);
     } else {
     PooledBuffer recv_buf_pool(staging_memory_pool(), chunk_elems * elem_size);
@@ -1719,6 +1764,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
                 at::Tensor incoming = torch::empty_like(recv_chunk);
                 unstage_from_recv(incoming, recv_buf_pool.data(), recv_bytes);
                 metal_reduce_op(recv_chunk, incoming, op);
+                incoming_keep.tensors.push_back(std::move(incoming));  // kernel is async
                 arm_chunk(recv_idx);
             }
         }
@@ -1864,10 +1910,17 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
     } else {
         // f16 or compressed path: existing Metal pipeline
         if (rank == 0) {
+            // Pin staging tensors until the queue drain below — the reduce
+            // kernels read them asynchronously, and letting them die mid-loop
+            // lets the MPS allocator recycle their buffers into the next
+            // iteration's empty_like while the kernel still reads them.
+            IncomingKeepAlive incoming_keep;
+            incoming_keep.tensors.reserve(ws - 1);
             for (int peer = 1; peer < ws; peer++) {
                 at::Tensor incoming = torch::empty_like(tensor);
                 compressed_recv(peer, OpType::ALLREDUCE, seq, 0, incoming);
                 metal_reduce_op(tensor, incoming, op);
+                incoming_keep.tensors.push_back(std::move(incoming));
             }
 
             if (op == c10d::ReduceOp::AVG) {
@@ -2718,6 +2771,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
 
             std::vector<at::Tensor> chunks = inputs_copy;
 
+            // Keep-alive for async-kernel staging tensors; drained by the
+            // metal_sync_queue_only in the tail below before destruction.
+            IncomingKeepAlive incoming_keep;
+
             if (ring_pipeline_enabled()) {
                 // Streaming pipeline: send(s) = (rank+1-s) = recv(s-1), so
                 // lookahead 1; every received chunk is reduced into place
@@ -2735,7 +2792,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                 }
                 RingPipelineCtx ctx{transport_.get(), watchdog_.get(),
                                     metrics_.get(), seq, left, right,
-                                    OpType::REDUCE_SCATTER, rs_op, use_cpu};
+                                    OpType::REDUCE_SCATTER, rs_op, use_cpu,
+                                    &incoming_keep.tensors};
                 run_ring_pipeline(ctx, chunks, plan, /*lookahead=*/1);
             } else {
             PooledBuffer recv_buf(staging_memory_pool(), nbytes);
@@ -2790,6 +2848,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                     at::Tensor incoming = torch::empty_like(chunks[recv_idx]);
                     unstage_from_recv(incoming, recv_buf.data(), nbytes);
                     metal_reduce_op(chunks[recv_idx], incoming, rs_op);
+                    incoming_keep.tensors.push_back(std::move(incoming));  // kernel is async
                     arm_chunk(recv_idx);
                 }
 

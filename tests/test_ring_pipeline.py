@@ -120,6 +120,29 @@ def _concurrent_buckets_fn(rank, world_size):
         assert bad == 0, f"bucket {i}: {bad} corrupted elements"
 
 
+def _skewed_start_flood_fn(rank, world_size):
+    """Credit flow-control regression: rank (ws-1) starts each collective
+    LATE (simulating a slower GPU / later bucket start on a mixed cluster).
+    Its upstream neighbor could otherwise legally stream nearly the whole
+    bucket unsolicited; with a deliberately tiny park limit (8 MB) that
+    would overflow and abort.  Credits cap the sender's lead at depth+2
+    chunks, so this must pass."""
+    import time
+    import torch
+    import torch.distributed as dist
+
+    n = 12_000_000  # 48 MB fp32 -> chunks ~6 MB at ws=4 (2*ws chunking)
+    for it in range(3):
+        if rank == world_size - 1:
+            time.sleep(1.0)  # late starter
+        t = torch.full((n,), float(it + 1) * (rank + 1),
+                       dtype=torch.float32, device="mps")
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        expected = float(it + 1) * sum(r + 1 for r in range(world_size))
+        bad = (t.cpu() != expected).sum().item()
+        assert bad == 0, f"iter {it}: {bad} corrupted elements"
+
+
 def _p2p_during_collective_fn(rank, world_size):
     """Demux regression: p2p send/recv interleaved with a large collective on
     the same links.  Pre-demux this was a documented interleaving hazard;
@@ -203,3 +226,19 @@ class TestDemuxInterleave:
     @pytest.mark.parametrize("world_size", [4])
     def test_p2p_during_collective(self, world_size):
         run_workers(_p2p_during_collective_fn, world_size=world_size, timeout=300)
+
+
+class TestCreditFlowControl:
+    @pytest.mark.parametrize("world_size", [4])
+    def test_skewed_start_bounded_by_credits(self, world_size):
+        run_workers(
+            _skewed_start_flood_fn, world_size=world_size,
+            env={
+                # Small enough that an uncredited sender flooding a late rank
+                # (~bucket size) would overflow and abort; credits keep the
+                # lead at (depth+2) x chunk ~ 24 MB.
+                "MCCL_DEMUX_PARK_BYTES": str(48 * 1024 * 1024),
+                "MCCL_CREDIT_MIN_CHUNK": str(1024 * 1024),
+            },
+            timeout=420,
+        )

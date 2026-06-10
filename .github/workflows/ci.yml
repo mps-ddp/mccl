@@ -63,6 +63,9 @@ jobs:
       - name: Pipelined ring + demux (ws=4)
         run: pytest -v tests/test_ring_pipeline.py -k "not 6"
 
+      - name: Metrics populated (latency/phase stats nonzero)
+        run: pytest -v tests/test_metrics.py
+
       - name: Tree collectives (ws=3..5)
         run: pytest -v tests/test_tree_collectives.py -k "not 6"
 

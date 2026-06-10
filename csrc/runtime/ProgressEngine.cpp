@@ -143,10 +143,10 @@ void ProgressEngine::worker_loop() {
 
         MCCL_TRACE("Executing op seq=%u", op.seq_num);
 
-        // Record when execution actually starts (after queue wait)
-        if (metrics_) {
-            metrics_->op_execute_start(op.seq_num);
-        }
+        // NOTE: execute-start metrics are recorded by the collective's own
+        // execute lambda (ProcessGroupMCCL::begin_execute) — the engine's
+        // internal seq_counter_ is NOT the collective seq, so stamping
+        // metrics here would hit the wrong (or no) inflight entry.
 
         bool exec_ok = false;
         std::exception_ptr exec_ex;

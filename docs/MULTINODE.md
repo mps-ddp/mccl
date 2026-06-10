@@ -145,8 +145,9 @@ torchrun --nnodes=24 --node_rank=$i --nproc_per_node=1 \
 |------|---------|-------------|
 | `MCCL_RING_PIPELINE` | on | Streaming TX/RX ring: both link directions busy through all 2(N-1) steps. Set `0` only to bisect a suspected pipeline bug. |
 | `MCCL_PIPELINE_DEPTH` | 2 | Posted-ahead receives per collective. Raise to 3-4 on high-latency links. |
-| `MCCL_COLLECTIVE_CONCURRENCY` | 2 | DDP buckets in flight. Raise to 3-4 if `avg_network_ms` shows gaps between buckets; lower to 1 if `MCCL_DEMUX_PARK_BYTES` overflows are reported. |
-| `MCCL_SMALL_MSG_THRESHOLD` | 256 KiB | Below: recursive-doubling tree allreduce (~2+log2 N rounds). Above: pipelined ring. |
+| `MCCL_COLLECTIVE_CONCURRENCY` | 2 | DDP buckets in flight. Raise to 3-4 if `avg_network_ms` shows gaps between buckets. |
+| `MCCL_CREDIT_MIN_CHUNK` | 1 MB | Credit flow control: senders stay at most `depth+2` chunks ahead of each consumer, so a slow GPU / late bucket start on one Mac is throttled at the source instead of flooding its receive buffers. Mixed M1/M4 clusters rely on this. |
+| `MCCL_SMALL_MSG_THRESHOLD` | auto | Below: recursive-doubling tree allreduce (~2+log2 N rounds). Above: pipelined ring. Auto-scales with world size (256 KiB at N<=4 up to 2 MiB at N=24+) since the ring pays 2(N-1) latencies; set explicitly to pin. |
 | broadcast | auto | ws>=4 uses binomial tree (small) / pipelined ring (large): root egress is S bytes, not (N-1)S. |
 
 4. **Verify the link**, then the ring bound:
@@ -168,6 +169,33 @@ pair with iperf3).
 5. **Failure triage**: `MCCL_LOG_LEVEL=INFO` prints per-collective algo +
    timing; watchdog aborts name the seq/op; `demux park limit exceeded`
    means one rank is outpacing another (see knob table above).
+
+## Troubleshooting: "gai error: 8 — nodename nor servname provided"
+
+`The IPv6 network addresses of (<your-mac-name>, <port>) cannot be
+retrieved (gai error: 8 ...)` is printed by **PyTorch's TCPStore /
+torchrun**, not MCCL — it fires during `init_process_group`, before MCCL's
+transport exists, when `MASTER_ADDR` (or torchrun's rendezvous endpoint) is
+a hostname that `getaddrinfo` cannot resolve. PyTorch probes IPv6 first, so
+you may see this once as a *benign warning* (it then falls back to IPv4);
+it is fatal only when IPv4 resolution fails too.
+
+macOS specifics: a bare computer name (`Foo-MacBook-Pro`) usually does NOT
+resolve — mDNS needs the `.local` suffix, and `HostName` /
+`LocalHostName` / `ComputerName` can disagree (`scutil --get HostName`).
+
+Fixes, in order of preference:
+
+1. **Always pass a numeric IP**: `--master_addr=127.0.0.1` for single-node;
+   the Thunderbolt bridge IP (`169.254.x.x`) or LAN IP of rank 0 for
+   multi-node. Every example in this repo does this.
+2. Test what the store will see: `dscacheutil -q host -a name <name>`.
+3. If you must use a name: use the full `<name>.local`, or pin it in
+   `/etc/hosts`, or align it via `sudo scutil --set HostName <name>.local`.
+
+MCCL itself never resolves or publishes hostnames — endpoints exchanged
+through the store are numeric interface IPs — and it now logs an actionable
+warning at startup when `MASTER_ADDR` is set to something unresolvable.
 
 ## Optional: Metal gradient reduce (future work)
 

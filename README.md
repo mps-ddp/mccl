@@ -136,7 +136,8 @@ Network and staging run on a **background queue** (`ProgressEngine`, `csrc/runti
 | `MCCL_RING_PIPELINE` | on | Streaming TX/RX ring pipeline (NCCL-style): both link directions + reduce busy concurrently. `0` = lock-step fallback (debug). |
 | `MCCL_PIPELINE_DEPTH` | `2` | Receives posted ahead per ring pipeline (1-8). |
 | `MCCL_COLLECTIVE_CONCURRENCY` | `2` | ws>=3 collectives in flight (1-4); buckets overlap on the wire via the demux transport. |
-| `MCCL_DEMUX_PARK_BYTES` | 256 MB | Per-peer bound on messages buffered before their receive is posted. |
+| `MCCL_DEMUX_PARK_BYTES` | 512 MB | Per-peer bound on messages buffered before their receive is posted (headroom only — credits bound the steady state). |
+| `MCCL_CREDIT_MIN_CHUNK` | 1 MB | Chunks at or above this engage NCCL-style credit flow control: a sender runs at most `depth+2` steps ahead of its consumer, so a slow/late rank is never flooded. `0` disables. |
 | `MCCL_FP32_CPU_REDUCE` | off | fp32 reductions via vDSP directly in unified memory (often higher allreduce busbw). |
 | `MCCL_CPU_WRITE_SYNC` | `none` | `full` restores a full `torch.mps.synchronize()` after CPU-path collectives (debugging only; serializes buckets). |
 | `MCCL_EVENT_SYNC` | on | `0` disables MTLSharedEvent sync (falls back to blocking stream sync; kills overlap). |

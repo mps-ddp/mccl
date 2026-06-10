@@ -126,6 +126,15 @@ private:
     void compressed_recv(int peer, OpType op, uint32_t seq, uint32_t tid,
                          const at::Tensor& tensor);
 
+    /// First line of every collective's execute lambda: arms the watchdog
+    /// deadline and stamps Metrics::op_execute_start with the COLLECTIVE seq
+    /// (the engine's internal counter is a different namespace), so
+    /// queue-wait vs execution time splits are attributed correctly.
+    void begin_execute(uint32_t seq) {
+        watchdog_->touch(seq);
+        metrics_->op_execute_start(seq);
+    }
+
     // Work registry: tracks all in-flight Work objects so watchdog/health
     // callbacks can mark them as failed without waiting for the I/O to unblock.
     void register_work(uint32_t seq, c10::intrusive_ptr<WorkMCCL> work);

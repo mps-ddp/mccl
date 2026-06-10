@@ -35,6 +35,12 @@ struct TransportConfig {
 /// Warn if MCCL listen base port matches MASTER_PORT (TCP store vs MCCL rank-0 collision).
 void warn_if_mccl_port_overlaps_master(const TransportConfig& cfg);
 
+/// Warn (with actionable guidance) when MASTER_ADDR is a hostname that does
+/// not resolve to IPv4 on this machine — PyTorch's TCPStore will fail with
+/// "gai error: 8" long before MCCL's transport runs.  Best-effort diagnosis;
+/// MCCL itself only ever publishes/dials numeric IPs.
+void warn_if_master_addr_unresolvable();
+
 class TcpTransport : public Transport {
 public:
     TcpTransport(int rank, int world_size, const TransportConfig& config);
@@ -150,10 +156,11 @@ private:
     std::atomic<bool> readers_started_{false};
     bool auto_start_readers_ = true;
     bool crc_enabled_ = false;
-    // Bound on buffered not-yet-posted messages per peer.  Sized for
-    // concurrent collectives: a peer that starts bucket N+1 earlier than us
-    // may stream up to pipeline_lookahead x ring_chunk unsolicited bytes.
-    size_t park_limit_bytes_ = 256ULL << 20;  // MCCL_DEMUX_PARK_BYTES
+    // Bound on buffered not-yet-posted messages per peer.  Credit flow
+    // control caps a sender's lead at credit_window x chunk, so this is
+    // pure headroom (concurrency x window x chunk plus socket buffers);
+    // overflowing it indicates a real desync and fails loudly.
+    size_t park_limit_bytes_ = 512ULL << 20;  // MCCL_DEMUX_PARK_BYTES
 
     std::vector<Connection> peers_;
     std::vector<std::unique_ptr<PeerRouter>> routers_;

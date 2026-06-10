@@ -217,6 +217,26 @@ TransportConfig TransportConfig::from_env() {
     return cfg;
 }
 
+void warn_if_master_addr_unresolvable() {
+    const char* master = std::getenv("MASTER_ADDR");
+    if (!master || master[0] == '\0') return;
+    if (resolve_ipv4(master) != 0) return;  // resolves fine (numeric or DNS/mDNS)
+
+    // PyTorch's TCPStore resolves MASTER_ADDR before MCCL ever runs; it
+    // probes IPv6 first ("The IPv6 network addresses of (...) cannot be
+    // retrieved (gai error: 8)") and fails hard if IPv4 cannot resolve
+    // either.  On macOS a bare computer name often does not resolve —
+    // mDNS needs the ".local" suffix and the ComputerName/HostName/
+    // LocalHostName values can disagree (scutil --get HostName).
+    MCCL_WARN(
+        "MASTER_ADDR='%s' does not resolve to an IPv4 address on this host. "
+        "PyTorch's store will likely fail with 'gai error: 8 - nodename nor "
+        "servname provided'. Use a NUMERIC IP instead: 127.0.0.1 for "
+        "single-node, the Thunderbolt bridge IP (169.254.x.x) or LAN IP for "
+        "multi-node. Verify with: dscacheutil -q host -a name %s",
+        master, master);
+}
+
 void warn_if_mccl_port_overlaps_master(const TransportConfig& cfg) {
     const char* mp = std::getenv("MASTER_PORT");
     if (!mp) return;
@@ -237,6 +257,21 @@ TcpTransport::TcpTransport(int rank, int world_size, const TransportConfig& conf
 
     MCCL_CHECK(rank >= 0 && rank < world_size, "Invalid rank");
     MCCL_CHECK(world_size >= 2, "world_size must be >= 2");
+
+    // Scale the small-message threshold with world size when not pinned by
+    // env: the recursive-doubling tree costs ~log2(N) full-payload rounds
+    // per rank vs the ring's 2(N-1) latency-bound steps, so the tree wins
+    // for progressively larger payloads as N grows (latency dominates the
+    // ring at 2(N-1) hops).  256 KiB at N<=4, scaling to 1.5 MiB at N=24.
+    if (!std::getenv("MCCL_SMALL_MSG_THRESHOLD") && world_size > 4) {
+        size_t scaled = config_.small_msg_threshold *
+                        (static_cast<size_t>(world_size) / 4);
+        config_.small_msg_threshold =
+            std::min<size_t>(scaled, 2 * 1024 * 1024);
+        MCCL_INFO("Rank %d: small_msg_threshold auto-scaled to %zu for "
+                  "world_size=%d (set MCCL_SMALL_MSG_THRESHOLD to override)",
+                  rank_, config_.small_msg_threshold, world_size);
+    }
 
     if (auto* v = std::getenv("MCCL_TRANSPORT_CRC")) {
         crc_enabled_ = (std::string(v) == "1" || std::string(v) == "true");

@@ -80,6 +80,39 @@ inline int ring_pipeline_depth() {
     return depth;
 }
 
+// ── Credit-based flow control (NCCL-style) ──────────────────────────
+//
+// A sender's pipeline is gated by ITS OWN receive progress, not by the
+// downstream rank's.  On a ring this means an upstream neighbor can run
+// nearly the whole reduce-scatter phase while a slow rank (slower GPU,
+// later bucket start) has consumed nothing — flooding it with up to a full
+// bucket of unsolicited data that the demux must park.  Credits bound that:
+// the receiver sends a 1-byte message (same seq, tid bit 31 set) after
+// consuming each step; the sender may run at most `credit_window` steps
+// ahead of the last credited step.  Credits ride the ordinary demux path —
+// no protocol change — and flow strictly backward, so no cycles.
+//
+// Only engaged for chunks >= MCCL_CREDIT_MIN_CHUNK (default 1 MB): below
+// that, the flood is bounded to a few MB anyway and the extra per-step
+// message would cost latency on small rings.
+constexpr uint32_t kCreditTidFlag = 0x80000000u;
+
+inline size_t credit_min_chunk_bytes() {
+    static size_t v = [] {
+        auto* e = std::getenv("MCCL_CREDIT_MIN_CHUNK");
+        long long n = e ? std::atoll(e) : (1LL << 20);
+        return static_cast<size_t>(std::max(0LL, n));
+    }();
+    return v;
+}
+
+// Sender lead over the last credited step.  depth + 2 keeps the wire full
+// (receiver posts `depth` ahead; the +2 covers credit round-trip latency)
+// while bounding unsolicited data at a slow receiver to window x chunk.
+inline int credit_window() {
+    return ring_pipeline_depth() + 2;
+}
+
 // ── Streaming ring pipeline ──────────────────────────────────────────
 //
 // NCCL-style execution of a ring schedule: a TX thread streams chunks to the
@@ -172,6 +205,24 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
         return static_cast<size_t>(chunks[idx].numel()) * chunks[idx].element_size();
     };
 
+    // Credit flow control engages for large chunks only (see helpers above).
+    size_t max_chunk = 0;
+    for (auto& c : chunks) {
+        max_chunk = std::max(max_chunk,
+                             static_cast<size_t>(c.numel()) * c.element_size());
+    }
+    const bool credits_on = max_chunk >= credit_min_chunk_bytes() &&
+                            credit_min_chunk_bytes() > 0;
+    const int cwin = credit_window();
+
+    // Credits arrive from the RIGHT neighbor (the consumer of our sends):
+    // one byte per step, tid = kCreditTidFlag | step.  Storage lives at
+    // FUNCTION scope (not in the TX lambda): registered sinks reference it,
+    // and on an early TX exit the error path below must be able to cancel
+    // and drain them before this memory dies.
+    std::vector<uint8_t> credit_bytes(credits_on ? nsteps : 0);
+    std::vector<RecvTicket> credit_tickets(credits_on ? nsteps : 0);
+
     // ── TX: stream chunks to the right neighbor in schedule order ──
     std::exception_ptr tx_error;
     std::thread tx([&] {
@@ -180,6 +231,15 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
             // concurrent collectives never share the global StagingPool.
             std::unique_ptr<PooledBuffer> tx_staging;
             size_t tx_staging_size = 0;
+
+            if (credits_on) {
+                for (size_t g = 0; g + cwin < nsteps; ++g) {
+                    credit_tickets[g] = ctx.transport->post_recv(
+                        ctx.right, ctx.wire_op, ctx.seq,
+                        kCreditTidFlag | static_cast<uint32_t>(g),
+                        &credit_bytes[g], 1);
+                }
+            }
 
             for (size_t g = 0; g < nsteps; ++g) {
                 const RingStep& st = plan[g];
@@ -190,6 +250,17 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
                 uint64_t fence_val = 0;
                 if (!gates.wait_gate(g, &fence_val)) return;  // RX failed
                 if (fence_val > 0) wait_for_mccl_fence(fence_val);
+
+                // Don't outrun the consumer: before sending step g, the right
+                // neighbor must have consumed step g - cwin.  Bounds parked
+                // bytes at a slow/late receiver to cwin x chunk.
+                if (credits_on && g >= static_cast<size_t>(cwin)) {
+                    MCCL_CHECK(ctx.transport->wait_recv(
+                                   credit_tickets[g - cwin]),
+                               "ring pipeline credit wait failed at step " +
+                               std::to_string(g) + " (seq=" +
+                               std::to_string(ctx.seq) + ")");
+                }
 
                 ctx.watchdog->touch(ctx.seq);
 
@@ -230,6 +301,13 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
     std::vector<RecvTicket> tickets(nsteps);
     std::vector<void*> recv_dst(nsteps, nullptr);
     std::vector<uint8_t> recv_inplace(nsteps, 0);
+
+    // Phase accounting: wall time of the whole pipeline is the network
+    // phase (TX/RX/reduce overlap by design, so phases exceed elapsed —
+    // that is the point); reduce time is accumulated around the actual
+    // reduction calls on the RX side.
+    const auto pipe_t0 = std::chrono::steady_clock::now();
+    double red_ms_accum = 0;
 
     std::exception_ptr rx_error;
     try {
@@ -289,6 +367,7 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
 
                 at::Tensor& rchunk = chunks[st.recv_idx];
                 if (st.kind == RingRecvKind::REDUCE) {
+                    const auto red_t0 = std::chrono::steady_clock::now();
                     if (ctx.use_cpu) {
                         MPSBufferView view = extract_mps_buffer(rchunk);
                         cpu_reduce_op(static_cast<float*>(view.cpu_ptr),
@@ -307,6 +386,8 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
                             metal_sync_queue_only();
                         }
                     }
+                    red_ms_accum += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - red_t0).count();
                 } else {
                     if (!recv_inplace[g]) {
                         // Private-storage fallback: blit caller-owned scratch
@@ -317,6 +398,20 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
             }
 
             gates.open_gate(g + static_cast<size_t>(lookahead), gate_fence);
+
+            // Credit the LEFT neighbor: step g is consumed; it may now send
+            // step g + cwin.  Sent for every step (even empty/recv-less
+            // ones) so the sender's unconditional waits always resolve.
+            if (credits_on && g + static_cast<size_t>(cwin) < nsteps) {
+                uint8_t one = 1;
+                MCCL_CHECK(ctx.transport->send_chunks(
+                               ctx.left, ctx.wire_op, ctx.seq,
+                               kCreditTidFlag | static_cast<uint32_t>(g),
+                               &one, 1),
+                           "ring pipeline credit send failed at step " +
+                           std::to_string(g) + " (seq=" +
+                           std::to_string(ctx.seq) + ")");
+            }
 
             if (next_post < nsteps) {
                 post_step(next_post);
@@ -329,8 +424,31 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
     }
 
     tx.join();
+
+    if (rx_error || tx_error) {
+        // Posted-but-unwaited receives (depth-ahead data, credit tickets)
+        // still reference scratch/credit storage that dies with this frame.
+        // Cancel them, then drain each ticket: wait_recv blocks until the
+        // reader is not mid-copy, so destruction below is safe.  Waits
+        // return instantly (cancelled or already complete) — never block on
+        // the peer, which may itself be stuck.
+        ctx.transport->cancel_recvs(ctx.seq, "ring pipeline aborted");
+        for (auto& t : tickets) {
+            if (!t) continue;
+            try { ctx.transport->wait_recv(t); } catch (...) {}
+        }
+        for (auto& t : credit_tickets) {
+            if (!t) continue;
+            try { ctx.transport->wait_recv(t); } catch (...) {}
+        }
+    }
+
     if (rx_error) std::rethrow_exception(rx_error);
     if (tx_error) std::rethrow_exception(tx_error);
+
+    const double net_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - pipe_t0).count();
+    ctx.metrics->record_phase(ctx.seq, 0, net_ms, red_ms_accum);
 }
 
 // MCCL_FP32_CPU_REDUCE: unset = Metal/staging for float32 (default, fewer full syncs).
@@ -557,6 +675,7 @@ void ProcessGroupMCCL::init_transport() {
 
     TransportConfig cfg = TransportConfig::from_env();
     warn_if_mccl_port_overlaps_master(cfg);
+    warn_if_master_addr_unresolvable();
 
     if (cfg.transport == "rdma" ||
         (cfg.transport == "auto" && RdmaTransport::is_available())) {
@@ -822,7 +941,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
             net_engine_for(peer).submit(
                 [this, tensor_copy, seq, red_op, sync_val, defer_mps_sync_to_engine,
                  peer, nbytes, shared_recv_buf]() mutable {
-                    watchdog_->touch(seq);  // clock starts at execution, not submission
+                    begin_execute(seq);  // watchdog arm + execute-start metric
                     if (defer_mps_sync_to_engine) {
                         if (overlap_comm_ && event_sync_available()) {
                             uint64_t v = next_event_value();
@@ -914,7 +1033,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
             // must use net_engine to avoid concurrent socket access with large ops)
             net_engine_for(peer).submit(
                 [this, tensor_copy, seq, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
-                    watchdog_->touch(seq);
+                    begin_execute(seq);
                     if (defer_mps_sync_to_engine) {
                         if (overlap_comm_ && event_sync_available()) {
                             uint64_t v = next_event_value();
@@ -953,7 +1072,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         // Small messages stay latency-optimal via the recursive-doubling tree.
         collective_pool_->submit(
             [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
-                watchdog_->touch(seq);
+                begin_execute(seq);
                 if (defer_mps_sync_to_engine) {
                     if (overlap_comm_ && event_sync_available()) {
                         uint64_t v = next_event_value();
@@ -965,6 +1084,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 } else if (sync_val > 0) {
                     wait_for_mps(sync_val);
                 }
+                const auto exec_t0 = std::chrono::steady_clock::now();
                 const char* algo = "unknown";
                 if (nbytes <= transport_->config().small_msg_threshold) {
                     algo = "tree_small";
@@ -978,7 +1098,12 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                         allreduce_ring(tensor_copy, seq, red_op);
                     }
                 }
-                MCCL_INFO("allreduce seq=%u: algo=%s nbytes=%zu", seq, algo, nbytes);
+                const double exec_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - exec_t0).count();
+                const double gbps =
+                    exec_ms > 0 ? (nbytes * 8.0) / (exec_ms * 1e6) : 0.0;
+                MCCL_INFO("allreduce seq=%u: algo=%s nbytes=%zu exec=%.2fms (%.2f Gbps algbw)",
+                          seq, algo, nbytes, exec_ms, gbps);
             },
             [this, work_ptr, seq]() {
                 unregister_work(seq);
@@ -1045,7 +1170,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
         (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
     coalesced_engine.submit(
         [this, flat_copy, tensors_copy, seq, ws, nbytes, red_op, sync_val]() mutable {
-            watchdog_->touch(seq);
+            begin_execute(seq);
             if (sync_val > 0) wait_for_mps(sync_val);
             if (ws == 2) {
                 allreduce_two_rank(flat_copy, seq, red_op);
@@ -1824,6 +1949,9 @@ void ProcessGroupMCCL::allreduce_tree_small(at::Tensor& tensor, uint32_t seq,
     for (int m = 1; m < p; m <<= 1) rounds++;
     const uint32_t final_tid = static_cast<uint32_t>(rounds) + 1;
 
+    const auto tree_t0 = std::chrono::steady_clock::now();
+    double red_ms_accum = 0;
+
     if (rank >= p) {
         // Fold into the partner, then wait for the finished result.
         MCCL_CHECK(transport_->send_chunks(rank - p, OpType::ALLREDUCE, seq,
@@ -1841,7 +1969,10 @@ void ProcessGroupMCCL::allreduce_tree_small(at::Tensor& tensor, uint32_t seq,
                                                round_tid, recv_buf.data(), nbytes),
                        "tree allreduce fold-in recv failed");
             metrics_->record_transport_bytes(nbytes, false);
+            const auto r0 = std::chrono::steady_clock::now();
             reduce_in(recv_buf.data());
+            red_ms_accum += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - r0).count();
         }
 
         for (int mask = 1; mask < p; mask <<= 1) {
@@ -1859,7 +1990,10 @@ void ProcessGroupMCCL::allreduce_tree_small(at::Tensor& tensor, uint32_t seq,
                        "tree allreduce round recv failed");
             metrics_->record_transport_bytes(nbytes, true);
             metrics_->record_transport_bytes(nbytes, false);
+            const auto r0 = std::chrono::steady_clock::now();
             reduce_in(recv_buf.data());
+            red_ms_accum += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - r0).count();
         }
 
         scale_avg();
@@ -1874,6 +2008,10 @@ void ProcessGroupMCCL::allreduce_tree_small(at::Tensor& tensor, uint32_t seq,
 
     if (overlap_comm_) signal_mccl_done(next_event_value());
     mps_stream_sync_after_cpu_mps_buffer_write();
+
+    const double net_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - tree_t0).count();
+    metrics_->record_phase(seq, 0, net_ms, red_ms_accum);
 }
 
 
@@ -1913,51 +2051,115 @@ void ProcessGroupMCCL::broadcast_ring_pipelined(at::Tensor& tensor,
         return std::min(slice, nbytes - s * slice);
     };
 
-    if (is_root) {
-        for (size_t s = 0; s < nslices; ++s) {
-            watchdog_->touch(seq);
+    // Credit flow control: every rank that SENDS (root + forwarders) may run
+    // at most cwin slices ahead of what `next` has consumed; every rank that
+    // RECEIVES credits `prev` per consumed slice.  Without this, the root
+    // streams the entire payload into a slow successor's park buffer.
+    const bool credits_on = slice >= credit_min_chunk_bytes() &&
+                            credit_min_chunk_bytes() > 0 &&
+                            nslices > static_cast<size_t>(credit_window());
+    const int cwin = credit_window();
+    const bool sender = !is_tail;          // root and middle ranks send
+    std::vector<uint8_t> credit_bytes((credits_on && sender) ? nslices : 0);
+    std::vector<RecvTicket> credit_tickets((credits_on && sender) ? nslices : 0);
+    std::vector<RecvTicket> tickets(is_root ? 0 : nslices);
+
+    const auto bc_t0 = std::chrono::steady_clock::now();
+
+    std::exception_ptr err;
+    try {
+        if (credits_on && sender) {
+            for (size_t s = 0; s + cwin < nslices; ++s) {
+                credit_tickets[s] = transport_->post_recv(
+                    next, OpType::BROADCAST, seq,
+                    kCreditTidFlag | static_cast<uint32_t>(s),
+                    &credit_bytes[s], 1);
+            }
+        }
+
+        auto send_slice = [&](size_t s) {
+            if (credits_on && s >= static_cast<size_t>(cwin)) {
+                MCCL_CHECK(transport_->wait_recv(credit_tickets[s - cwin]),
+                           "broadcast ring credit wait failed at slice " +
+                           std::to_string(s));
+            }
             MCCL_CHECK(transport_->send_chunks(
                            next, OpType::BROADCAST, seq,
                            static_cast<uint32_t>(s), base + s * slice,
                            slice_len(s)),
                        "broadcast ring send failed at slice " + std::to_string(s));
-        }
-    } else {
-        const int depth = ring_pipeline_depth();
-        std::vector<RecvTicket> tickets(nslices);
-        size_t next_post = 0;
-        for (; next_post < nslices && next_post < static_cast<size_t>(depth);
-             ++next_post) {
-            tickets[next_post] = transport_->post_recv(
-                prev, OpType::BROADCAST, seq,
-                static_cast<uint32_t>(next_post),
-                base + next_post * slice, slice_len(next_post));
-        }
-        for (size_t s = 0; s < nslices; ++s) {
-            watchdog_->touch(seq);
-            MCCL_CHECK(transport_->wait_recv(tickets[s]),
-                       "broadcast ring recv failed at slice " + std::to_string(s));
-            if (!is_tail) {
-                MCCL_CHECK(transport_->send_chunks(
-                               next, OpType::BROADCAST, seq,
-                               static_cast<uint32_t>(s), base + s * slice,
-                               slice_len(s)),
-                           "broadcast ring forward failed at slice " +
-                           std::to_string(s));
+            metrics_->record_transport_bytes(slice_len(s), true);
+        };
+        auto send_credit = [&](size_t s) {
+            if (!credits_on || s + static_cast<size_t>(cwin) >= nslices) return;
+            uint8_t one = 1;
+            MCCL_CHECK(transport_->send_chunks(
+                           prev, OpType::BROADCAST, seq,
+                           kCreditTidFlag | static_cast<uint32_t>(s), &one, 1),
+                       "broadcast ring credit send failed at slice " +
+                       std::to_string(s));
+        };
+
+        if (is_root) {
+            for (size_t s = 0; s < nslices; ++s) {
+                watchdog_->touch(seq);
+                send_slice(s);
             }
-            if (next_post < nslices) {
+        } else {
+            const int depth = ring_pipeline_depth();
+            size_t next_post = 0;
+            for (; next_post < nslices && next_post < static_cast<size_t>(depth);
+                 ++next_post) {
                 tickets[next_post] = transport_->post_recv(
                     prev, OpType::BROADCAST, seq,
                     static_cast<uint32_t>(next_post),
                     base + next_post * slice, slice_len(next_post));
-                ++next_post;
+            }
+            for (size_t s = 0; s < nslices; ++s) {
+                watchdog_->touch(seq);
+                MCCL_CHECK(transport_->wait_recv(tickets[s]),
+                           "broadcast ring recv failed at slice " + std::to_string(s));
+                metrics_->record_transport_bytes(slice_len(s), false);
+                if (!is_tail) {
+                    send_slice(s);
+                }
+                send_credit(s);
+                if (next_post < nslices) {
+                    tickets[next_post] = transport_->post_recv(
+                        prev, OpType::BROADCAST, seq,
+                        static_cast<uint32_t>(next_post),
+                        base + next_post * slice, slice_len(next_post));
+                    ++next_post;
+                }
+            }
+            if (staged) {
+                // Blit the staged copy into the private tensor.
+                blit_buffer_to_tensor(staged->data(), tensor);
             }
         }
-        if (staged) {
-            // Blit the staged copy into the private tensor.
-            blit_buffer_to_tensor(staged->data(), tensor);
-        }
+    } catch (...) {
+        err = std::current_exception();
     }
+
+    if (err) {
+        // Same lifetime rule as run_ring_pipeline: posted-but-unwaited sinks
+        // reference `staged`/credit storage in this frame — cancel and drain
+        // before unwinding.
+        transport_->cancel_recvs(seq, "broadcast ring aborted");
+        for (auto& t : tickets) {
+            if (!t) continue;
+            try { transport_->wait_recv(t); } catch (...) {}
+        }
+        for (auto& t : credit_tickets) {
+            if (!t) continue;
+            try { transport_->wait_recv(t); } catch (...) {}
+        }
+        std::rethrow_exception(err);
+    }
+
+    metrics_->record_phase(seq, 0,
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - bc_t0).count(), 0);
 }
 
 
@@ -1982,6 +2184,8 @@ void ProcessGroupMCCL::broadcast_tree_small(at::Tensor& tensor,
         base = static_cast<uint8_t*>(staged->data());
     }
 
+    const auto bt_t0 = std::chrono::steady_clock::now();
+
     bool have_data = (relid == 0);
     for (int k = 0; (1 << k) < ws; ++k) {
         const int bit = 1 << k;
@@ -1992,6 +2196,7 @@ void ProcessGroupMCCL::broadcast_tree_small(at::Tensor& tensor,
                                                static_cast<uint32_t>(k),
                                                base, nbytes),
                        "broadcast tree recv failed at round " + std::to_string(k));
+            metrics_->record_transport_bytes(nbytes, false);
             have_data = true;
         } else if (have_data && relid < bit && relid + bit < ws) {
             const int dst = ((relid + bit) + root) % ws;
@@ -1999,12 +2204,17 @@ void ProcessGroupMCCL::broadcast_tree_small(at::Tensor& tensor,
                                                static_cast<uint32_t>(k),
                                                base, nbytes),
                        "broadcast tree send failed at round " + std::to_string(k));
+            metrics_->record_transport_bytes(nbytes, true);
         }
     }
 
     if (staged && relid != 0) {
         blit_buffer_to_tensor(staged->data(), tensor);
     }
+
+    metrics_->record_phase(seq, 0,
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - bt_t0).count(), 0);
 }
 
 
@@ -2058,18 +2268,21 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
         const bool use_ring = nbytes > transport_->config().small_msg_threshold;
         collective_pool_->submit(
             [this, tensor_copy, seq, root, nbytes, use_ring, sync_val_bc]() mutable {
-                watchdog_->touch(seq);
+                begin_execute(seq);
                 if (sync_val_bc > 0) wait_for_mps(sync_val_bc);
+                const auto exec_t0 = std::chrono::steady_clock::now();
                 if (use_ring) {
                     broadcast_ring_pipelined(tensor_copy, seq, root);
                 } else {
                     broadcast_tree_small(tensor_copy, seq, root);
                 }
-                metrics_->record_transport_bytes(nbytes, getRank() == root);
+                // Bytes are recorded per slice/round inside the algorithms.
                 if (overlap_comm_) signal_mccl_done(next_event_value());
                 mps_stream_sync_after_cpu_mps_buffer_write();
-                MCCL_INFO("broadcast seq=%u: algo=%s nbytes=%zu",
-                          seq, use_ring ? "ring_pipelined" : "tree", nbytes);
+                const double exec_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - exec_t0).count();
+                MCCL_INFO("broadcast seq=%u: algo=%s nbytes=%zu exec=%.2fms",
+                          seq, use_ring ? "ring_pipelined" : "tree", nbytes, exec_ms);
             },
             [this, work_ptr, seq]() {
                 unregister_work(seq);
@@ -2152,7 +2365,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
 
         reduce_engine_->submit(
             [this, tensor_copy, seq, sync_val_bc, staged_buf]() mutable {
-                watchdog_->touch(seq);
+                begin_execute(seq);
                 if (sync_val_bc > 0) wait_for_mps(sync_val_bc);
                 StagingBuffer staged = stage_for_send_nosync(tensor_copy);
                 memcpy(staged_buf->data(), staged.data, staged.nbytes);
@@ -2198,7 +2411,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
         // Non-root receives from root using root's NetEngine
         net_engine_for(root).submit(
             [this, tensor_copy, root, seq, nbytes, sync_val_bc]() mutable {
-                watchdog_->touch(seq);
+                begin_execute(seq);
                 if (sync_val_bc > 0) wait_for_mps(sync_val_bc);
                 bool use_cpu = prefer_cpu_unified_buffer_path(tensor_copy);
                 if (use_cpu) {
@@ -2258,7 +2471,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::barrier(
 
     reduce_engine_->submit(
         [this, seq]() {
-            watchdog_->touch(seq);
+            begin_execute(seq);
             rendezvous_->barrier("collective_" + std::to_string(seq));
         },
         [this, work_ptr, seq]() {
@@ -2333,7 +2546,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
         (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
     ag_engine.submit(
         [this, input_copy, outputs_copy, seq, rank, ws, nbytes, sync_val_ag]() mutable {
-            watchdog_->touch(seq);
+            begin_execute(seq);
             if (sync_val_ag > 0) wait_for_mps(sync_val_ag);
             bool use_cpu = (input_copy.scalar_type() == at::kFloat) &&
                            prefer_cpu_unified_buffer_path(input_copy);
@@ -2496,7 +2709,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
         (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
     rs_engine.submit(
         [this, output_copy, inputs_copy, seq, rank, ws, nbytes, rs_op, sync_val_rs]() mutable {
-            watchdog_->touch(seq);
+            begin_execute(seq);
             if (sync_val_rs > 0) wait_for_mps(sync_val_rs);
             int left = (rank - 1 + ws) % ws;
             int right = (rank + 1) % ws;
@@ -2657,7 +2870,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
 
     net_engine_for(dstRank).submit(
         [this, tensor, dstRank, seq, tag, nbytes, sync_val_s]() mutable {
-            watchdog_->touch(seq);
+            begin_execute(seq);
             if (sync_val_s > 0) wait_for_mps(sync_val_s);
             StagingBuffer staged = stage_for_send_nosync(tensor);
             MCCL_CHECK(transport_->send_chunks(dstRank, OpType::SEND, seq,
@@ -2715,7 +2928,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
 
     net_engine_for(srcRank).submit(
         [this, tensor, srcRank, seq, tag, nbytes]() mutable {
-            watchdog_->touch(seq);
+            begin_execute(seq);
             bool use_cpu = prefer_cpu_unified_buffer_path(tensor);
             if (use_cpu) {
                 MPSBufferView view = extract_mps_buffer(tensor);

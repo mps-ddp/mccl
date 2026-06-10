@@ -38,7 +38,8 @@ class MCCLConfig:
     ring_pipeline: bool = True       # streaming TX/RX ring (off = lock-step debug)
     pipeline_depth: int = 2          # posted-ahead receives per pipeline (1-8)
     collective_concurrency: int = 2  # ws>=3 collectives in flight (1-4)
-    demux_park_bytes: int = 256 * 1024 * 1024  # per-peer unmatched-message bound
+    demux_park_bytes: int = 512 * 1024 * 1024  # per-peer unmatched-message bound
+    credit_min_chunk: int = 1024 * 1024  # credit flow control floor (0 = off)
     fp32_cpu_reduce: bool = False    # vDSP fp32 reduce in unified memory
     cpu_write_sync: str = "auto"     # "auto" (none) or "full" (debug)
     event_sync: bool = True          # MTLSharedEvent sync path
@@ -77,6 +78,7 @@ class MCCLConfig:
             "MCCL_PIPELINE_DEPTH": "pipeline_depth",
             "MCCL_COLLECTIVE_CONCURRENCY": "collective_concurrency",
             "MCCL_DEMUX_PARK_BYTES": "demux_park_bytes",
+            "MCCL_CREDIT_MIN_CHUNK": "credit_min_chunk",
             "MCCL_FP32_CPU_REDUCE": "fp32_cpu_reduce",
             "MCCL_CPU_WRITE_SYNC": "cpu_write_sync",
             "MCCL_EVENT_SYNC": "event_sync",

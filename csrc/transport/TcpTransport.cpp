@@ -302,7 +302,8 @@ TcpTransport::TcpTransport(int rank, int world_size, const TransportConfig& conf
         const size_t cwin = static_cast<size_t>(pipe_depth + 2);
         const size_t scaled =
             static_cast<size_t>(coll_conc) * cwin * config_.chunk_bytes * 2;
-        park_limit_bytes_ = std::max(512ULL << 20, scaled);
+        const size_t floor_bytes = static_cast<size_t>(512) << 20;  // 512 MiB
+        park_limit_bytes_ = std::max(floor_bytes, scaled);
         MCCL_INFO("Rank %d: demux park limit auto-scaled to %zu bytes "
                   "(concurrency=%d depth=%d chunk=%zu)",
                   rank_, park_limit_bytes_, coll_conc, pipe_depth,

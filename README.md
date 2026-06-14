@@ -141,7 +141,7 @@ Network and staging run on a **background queue** (`ProgressEngine`, `csrc/runti
 | `MCCL_FP32_CPU_REDUCE` | off | fp32 reductions via vDSP directly in unified memory (often higher allreduce busbw). |
 | `MCCL_CPU_WRITE_SYNC` | `none` | `full` restores a full `torch.mps.synchronize()` after CPU-path collectives (debugging only; serializes buckets). |
 | `MCCL_EVENT_SYNC` | on | `0` disables MTLSharedEvent sync (falls back to blocking stream sync; kills overlap). |
-| `MCCL_LINK_PROFILE` | unset | `thunderbolt` = 16 MB transport chunks. |
+| `MCCL_LINK_PROFILE` | unset | `thunderbolt` = 16 MB transport chunks. `ethernet` = 4–8 MB chunks (GbE clusters). |
 | `MCCL_CHUNK_BYTES`, `MCCL_SOCK_BUFSIZE`, `MCCL_TCP_LOWAT` | — | transport sizing (see `Connection.cpp`). |
 | `MCCL_COMPRESSION` / `MCCL_TOPK_RATIO` | none | `fp16` or `topk` gradient compression (size-prefixed exact-payload framing). |
 | `MCCL_WATCHDOG_TIMEOUT_MS` | PG timeout | hang detector; the clock starts when an op begins executing, not when it is queued. |

@@ -67,6 +67,8 @@ public:
 
     void shutdown() override;
 
+    void set_metrics(Metrics* metrics) override;
+
     /// Check if RDMA is available on this machine (dlopen + device probe).
     static bool is_available();
 
@@ -111,6 +113,11 @@ private:
     std::vector<std::unordered_set<uint64_t>> completed_wrs_;
 
     std::vector<std::unique_ptr<std::mutex>> rdma_mu_;
+
+    // Lazy RDMA tickets created by post_recv.  They do not register with TCP
+    // demux, so cancel_recvs must mark them done locally on abort paths.
+    std::mutex lazy_tickets_mu_;
+    std::vector<std::weak_ptr<PostedRecv>> lazy_tickets_;
 };
 
 } // namespace mccl

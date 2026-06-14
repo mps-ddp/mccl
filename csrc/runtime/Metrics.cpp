@@ -66,6 +66,32 @@ void Metrics::record_error() {
     total_errors_.fetch_add(1, std::memory_order_relaxed);
 }
 
+void Metrics::record_demux_zerocopy(size_t /*bytes*/) {
+    demux_zerocopy_hits_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Metrics::record_demux_park(size_t /*bytes*/) {
+    demux_park_hits_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Metrics::record_router_failure() {
+    router_failures_.fetch_add(1, std::memory_order_relaxed);
+    record_error();
+}
+
+void Metrics::record_credit_wait_ms(double ms) {
+    if (ms <= 0) return;
+    auto us = static_cast<uint64_t>(ms * 1000.0);
+    total_credit_wait_us_.fetch_add(us, std::memory_order_relaxed);
+}
+
+void Metrics::record_demux_parked_bytes(size_t bytes) {
+    uint64_t cur = demux_parked_bytes_peak_.load(std::memory_order_relaxed);
+    while (bytes > cur &&
+           !demux_parked_bytes_peak_.compare_exchange_weak(
+               cur, bytes, std::memory_order_relaxed)) {}
+}
+
 Metrics::Summary Metrics::summarize() const {
     std::lock_guard<std::mutex> lock(mu_);
     Summary s{};
@@ -74,7 +100,15 @@ Metrics::Summary Metrics::summarize() const {
     s.total_bytes_recv = total_bytes_recv_.load();
     s.total_errors = total_errors_.load();
 
-    if (completed_.empty()) return s;
+    if (completed_.empty()) {
+        s.demux_zerocopy_hits = demux_zerocopy_hits_.load();
+        s.demux_park_hits = demux_park_hits_.load();
+        s.demux_parked_bytes_peak = demux_parked_bytes_peak_.load();
+        s.router_failures = router_failures_.load();
+        s.total_credit_wait_ms =
+            static_cast<double>(total_credit_wait_us_.load()) / 1000.0;
+        return s;
+    }
 
     std::vector<double> latencies;
     latencies.reserve(completed_.size());
@@ -112,6 +146,13 @@ Metrics::Summary Metrics::summarize() const {
     s.avg_queue_wait_ms = total_queue_wait / n;
     s.avg_execution_ms = total_execution / n;
 
+    s.demux_zerocopy_hits = demux_zerocopy_hits_.load();
+    s.demux_park_hits = demux_park_hits_.load();
+    s.demux_parked_bytes_peak = demux_parked_bytes_peak_.load();
+    s.router_failures = router_failures_.load();
+    s.total_credit_wait_ms =
+        static_cast<double>(total_credit_wait_us_.load()) / 1000.0;
+
     return s;
 }
 
@@ -133,6 +174,12 @@ void Metrics::log_summary() const {
     MCCL_INFO("  Avg sync:         %.3f ms", s.avg_sync_ms);
     MCCL_INFO("  Avg network:      %.3f ms", s.avg_network_ms);
     MCCL_INFO("  Avg reduce:       %.3f ms", s.avg_reduce_ms);
+    MCCL_INFO("  Demux zerocopy:   %llu hits", (unsigned long long)s.demux_zerocopy_hits);
+    MCCL_INFO("  Demux park:       %llu hits (peak parked %llu bytes)",
+              (unsigned long long)s.demux_park_hits,
+              (unsigned long long)s.demux_parked_bytes_peak);
+    MCCL_INFO("  Router failures:  %llu", (unsigned long long)s.router_failures);
+    MCCL_INFO("  Credit wait:      %.3f ms total", s.total_credit_wait_ms);
     MCCL_INFO("============================");
 }
 
@@ -143,6 +190,11 @@ void Metrics::reset() {
     total_bytes_sent_.store(0, std::memory_order_seq_cst);
     total_bytes_recv_.store(0, std::memory_order_seq_cst);
     total_errors_.store(0, std::memory_order_seq_cst);
+    demux_zerocopy_hits_.store(0, std::memory_order_seq_cst);
+    demux_park_hits_.store(0, std::memory_order_seq_cst);
+    demux_parked_bytes_peak_.store(0, std::memory_order_seq_cst);
+    router_failures_.store(0, std::memory_order_seq_cst);
+    total_credit_wait_us_.store(0, std::memory_order_seq_cst);
 }
 
 std::vector<OpMetric> Metrics::recent_ops(size_t n) const {

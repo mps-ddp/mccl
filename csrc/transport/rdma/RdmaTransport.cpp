@@ -35,6 +35,20 @@ RdmaTransport::~RdmaTransport() {
 void RdmaTransport::connect_all(const std::vector<std::string>& endpoints) {
     tcp_->connect_all(endpoints);
     try_init_rdma();
+    if (rdma_active_.load(std::memory_order_acquire)) {
+        auto* v = std::getenv("MCCL_RING_PIPELINE");
+        const bool pipeline_on =
+            !v || !(std::string(v) == "0" || std::string(v) == "false" ||
+                    std::string(v) == "no" || std::string(v) == "off");
+        if (pipeline_on) {
+            // The current RDMA post_recv is lazy/lock-step, while the default
+            // ring pipeline starts TX before wait_recv.  TCP demux is the
+            // correct async transport until RDMA has real posted recv queues.
+            MCCL_WARN("RdmaTransport: disabling RDMA data path because "
+                      "MCCL_RING_PIPELINE is enabled; using TCP demux");
+            rdma_active_.store(false, std::memory_order_release);
+        }
+    }
     tcp_->start_readers();
 
     if (rdma_active_.load(std::memory_order_acquire)) {
@@ -65,6 +79,10 @@ RecvTicket RdmaTransport::post_recv(int peer_rank, OpType op, uint32_t seq,
         t->data = static_cast<uint8_t*>(data);
         t->nbytes = nbytes;
         t->kind = 1;  // lazy RDMA, executed in wait_recv
+        {
+            std::lock_guard<std::mutex> lock(lazy_tickets_mu_);
+            lazy_tickets_.push_back(t);
+        }
         return t;
     }
     return tcp_->post_recv(peer_rank, op, seq, tid, data, nbytes);
@@ -74,6 +92,11 @@ bool RdmaTransport::wait_recv(const RecvTicket& ticket) {
     if (!ticket || ticket->kind != 1) {
         return tcp_->wait_recv(ticket);
     }
+    {
+        std::lock_guard<std::mutex> lock(ticket->mu);
+        if (ticket->error) std::rethrow_exception(ticket->error);
+        if (ticket->done) return !ticket->conn_closed;
+    }
     if (ticket->nbytes == 0) return true;
     // Execute the lazy RDMA receive now (ordered per peer by rdma_mu_).
     return recv_chunks(ticket->peer, ticket->op, ticket->seq, ticket->tid,
@@ -82,6 +105,29 @@ bool RdmaTransport::wait_recv(const RecvTicket& ticket) {
 
 void RdmaTransport::cancel_recvs(uint32_t seq, const std::string& reason) {
     tcp_->cancel_recvs(seq, reason);
+    auto err = std::make_exception_ptr(MCCLError(
+        "RDMA receive cancelled (seq=" + std::to_string(seq) + "): " + reason));
+    std::lock_guard<std::mutex> lock(lazy_tickets_mu_);
+    for (auto it = lazy_tickets_.begin(); it != lazy_tickets_.end();) {
+        auto ticket = it->lock();
+        if (!ticket) {
+            it = lazy_tickets_.erase(it);
+            continue;
+        }
+        if (ticket->seq == seq) {
+            {
+                std::lock_guard<std::mutex> tlock(ticket->mu);
+                if (!ticket->done) {
+                    ticket->error = err;
+                    ticket->done = true;
+                }
+            }
+            ticket->cv.notify_all();
+            it = lazy_tickets_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 // ── RDMA initialization via TCP side channel ────────────────────────
@@ -552,6 +598,11 @@ int RdmaTransport::rank() const { return tcp_->rank(); }
 int RdmaTransport::world_size() const { return tcp_->world_size(); }
 const TransportConfig& RdmaTransport::config() const { return tcp_->config(); }
 std::string RdmaTransport::listen_endpoint() const { return tcp_->listen_endpoint(); }
+
+void RdmaTransport::set_metrics(Metrics* metrics) {
+    metrics_ = metrics;
+    if (tcp_) tcp_->set_metrics(metrics);
+}
 
 void RdmaTransport::shutdown() {
     rdma_active_.store(false, std::memory_order_release);

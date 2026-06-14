@@ -52,8 +52,9 @@ def parse_args() -> argparse.Namespace:
                    help="Training steps after warmup (default: 500)")
     p.add_argument("--batch-size", type=int, default=128,
                    help="Per-rank batch size (default: 128)")
-    p.add_argument("--bucket-mb", type=int, default=25,
-                   help="DDP gradient bucket size in MB (default: 25)")
+    p.add_argument("--bucket-mb", type=int,
+                   default=int(os.environ.get("DDP_BUCKET_MB", "25")),
+                   help="DDP gradient bucket size in MB (default: DDP_BUCKET_MB env or 25)")
     p.add_argument("--input-dim", type=int, default=512)
     p.add_argument("--num-classes", type=int, default=64)
     p.add_argument("--hidden", type=int, default=1024)

@@ -153,9 +153,12 @@ void ProgressEngine::worker_loop() {
         try {
             op.execute();
             exec_ok = true;
+        } catch (const std::exception& e) {
+            exec_ex = std::current_exception();
+            MCCL_ERROR("Op seq=%u execute() failed: %s", op.seq_num, e.what());
         } catch (...) {
             exec_ex = std::current_exception();
-            MCCL_ERROR("Op seq=%u execute() failed with exception", op.seq_num);
+            MCCL_ERROR("Op seq=%u execute() failed with non-standard exception", op.seq_num);
         }
 
         if (exec_ok) {
@@ -163,9 +166,14 @@ void ProgressEngine::worker_loop() {
             try {
                 if (op.on_complete) op.on_complete();
                 MCCL_TRACE("Op seq=%u completed", op.seq_num);
+            } catch (const std::exception& e) {
+                complete_ex = std::current_exception();
+                MCCL_ERROR("Op seq=%u on_complete() threw: %s — routing to on_error",
+                           op.seq_num, e.what());
             } catch (...) {
                 complete_ex = std::current_exception();
-                MCCL_ERROR("Op seq=%u on_complete() threw — routing to on_error", op.seq_num);
+                MCCL_ERROR("Op seq=%u on_complete() threw non-standard exception — routing to on_error",
+                           op.seq_num);
             }
             if (complete_ex) {
                 try {

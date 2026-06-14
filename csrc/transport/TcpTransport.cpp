@@ -1,4 +1,5 @@
 #include "transport/TcpTransport.hpp"
+#include "runtime/Metrics.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 #include "common/Version.hpp"
@@ -189,6 +190,9 @@ TransportConfig TransportConfig::from_env() {
         cfg.connect_timeout = std::chrono::milliseconds(std::atoll(v));
     if (auto* v = std::getenv("MCCL_HEARTBEAT_INTERVAL_MS"))
         cfg.heartbeat_interval = std::chrono::milliseconds(std::atoll(v));
+    if (cfg.listen_addr == "auto") {
+        cfg.listen_addr = "0.0.0.0";
+    }
 
     // Auto-detect Thunderbolt bridge if no explicit listen address set
     if (cfg.listen_addr == "0.0.0.0" && cfg.ifname.empty()) {
@@ -209,6 +213,12 @@ TransportConfig TransportConfig::from_env() {
         if (prof && std::string(prof) == "thunderbolt") {
             cfg.chunk_bytes = std::max(cfg.chunk_bytes, size_t(16) * 1024 * 1024);
             MCCL_INFO("MCCL_LINK_PROFILE=thunderbolt: using chunk_bytes=%zu (set "
+                      "MCCL_CHUNK_BYTES to override)",
+                      cfg.chunk_bytes);
+        } else if (prof && std::string(prof) == "ethernet") {
+            cfg.chunk_bytes = std::min(cfg.chunk_bytes, size_t(8) * 1024 * 1024);
+            cfg.chunk_bytes = std::max(cfg.chunk_bytes, size_t(4) * 1024 * 1024);
+            MCCL_INFO("MCCL_LINK_PROFILE=ethernet: using chunk_bytes=%zu (set "
                       "MCCL_CHUNK_BYTES to override)",
                       cfg.chunk_bytes);
         }
@@ -278,6 +288,25 @@ TcpTransport::TcpTransport(int rank, int world_size, const TransportConfig& conf
     }
     if (auto* v = std::getenv("MCCL_DEMUX_PARK_BYTES")) {
         park_limit_bytes_ = static_cast<size_t>(std::atoll(v));
+    } else {
+        // Headroom for overlapping collectives: concurrency x credit_window x
+        // chunk, with a 2x safety factor (matches credit lead at steady state).
+        int coll_conc = 2;
+        if (auto* cv = std::getenv("MCCL_COLLECTIVE_CONCURRENCY")) {
+            coll_conc = static_cast<int>(std::min(4L, std::max(1L, std::atol(cv))));
+        }
+        int pipe_depth = 2;
+        if (auto* pv = std::getenv("MCCL_PIPELINE_DEPTH")) {
+            pipe_depth = static_cast<int>(std::min(8L, std::max(1L, std::atol(pv))));
+        }
+        const size_t cwin = static_cast<size_t>(pipe_depth + 2);
+        const size_t scaled =
+            static_cast<size_t>(coll_conc) * cwin * config_.chunk_bytes * 2;
+        park_limit_bytes_ = std::max(512ULL << 20, scaled);
+        MCCL_INFO("Rank %d: demux park limit auto-scaled to %zu bytes "
+                  "(concurrency=%d depth=%d chunk=%zu)",
+                  rank_, park_limit_bytes_, coll_conc, pipe_depth,
+                  config_.chunk_bytes);
     }
 
     send_mu_.resize(world_size);
@@ -555,6 +584,7 @@ void TcpTransport::fail_router(int peer, std::exception_ptr err, bool conn_close
         MCCL_ERROR("Rank %d: demux router for peer %d failed %zu pending recv(s)%s",
                    rank_, peer, victims.size(), conn_closed ? " (connection closed)" : "");
     }
+    if (metrics_) metrics_->record_router_failure();
 }
 
 bool TcpTransport::route_message(int peer, const MessageHeader& hdr) {
@@ -633,6 +663,7 @@ bool TcpTransport::route_message(int peer, const MessageHeader& hdr) {
                 if (it->second.empty()) map.erase(it);
             }
         }
+        if (metrics_) metrics_->record_demux_zerocopy(hdr.payload_bytes);
         return true;
     }
 
@@ -683,22 +714,37 @@ bool TcpTransport::route_message(int peer, const MessageHeader& hdr) {
                 sit->second.pop_front();
                 if (sit->second.empty()) map.erase(sit);
             }
-        } else {
-            rt.parked_bytes += pm.payload.size();
-            if (rt.parked_bytes > park_limit_bytes_) {
-                park_overflow = true;
             } else {
-                auto& pk = is_p2p ? rt.p2p_parked : rt.parked;
-                pk[key].push_back(std::move(pm));
+                rt.parked_bytes += pm.payload.size();
+                if (metrics_) {
+                    metrics_->record_demux_park(pm.payload.size());
+                    metrics_->record_demux_parked_bytes(rt.parked_bytes);
+                }
+                if (rt.parked_bytes > park_limit_bytes_) {
+                    park_overflow = true;
+                } else {
+                    auto& pk = is_p2p ? rt.p2p_parked : rt.parked;
+                    pk[key].push_back(std::move(pm));
+                }
             }
-        }
     }
     if (park_overflow) {
+        size_t parked_now = 0;
+        size_t park_limit = park_limit_bytes_;
+        {
+            std::lock_guard<std::mutex> lock(rt.mu);
+            parked_now = rt.parked_bytes;
+        }
+        const char* cause =
+            (parked_now > park_limit)
+                ? "demux park buffer full (backpressure)"
+                : "payload overflow (protocol desync)";
         fail_router(peer, std::make_exception_ptr(MCCLError(
-            "demux park limit exceeded or payload overflow (seq=" +
-            std::to_string(hdr.seq_num) + " tid=" +
-            std::to_string(hdr.tensor_id) + "): receiver desynchronized "
-            "from sender, or concurrent collectives outpacing this rank — "
+            std::string(cause) + " (seq=" + std::to_string(hdr.seq_num) +
+            " tid=" + std::to_string(hdr.tensor_id) +
+            ", parked=" + std::to_string(parked_now) + " limit=" +
+            std::to_string(park_limit) +
+            "): slow/straggler rank or concurrent buckets outpacing this rank — "
             "raise MCCL_DEMUX_PARK_BYTES or lower MCCL_COLLECTIVE_CONCURRENCY")),
             false);
         return false;
@@ -843,6 +889,7 @@ void TcpTransport::fail_recvs_for_seq(uint32_t seq, const std::string& reason) {
         if (p == rank_ || !routers_[p]) continue;
         PeerRouter& rt = *routers_[p];
         std::vector<RecvTicket> victims;
+        size_t purged_parked = 0;
         {
             std::lock_guard<std::mutex> lock(rt.mu);
             for (auto it = rt.sinks.begin(); it != rt.sinks.end();) {
@@ -852,6 +899,23 @@ void TcpTransport::fail_recvs_for_seq(uint32_t seq, const std::string& reason) {
                 } else {
                     ++it;
                 }
+            }
+            // Drop parked-but-unclaimed bytes for this collective so a
+            // cancelled seq cannot exhaust the park budget for later ops.
+            for (auto it = rt.parked.begin(); it != rt.parked.end();) {
+                if (static_cast<uint32_t>(it->first >> 32) == seq) {
+                    for (const auto& pm : it->second) {
+                        purged_parked += pm.payload.size();
+                    }
+                    it = rt.parked.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (purged_parked > 0) {
+                rt.parked_bytes = (rt.parked_bytes >= purged_parked)
+                                      ? rt.parked_bytes - purged_parked
+                                      : 0;
             }
         }
         for (auto& s : victims) {

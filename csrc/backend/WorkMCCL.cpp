@@ -93,6 +93,17 @@ void WorkMCCL::markComplete() {
 }
 
 void WorkMCCL::markError(std::exception_ptr err) {
+    std::string msg = "unknown exception";
+    if (err) {
+        try {
+            std::rethrow_exception(err);
+        } catch (const std::exception& e) {
+            msg = e.what();
+        } catch (...) {
+            msg = "non-standard exception";
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (completed_) return;
@@ -102,7 +113,7 @@ void WorkMCCL::markError(std::exception_ptr err) {
     }
     finishWorkMCCLFuture();
     cv_.notify_all();
-    MCCL_ERROR("WorkMCCL seq=%u failed with error", seq_);
+    MCCL_ERROR("WorkMCCL seq=%u failed: %s", seq_, msg.c_str());
 }
 
 } // namespace mccl

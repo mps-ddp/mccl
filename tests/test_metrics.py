@@ -65,6 +65,7 @@ def _metrics_populated_fn(rank, world_size):
     # their reduce time (vDSP wall / Metal encode time — small but nonzero).
     assert m.avg_network_ms > 0.0, f"avg_network_ms={m.avg_network_ms}"
     assert m.avg_reduce_ms > 0.0, f"avg_reduce_ms={m.avg_reduce_ms}"
+    assert m.avg_sync_ms >= 0.0, f"avg_sync_ms={m.avg_sync_ms}"
 
     assert m.peak_throughput_gbps > 0.0, \
         f"peak_throughput_gbps={m.peak_throughput_gbps}"

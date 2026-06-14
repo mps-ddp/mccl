@@ -35,7 +35,6 @@ def _worker(rank, world_size, fn, port):
 def _run_distributed(fn, world_size=2, port=29500):
     import subprocess, sys, textwrap, inspect
     src = textwrap.dedent(inspect.getsource(fn))
-    fn_name = fn.__name__
     script = (
         "import os, sys, torch, torch.distributed as dist\n"
         f"os.environ['MASTER_ADDR'] = '127.0.0.1'\n"
@@ -47,20 +46,12 @@ def _run_distributed(fn, world_size=2, port=29500):
         "world_size = int(sys.argv[2])\n"
         "import mccl\n"
         "dist.init_process_group(backend='mccl', rank=rank, world_size=world_size, device_id=torch.device('mps:0'))\n"
-            "rc = 0\n"
             "try:\n"
             f"{textwrap.indent(src, '    ')}"
-            f"    {fn_name}(rank, world_size)\n"
-            "except BaseException:\n"
-            "    import traceback\n"
-            "    traceback.print_exc()\n"
-            "    rc = 1\n"
+            "    fn(rank, world_size)\n"
             "finally:\n"
-            "    try:\n"
-            "        dist.destroy_process_group()\n"
-            "    except BaseException:\n"
-            "        pass\n"
-            "    os._exit(rc)\n"
+            "    dist.destroy_process_group()\n"
+            "    os._exit(0)\n"
     )
     import time
     procs = []

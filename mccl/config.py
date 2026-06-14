@@ -24,7 +24,7 @@ class MCCLConfig:
     listen_addr: str = "auto"
     port_base: int = 29600
     ifname: str = ""
-    chunk_bytes: int = 16 * 1024 * 1024
+    chunk_bytes: int = 4 * 1024 * 1024
     small_msg_threshold: int = 262144
     connect_timeout_ms: int = 30000
     transport_crc: bool = False

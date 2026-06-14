@@ -70,21 +70,6 @@ public:
     /// Record a transport error.
     void record_error();
 
-    /// Demux: payload delivered zero-copy into a posted recv buffer.
-    void record_demux_zerocopy(size_t bytes);
-
-    /// Demux: payload copied into the park buffer (recv not posted yet).
-    void record_demux_park(size_t bytes);
-
-    /// Router fatal failure (EOF, ABORT, protocol error, park overflow).
-    void record_router_failure();
-
-    /// Credit-flow-control stall on the TX side of a pipelined ring.
-    void record_credit_wait_ms(double ms);
-
-    /// Update peak demux parked bytes (per-process aggregate across peers).
-    void record_demux_parked_bytes(size_t bytes);
-
     // ── Aggregated stats ────────────────────────────────────────────
 
     struct Summary {
@@ -101,12 +86,6 @@ public:
         double avg_reduce_ms;
         double avg_queue_wait_ms;
         double avg_execution_ms;
-        // Transport / demux (aggregate since last reset)
-        uint64_t demux_zerocopy_hits;
-        uint64_t demux_park_hits;
-        uint64_t demux_parked_bytes_peak;
-        uint64_t router_failures;
-        double total_credit_wait_ms;
     };
 
     Summary summarize() const;
@@ -129,11 +108,6 @@ private:
     std::atomic<uint64_t> total_bytes_sent_{0};
     std::atomic<uint64_t> total_bytes_recv_{0};
     std::atomic<uint64_t> total_errors_{0};
-    std::atomic<uint64_t> demux_zerocopy_hits_{0};
-    std::atomic<uint64_t> demux_park_hits_{0};
-    std::atomic<uint64_t> demux_parked_bytes_peak_{0};
-    std::atomic<uint64_t> router_failures_{0};
-    std::atomic<uint64_t> total_credit_wait_us_{0};  // microseconds for atomic add
 };
 
 } // namespace mccl

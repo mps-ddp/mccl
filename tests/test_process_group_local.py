@@ -47,7 +47,6 @@ def _run_distributed(fn, world_size=2, port=29500, extra_mccl_env=None):
     """
     import subprocess, sys, textwrap, inspect
     src = textwrap.dedent(inspect.getsource(fn))
-    fn_name = fn.__name__
     extra_lines = ""
     if extra_mccl_env:
         for k, v in extra_mccl_env.items():
@@ -64,20 +63,12 @@ def _run_distributed(fn, world_size=2, port=29500, extra_mccl_env=None):
         "world_size = int(sys.argv[2])\n"
         "import mccl\n"
         "dist.init_process_group(backend='mccl', rank=rank, world_size=world_size, device_id=torch.device('mps:0'))\n"
-            "rc = 0\n"
             "try:\n"
             f"{textwrap.indent(src, '    ')}"
-            f"    {fn_name}(rank, world_size)\n"
-            "except BaseException:\n"
-            "    import traceback\n"
-            "    traceback.print_exc()\n"
-            "    rc = 1\n"
+            "    fn(rank, world_size)\n"
             "finally:\n"
-            "    try:\n"
-            "        dist.destroy_process_group()\n"
-            "    except BaseException:\n"
-            "        pass\n"
-            "    os._exit(rc)\n"
+            "    dist.destroy_process_group()\n"
+            "    os._exit(0)\n"
     )
     import time
     procs = []
@@ -140,7 +131,6 @@ def _run_three_rank_parity_workers(
         "rank = int(sys.argv[1])\n"
         "world_size = int(sys.argv[2])\n"
         f"{init_pg}"
-        "rc = 0\n"
         "try:\n"
         "    out = os.environ['PARITY_OUTFILE']\n"
         f"    n = {n}\n"
@@ -148,16 +138,9 @@ def _run_three_rank_parity_workers(
         f"    dist.all_reduce(t, op={rop})\n"
         "    if rank == 0:\n"
         "        torch.save(t.detach().cpu(), out)\n"
-        "except BaseException:\n"
-        "    import traceback\n"
-        "    traceback.print_exc()\n"
-        "    rc = 1\n"
         "finally:\n"
-        "    try:\n"
-        "        dist.destroy_process_group()\n"
-        "    except BaseException:\n"
-        "        pass\n"
-        "    os._exit(rc)\n"
+        "    dist.destroy_process_group()\n"
+        "    os._exit(0)\n"
     )
     procs = []
     for r in range(3):

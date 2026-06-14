@@ -212,10 +212,5 @@ PYBIND11_MODULE(_C, m) {
         .def_readonly("avg_network_ms", &mccl::Metrics::Summary::avg_network_ms)
         .def_readonly("avg_reduce_ms", &mccl::Metrics::Summary::avg_reduce_ms)
         .def_readonly("avg_queue_wait_ms", &mccl::Metrics::Summary::avg_queue_wait_ms)
-        .def_readonly("avg_execution_ms", &mccl::Metrics::Summary::avg_execution_ms)
-        .def_readonly("demux_zerocopy_hits", &mccl::Metrics::Summary::demux_zerocopy_hits)
-        .def_readonly("demux_park_hits", &mccl::Metrics::Summary::demux_park_hits)
-        .def_readonly("demux_parked_bytes_peak", &mccl::Metrics::Summary::demux_parked_bytes_peak)
-        .def_readonly("router_failures", &mccl::Metrics::Summary::router_failures)
-        .def_readonly("total_credit_wait_ms", &mccl::Metrics::Summary::total_credit_wait_ms);
+        .def_readonly("avg_execution_ms", &mccl::Metrics::Summary::avg_execution_ms);
 }

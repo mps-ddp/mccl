@@ -13,7 +13,6 @@
 namespace mccl {
 
 struct TransportConfig;
-class Metrics;
 
 /// A posted (asynchronous) receive.
 ///
@@ -109,12 +108,6 @@ public:
     virtual std::string listen_endpoint() const = 0;
 
     virtual void shutdown() = 0;
-
-    /// Attach the process-group metrics collector (optional).
-    virtual void set_metrics(Metrics* metrics) { metrics_ = metrics; }
-
-protected:
-    Metrics* metrics_ = nullptr;
 };
 
 } // namespace mccl

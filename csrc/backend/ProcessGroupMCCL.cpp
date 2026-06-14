@@ -283,16 +283,11 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
                 // neighbor must have consumed step g - cwin.  Bounds parked
                 // bytes at a slow/late receiver to cwin x chunk.
                 if (credits_on && g >= static_cast<size_t>(cwin)) {
-                    const auto cred_t0 = std::chrono::steady_clock::now();
                     MCCL_CHECK(ctx.transport->wait_recv(
                                    credit_tickets[g - cwin]),
                                "ring pipeline credit wait failed at step " +
                                std::to_string(g) + " (seq=" +
-                               std::to_string(ctx.seq) + "): slow consumer "
-                               "or peer desync");
-                    const double cred_ms = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - cred_t0).count();
-                    if (ctx.metrics) ctx.metrics->record_credit_wait_ms(cred_ms);
+                               std::to_string(ctx.seq) + ")");
                 }
 
                 ctx.watchdog->touch(ctx.seq);
@@ -733,7 +728,6 @@ void ProcessGroupMCCL::init_transport() {
     std::string my_endpoint = transport_->listen_endpoint();
     auto endpoints = rendezvous_->exchange_endpoints(my_endpoint);
     transport_->connect_all(endpoints);
-    transport_->set_metrics(metrics_.get());
 
     transport_initialized_ = true;
     MCCL_INFO("Rank %d: transport fully connected", getRank());
@@ -750,30 +744,14 @@ void ProcessGroupMCCL::unregister_work(uint32_t seq) {
 }
 
 void ProcessGroupMCCL::abort_all_inflight_works(const std::string& reason) {
-    std::vector<uint32_t> seqs;
     std::vector<c10::intrusive_ptr<WorkMCCL>> to_abort;
     {
         std::lock_guard<std::mutex> lock(work_registry_mu_);
-        seqs.reserve(work_registry_.size());
         for (auto& [seq, weak] : work_registry_) {
-            seqs.push_back(seq);
             auto strong = weak.lock();
             if (strong) to_abort.push_back(std::move(strong));
         }
         work_registry_.clear();
-    }
-    if (transport_) {
-        for (uint32_t seq : seqs) {
-            transport_->cancel_recvs(seq, reason);
-        }
-        if (!seqs.empty()) {
-            transport_->send_abort(seqs.front(), reason);
-        }
-    }
-    for (uint32_t seq : seqs) {
-        watchdog_->complete(seq);
-        metrics_->op_end(seq);
-        metrics_->record_error();
     }
     auto err = std::make_exception_ptr(MCCLError(reason));
     for (auto& work : to_abort) {
@@ -794,9 +772,7 @@ void ProcessGroupMCCL::on_watchdog_abort(uint32_t seq, const std::string& msg) {
 }
 
 void ProcessGroupMCCL::on_peer_death(int peer_rank) {
-    MCCL_ERROR("Rank %d: peer %d is dead — cancelling in-flight recvs and "
-               "aborting outstanding collectives",
-               getRank(), peer_rank);
+    MCCL_ERROR("Rank %d: peer %d is dead", getRank(), peer_rank);
     metrics_->record_error();
     abort_all_inflight_works("peer " + std::to_string(peer_rank) + " died");
 }
@@ -1129,9 +1105,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         // N+1's pipeline overlaps bucket N's on the wire.  The demultiplexed
         // transport routes the interleaved traffic by (seq, tid).
         // Small messages stay latency-optimal via the recursive-doubling tree.
-        ProgressEngine& ring_engine =
-            ring_pipeline_enabled() ? *collective_pool_ : *reduce_engine_;
-        ring_engine.submit(
+        collective_pool_->submit(
             [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
                 begin_execute(seq);
                 if (defer_mps_sync_to_engine) {
@@ -1197,8 +1171,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
     flat_inputs.reserve(tensors.size());
     for (auto& t : tensors) {
         MCCL_CHECK_TENSOR(t.is_mps(), "MCCL requires MPS tensors");
-        require_contiguous_output(t, "allreduce_coalesced");
-        check_single_tensor(t);
         require_reduce_dtype(t, "allreduce_coalesced");
         if (t.numel() == 0) continue;
         flat_inputs.push_back(t.flatten());
@@ -1214,7 +1186,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
         c10d::OpType::ALLREDUCE, seq, std::vector<at::Tensor>{flat});
     auto work_ptr = work;
     int ws = getSize();
-    int rank = getRank();
     c10d::ReduceOp::RedOpType red_op = opts.reduceOp;
 
     register_work(seq, work);
@@ -1231,10 +1202,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
     auto flat_copy = flat;
 
     ProgressEngine& coalesced_engine =
-        (ws == 2) ? net_engine_for(1 - rank)
-                  : ((ws >= 3 && collective_pool_ && ring_pipeline_enabled())
-                         ? *collective_pool_
-                         : *reduce_engine_);
+        (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
     coalesced_engine.submit(
         [this, flat_copy, tensors_copy, seq, ws, nbytes, red_op, sync_val]() mutable {
             begin_execute(seq);
@@ -1259,15 +1227,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
                                                   t.numel());
                 t.view_as(src_slice).copy_(src_slice);
                 offset += t_nbytes;
-            }
-            // copy_ above is enqueued on the MPS stream.  Work completion must
-            // not race a caller that immediately consumes the coalesced grads.
-            if (overlap_comm_ && event_sync_available()) {
-                uint64_t v = next_event_value();
-                commit_mps_and_signal(v);
-                wait_for_mps(v);
-            } else {
-                mps_stream_sync();
             }
         },
         [this, work_ptr, seq]() {
@@ -2354,10 +2313,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
 
     uint64_t sync_val_bc = sync_mps_nonblocking(overlap_comm_);
 
-    // ws >= 3: scale-aware algorithms on the collective pool.
+    // ws >= 4: scale-aware algorithms on the collective pool.
     //   large: pipelined ring (root egress S bytes instead of (ws-1)*S);
     //   small: binomial tree (ceil(log2 ws) rounds instead of ws-1 sends).
-    if (ws >= 3 && collective_pool_) {
+    // ws <= 3 keeps the per-peer fan-out below (parallel across 1-2 links).
+    if (ws >= 4 && collective_pool_) {
         const bool use_ring = nbytes > transport_->config().small_msg_threshold;
         collective_pool_->submit(
             [this, tensor_copy, seq, root, nbytes, use_ring, sync_val_bc]() mutable {
@@ -2636,9 +2596,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
     uint64_t sync_val_ag = sync_mps_nonblocking(overlap_comm_);
 
     ProgressEngine& ag_engine =
-        (ws >= 3 && collective_pool_ && ring_pipeline_enabled())
-            ? *collective_pool_
-            : *reduce_engine_;
+        (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
     ag_engine.submit(
         [this, input_copy, outputs_copy, seq, rank, ws, nbytes, sync_val_ag]() mutable {
             begin_execute(seq);
@@ -2801,9 +2759,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
     uint64_t sync_val_rs = sync_mps_nonblocking(overlap_comm_);
 
     ProgressEngine& rs_engine =
-        (ws >= 3 && collective_pool_ && ring_pipeline_enabled())
-            ? *collective_pool_
-            : *reduce_engine_;
+        (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
     rs_engine.submit(
         [this, output_copy, inputs_copy, seq, rank, ws, nbytes, rs_op, sync_val_rs]() mutable {
             begin_execute(seq);
@@ -2813,13 +2769,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
             bool use_cpu = (inputs_copy[0].scalar_type() == at::kFloat) &&
                            prefer_cpu_unified_buffer_path(inputs_copy[0]);
 
-            std::vector<at::Tensor> chunks;
-            chunks.reserve(inputs_copy.size());
-            for (const auto& t : inputs_copy) {
-                // Ring reduce-scatter accumulates in place; clone so caller
-                // input tensors are not mutated (matches c10d expectations).
-                chunks.push_back(t.clone());
-            }
+            std::vector<at::Tensor> chunks = inputs_copy;
 
             // Keep-alive for async-kernel staging tensors; drained by the
             // metal_sync_queue_only in the tail below before destruction.
@@ -2909,12 +2859,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
 
             int my_chunk = rank;
             if (use_cpu) {
-                if (rs_op == c10d::ReduceOp::AVG) {
-                    MPSBufferView chunk_view = extract_mps_buffer(chunks[my_chunk]);
-                    cpu_scale_inplace(static_cast<float*>(chunk_view.cpu_ptr),
-                                      chunks[my_chunk].numel(),
-                                      1.0f / static_cast<float>(ws));
-                }
                 MPSBufferView src_view = extract_mps_buffer(chunks[my_chunk]);
                 MPSBufferView dst_view = extract_mps_buffer(output_copy);
                 memcpy(dst_view.cpu_ptr, src_view.cpu_ptr, nbytes);
@@ -2922,10 +2866,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                 mps_stream_sync_after_cpu_mps_buffer_write();
             } else {
                 metal_sync_queue_only();
-                if (rs_op == c10d::ReduceOp::AVG) {
-                    metal_scale_inplace(chunks[my_chunk], 1.0 / ws);
-                    metal_sync_queue_only();
-                }
                 output_copy.copy_(chunks[my_chunk]);
                 // Event path may touch PyTorch MPS from this thread. Non-overlap: MCCL
                 // queue is drained before copy_; next collective syncs MPS before use.

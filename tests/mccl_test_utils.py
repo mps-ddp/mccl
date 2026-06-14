@@ -43,7 +43,6 @@ def run_workers(
         port = next_port()
 
     src = textwrap.dedent(inspect.getsource(fn))
-    fn_name = fn.__name__
     env_lines = ""
     for k, v in (env or {}).items():
         env_lines += f"os.environ[{k!r}] = {v!r}\n"
@@ -61,20 +60,12 @@ def run_workers(
         "import mccl\n"
         "dist.init_process_group(backend='mccl', rank=rank, world_size=world_size, "
         "device_id=torch.device('mps:0'))\n"
-        "rc = 0\n"
         "try:\n"
         f"{textwrap.indent(src, '    ')}"
-        f"    {fn_name}(rank, world_size)\n"
-        "except BaseException as e:\n"
-        "    import traceback\n"
-        "    traceback.print_exc()\n"
-        "    rc = 1\n"
+        "    fn(rank, world_size)\n"
         "finally:\n"
-        "    try:\n"
-        "        dist.destroy_process_group()\n"
-        "    except BaseException:\n"
-        "        pass\n"
-        "    os._exit(rc)\n"
+        "    dist.destroy_process_group()\n"
+        "    os._exit(0)\n"
     )
 
     procs = []

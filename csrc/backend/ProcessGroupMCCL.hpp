@@ -154,12 +154,11 @@ private:
     std::unique_ptr<Transport> transport_;
     std::unique_ptr<ProgressEngine> reduce_engine_;
     /// Executor pool for ws>=3 collectives: MCCL_COLLECTIVE_CONCURRENCY workers
-    /// dequeue in submission order.  Ring algorithms acquire ring_transport_mu_
-    /// so only one ring collective uses the links at a time (credit/HOL safety).
+    /// dequeue in submission order.  transport_collective_mu_ ensures only one
+    /// collective uses TCP at a time per rank (ring, tree, broadcast, etc.).
     std::unique_ptr<ProgressEngine> collective_pool_;
-    /// Serializes ring pipeline / lock-step ring on shared TCP links.  Demux
-    /// routes by (seq,tid) but concurrent rings still deadlock credits + send_mu.
-    std::mutex ring_transport_mu_;
+    /// Serializes all collective_pool transport I/O on shared links.
+    std::mutex transport_collective_mu_;
     std::vector<std::unique_ptr<ProgressEngine>> net_engines_;
     std::unique_ptr<Rendezvous> rendezvous_;
     std::unique_ptr<Watchdog> watchdog_;

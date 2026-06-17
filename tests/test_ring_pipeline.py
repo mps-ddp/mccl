@@ -95,6 +95,34 @@ def _rs_ag_pipeline_fn(rank, world_size):
         assert (outs16[r].cpu() == float(r + 2)).all(), f"f16 allgather slot {r}"
 
 
+def _concurrent_large_buckets_fn(rank, world_size):
+    """DDP-scale async buckets: ~33 MB ring chunks at ws=5, concurrency=2.
+
+    Pre-transport_collective_mu_ this interleaved on the wire and deadlocked.
+    """
+    import torch
+    import torch.distributed as dist
+
+    # 2*ws chunks; ~8.43M elems/chunk fp32 ≈ 33.7 MB (matches cluster DDP bucket scale).
+    n = 84_286_720
+    sizes = [n] * 12
+    tensors = []
+    works = []
+    for i, n_i in enumerate(sizes):
+        t = torch.full((n_i,), float(i % 7 + 1) * (rank + 1),
+                       dtype=torch.float32, device="mps")
+        tensors.append(t)
+        works.append(dist.all_reduce(t, op=dist.ReduceOp.SUM, async_op=True))
+    for w in works:
+        w.wait()
+
+    total = sum(r + 1 for r in range(world_size))
+    for i, t in enumerate(tensors):
+        expected = float(i % 7 + 1) * total
+        bad = (t.cpu() != expected).sum().item()
+        assert bad == 0, f"bucket {i}: {bad} corrupted elements"
+
+
 def _concurrent_buckets_fn(rank, world_size):
     """Many async allreduces in flight: with MCCL_COLLECTIVE_CONCURRENCY=2
     bucket N+1's pipeline overlaps bucket N's on the wire; every result is
@@ -219,6 +247,15 @@ class TestConcurrentCollectives:
             _concurrent_buckets_fn, world_size=world_size,
             env={"MCCL_COLLECTIVE_CONCURRENCY": concurrency},
             timeout=420,
+        )
+
+    @pytest.mark.parametrize("world_size", [5])
+    def test_async_large_buckets_ws5(self, world_size):
+        """Regression: cluster deadlock (seq=21, ~33 MB chunks, concurrency=2)."""
+        run_workers(
+            _concurrent_large_buckets_fn, world_size=world_size,
+            env={"MCCL_COLLECTIVE_CONCURRENCY": "2"},
+            timeout=900,
         )
 
 

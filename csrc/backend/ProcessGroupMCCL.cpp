@@ -1150,11 +1150,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         }
     } else {
         // ── 3+ ranks: ring algorithms on the collective executor pool ──
-        // Pool workers dequeue FIFO (collectives START in seq order on every
-        // rank, keeping schedules aligned) but run concurrently, so bucket
-        // N+1's pipeline overlaps bucket N's on the wire.  The demultiplexed
-        // transport routes the interleaved traffic by (seq, tid).
-        // Small messages stay latency-optimal via the recursive-doubling tree.
+        // Workers dequeue FIFO; ring_transport_mu_ serializes ring I/O so
+        // overlapping DDP bucket submits cannot interleave on the links.
         collective_pool_->submit(
             [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
                 begin_execute(seq);
@@ -1691,6 +1688,10 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
 
 void ProcessGroupMCCL::allreduce_ring_dispatch(at::Tensor& tensor, uint32_t seq,
                                                 c10d::ReduceOp::RedOpType op) {
+    // One ring collective on the wire per rank.  COLLECTIVE_CONCURRENCY>1 may
+    // dequeue a second bucket while the first ring is still in flight; inter-
+    // leaved rings deadlock credits/TCP even though demux keys differ by seq.
+    std::lock_guard<std::mutex> ring_guard(ring_transport_mu_);
     if (!use_chunked_ring_default()) {
         allreduce_ring(tensor, seq, op);
         return;
@@ -2141,6 +2142,7 @@ void ProcessGroupMCCL::allreduce_tree_small(at::Tensor& tensor, uint32_t seq,
 
 void ProcessGroupMCCL::broadcast_ring_pipelined(at::Tensor& tensor,
                                                 uint32_t seq, int root) {
+    std::lock_guard<std::mutex> ring_guard(ring_transport_mu_);
     // Ring broadcast rooted at `root`: rank order root -> root+1 -> ... ->
     // root+ws-1 (mod ws).  The payload is split into slices; each rank
     // forwards slice s while slice s+1 is arriving (depth-ahead posted
@@ -2694,6 +2696,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
             int left = (rank - 1 + ws) % ws;
             int right = (rank + 1) % ws;
 
+            {
+            std::lock_guard<std::mutex> ring_guard(ring_transport_mu_);
             if (ring_pipeline_enabled()) {
                 // Streaming pipeline: forward chunk s while chunk s+1 arrives.
                 // send(s) = (rank-s), recv(s) = (rank-s-1) = send(s+1):
@@ -2751,6 +2755,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                 metrics_->record_transport_bytes(nbytes, false);
             }
             }  // end lock-step fallback
+            }  // ring_transport_mu_
             if (use_cpu) {
                 mps_stream_sync_after_cpu_mps_buffer_write();
             }
@@ -2846,6 +2851,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
             // metal_sync_queue_only in the tail below before destruction.
             IncomingKeepAlive incoming_keep;
 
+            {
+            std::lock_guard<std::mutex> ring_guard(ring_transport_mu_);
             if (ring_pipeline_enabled()) {
                 // Streaming pipeline: send(s) = (rank+1-s) = recv(s-1), so
                 // lookahead 1; every received chunk is reduced into place
@@ -2927,6 +2934,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                 metrics_->record_transport_bytes(nbytes, false);
             }
             }  // end lock-step fallback
+            }  // ring_transport_mu_
 
             int my_chunk = rank;
             if (use_cpu) {

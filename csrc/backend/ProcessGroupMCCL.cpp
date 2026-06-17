@@ -41,14 +41,36 @@ void warn_removed_env_knobs() {
 bool use_chunked_ring_default() {
     static bool enabled = [] {
         auto* v = std::getenv("MCCL_RING_ALGO");
-        // Default: Gloo-style double-buffered chunked ring (better bandwidth
-        // utilization). Opt out with MCCL_RING_ALGO=basic|ring.
-        if (!v) return true;
-        std::string s(v);
-        if (s == "basic" || s == "ring" || s == "plain") return false;
+        if (v) {
+            std::string s(v);
+            if (s == "basic" || s == "ring" || s == "plain") return false;
+            return true;
+        }
+        // ws>4: chunked ring + default concurrency overwhelms demux (fails at 6–8 workers).
+        if (auto* ws = std::getenv("WORLD_SIZE")) {
+            long n = std::atol(ws);
+            if (n > 4) return false;
+        }
         return true;
     }();
     return enabled;
+}
+
+bool ring_fallback_basic_enabled(int world_size) {
+    if (auto* v = std::getenv("MCCL_RING_FALLBACK_BASIC")) {
+        std::string s(v);
+        return !(s == "0" || s == "false" || s == "no" || s == "off");
+    }
+    return world_size > 4;
+}
+
+bool is_supported_reduce_dtype(at::ScalarType dtype) {
+    return dtype == at::kFloat || dtype == at::kHalf || dtype == at::kBFloat16 ||
+           dtype == at::kBool || dtype == at::kInt || dtype == at::kLong;
+}
+
+bool is_integral_reduce_dtype(at::ScalarType dtype) {
+    return dtype == at::kBool || dtype == at::kInt || dtype == at::kLong;
 }
 
 // Kernel-fence pattern for the Metal reduce path (used by the ring and
@@ -575,6 +597,10 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     int coll_threads = 2;
     if (auto* v = std::getenv("MCCL_COLLECTIVE_CONCURRENCY")) {
         coll_threads = static_cast<int>(std::min(4L, std::max(1L, std::atol(v))));
+    } else if (world_size > 4) {
+        coll_threads = 1;
+        MCCL_INFO("MCCL_COLLECTIVE_CONCURRENCY defaulting to 1 (world_size=%d > 4)",
+                  world_size);
     }
     if (world_size >= 3) {
         collective_pool_ = std::make_unique<ProgressEngine>(
@@ -659,6 +685,17 @@ ProcessGroupMCCL::ProcessGroupMCCL(
               ring_pipeline_depth());
     MCCL_INFO("  collective_pool     = %s",
               collective_pool_ ? "on" : "off (ws<3)");
+    if (getSize() > 4) {
+        MCCL_INFO("  ring_steps_per_bucket = %d (2*(N-1); demux pressure scales with "
+                  "MCCL_COLLECTIVE_CONCURRENCY)",
+                  2 * (getSize() - 1));
+        if (use_chunked_ring_default() && coll_threads > 1) {
+            MCCL_WARN("world_size=%d: chunked ring + collective_concurrency=%d can "
+                      "stress demux; lab profile uses MCCL_RING_ALGO=basic and "
+                      "MCCL_COLLECTIVE_CONCURRENCY=1",
+                      getSize(), coll_threads);
+        }
+    }
     MCCL_INFO("  compression         = %s", compressor_ ? compressor_->name().c_str() : "none");
     if (compressor_ && comp_mode == CompressionMode::TOPK) {
         MCCL_INFO("  topk_ratio          = %.4f", topk_ratio);
@@ -801,9 +838,9 @@ void require_contiguous_output(const at::Tensor& tensor, const char* op_name) {
 void require_reduce_dtype(const at::Tensor& tensor, const char* op_name) {
     auto dtype = tensor.scalar_type();
     MCCL_CHECK_TENSOR(
-        dtype == at::kFloat || dtype == at::kHalf || dtype == at::kBFloat16,
+        is_supported_reduce_dtype(dtype),
         std::string("MCCL ") + op_name +
-        " supports float32/float16/bfloat16 only, got: " +
+        " supports float32/float16/bfloat16/int/bool only, got: " +
         std::string(at::toString(dtype)));
 }
 
@@ -1125,13 +1162,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                     algo = "tree_small";
                     allreduce_small(tensor_copy, seq, red_op);
                 } else {
-                    if (use_chunked_ring_default()) {
-                        algo = "ring_chunked";
-                        allreduce_ring_chunked(tensor_copy, seq, red_op);
-                    } else {
-                        algo = "ring";
-                        allreduce_ring(tensor_copy, seq, red_op);
-                    }
+                    algo = use_chunked_ring_default() ? "ring_chunked" : "ring";
+                    allreduce_ring_dispatch(tensor_copy, seq, red_op);
                 }
                 const double exec_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - exec_t0).count();
@@ -1210,10 +1242,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
             if (ws == 2) {
                 allreduce_two_rank(flat_copy, seq, red_op);
             } else if (ws >= 3) {
-                if (use_chunked_ring_default()) {
-                    allreduce_ring_chunked(flat_copy, seq, red_op);
+                if (nbytes <= transport_->config().small_msg_threshold) {
+                    allreduce_small(flat_copy, seq, red_op);
                 } else {
-                    allreduce_ring(flat_copy, seq, red_op);
+                    allreduce_ring_dispatch(flat_copy, seq, red_op);
                 }
             } else {
                 allreduce_ring(flat_copy, seq, red_op);
@@ -1643,6 +1675,25 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
     }
 }
 
+void ProcessGroupMCCL::allreduce_ring_dispatch(at::Tensor& tensor, uint32_t seq,
+                                                c10d::ReduceOp::RedOpType op) {
+    if (!use_chunked_ring_default()) {
+        allreduce_ring(tensor, seq, op);
+        return;
+    }
+    try {
+        allreduce_ring_chunked(tensor, seq, op);
+    } catch (...) {
+        if (!ring_fallback_basic_enabled(getSize())) {
+            throw;
+        }
+        MCCL_WARN("allreduce_ring_chunked failed (seq=%u rank=%d ws=%d nbytes=%zu); "
+                  "retrying with basic ring (MCCL_RING_FALLBACK_BASIC)",
+                  seq, getRank(), getSize(), tensor_nbytes(tensor));
+        allreduce_ring(tensor, seq, op);
+    }
+}
+
 void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
                                       c10d::ReduceOp::RedOpType op) {
     int rank = getRank();
@@ -1852,7 +1903,7 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
         auto dtype = tensor.scalar_type();
         bool tree_ok = !compressor_ && tensor_cpu_accessible(tensor) &&
                        (dtype == at::kFloat || dtype == at::kHalf ||
-                        dtype == at::kBFloat16);
+                        dtype == at::kBFloat16 || is_integral_reduce_dtype(dtype));
         if (tree_ok) {
             allreduce_tree_small(tensor, seq, op);
             return;
@@ -1973,7 +2024,9 @@ void ProcessGroupMCCL::allreduce_tree_small(at::Tensor& tensor, uint32_t seq,
     PooledBuffer recv_buf(staging_memory_pool(), nbytes);
 
     auto reduce_in = [&](const void* src) {
-        if (dtype == at::kFloat) {
+        if (is_integral_reduce_dtype(dtype)) {
+            cpu_reduce_op_integral(mine, src, count, dtype, op);
+        } else if (dtype == at::kFloat) {
             cpu_reduce_op(reinterpret_cast<float*>(mine),
                           static_cast<const float*>(src), count, op);
         } else if (dtype == at::kHalf) {
@@ -1987,7 +2040,9 @@ void ProcessGroupMCCL::allreduce_tree_small(at::Tensor& tensor, uint32_t seq,
     auto scale_avg = [&] {
         if (op != c10d::ReduceOp::AVG) return;
         const float s = 1.0f / static_cast<float>(ws);
-        if (dtype == at::kFloat) {
+        if (is_integral_reduce_dtype(dtype)) {
+            cpu_scale_inplace_integral(mine, count, dtype, s);
+        } else if (dtype == at::kFloat) {
             cpu_scale_inplace(reinterpret_cast<float*>(mine), count, s);
         } else if (dtype == at::kHalf) {
             cpu_scale_inplace_half(reinterpret_cast<c10::Half*>(mine), count, s);

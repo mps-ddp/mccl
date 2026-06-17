@@ -278,6 +278,28 @@ TcpTransport::TcpTransport(int rank, int world_size, const TransportConfig& conf
     }
     if (auto* v = std::getenv("MCCL_DEMUX_PARK_BYTES")) {
         park_limit_bytes_ = static_cast<size_t>(std::atoll(v));
+    } else {
+        // Scale demux park with world size and in-flight collectives so a fast
+        // rank does not trip park_limit_bytes_ when concurrency>1 at ws>=8.
+        int concurrency = 2;
+        if (auto* cv = std::getenv("MCCL_COLLECTIVE_CONCURRENCY")) {
+            concurrency = static_cast<int>(
+                std::min(4L, std::max(1L, std::atol(cv))));
+        }
+        size_t scaled = (512ULL << 20) *
+                        static_cast<size_t>(std::max(1, world_size / 4)) *
+                        static_cast<size_t>(concurrency);
+        park_limit_bytes_ = std::min<size_t>(scaled, 2ULL << 30);
+        MCCL_INFO("Rank %d: demux park_limit auto-scaled to %zu bytes "
+                  "(world_size=%d concurrency=%d; set MCCL_DEMUX_PARK_BYTES to override)",
+                  rank_, park_limit_bytes_, world_size_, concurrency);
+    }
+
+    if (static_cast<uint32_t>(config_.port_base) +
+            static_cast<uint32_t>(world_size_) > 65535u) {
+        MCCL_WARN("MCCL_PORT_BASE %u + world_size %d exceeds 65535 — "
+                  "ensure firewall allows MCCL_PORT_BASE .. +world_size-1",
+                  (unsigned)config_.port_base, world_size_);
     }
 
     send_mu_.resize(world_size);

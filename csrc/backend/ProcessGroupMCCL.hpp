@@ -103,6 +103,9 @@ private:
                         c10d::ReduceOp::RedOpType op);
     void allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
                                  c10d::ReduceOp::RedOpType op);
+    /// Chunked ring with optional basic-ring fallback (MCCL_RING_FALLBACK_BASIC).
+    void allreduce_ring_dispatch(at::Tensor& tensor, uint32_t seq,
+                                   c10d::ReduceOp::RedOpType op);
     void allreduce_small(at::Tensor& tensor, uint32_t seq,
                          c10d::ReduceOp::RedOpType op);
     /// Recursive-doubling allreduce for small messages: 2 + log2(p) serial

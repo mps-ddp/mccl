@@ -55,6 +55,9 @@ class MCCLConfig:
     max_queue_depth: int = 1024
     log_level: str = "WARN"
 
+    # Integration hint (not exported to MCCL C++ env).
+    ddp_bucket_mb: int = 25
+
     # ── env var name ↔ field mapping ─────────────────────────────────
 
     _ENV_MAP: dict[str, str] = dataclasses.field(default_factory=dict, repr=False, init=False)
@@ -207,6 +210,72 @@ class MCCLConfig:
             for f in dataclasses.fields(self)
             if f.name != "_ENV_MAP"
         }
+
+    @classmethod
+    def for_world_size(
+        cls,
+        world_size: int,
+        *,
+        mode: str = "lab",
+        link_profile: str = "",
+    ) -> "MCCLConfig":
+        """Scale-aware defaults for lab clusters.
+
+        ws <= 4: chunked ring + concurrency 2 (transport stays stable).
+        ws > 4: basic ring + concurrency 1 — required for demux headroom
+        and preferred for gradient correctness (chunked pipelined ring has
+        more async fence/credit surface; see tests/test_ring_algo_correctness.py).
+        """
+        cfg = cls()
+        if link_profile:
+            cfg.link_profile = link_profile
+        if mode == "perf":
+            cfg.ring_algo = "chunked"
+            cfg.collective_concurrency = min(3, max(2, world_size // 4))
+            cfg.pipeline_depth = 3
+            cfg.ddp_bucket_mb = 64
+            return cfg
+        if world_size <= 4:
+            cfg.ring_algo = "chunked"
+            cfg.collective_concurrency = 2
+            cfg.pipeline_depth = 2
+            cfg.ddp_bucket_mb = 25
+        elif world_size <= 8:
+            cfg.ring_algo = "basic"
+            cfg.collective_concurrency = 1
+            cfg.pipeline_depth = 2
+            cfg.demux_park_bytes = 1024 * 1024 * 1024
+            cfg.ddp_bucket_mb = 25
+        elif world_size <= 16:
+            cfg.ring_algo = "basic"
+            cfg.collective_concurrency = 1
+            cfg.pipeline_depth = 2
+            cfg.demux_park_bytes = int(1.5 * 1024 * 1024 * 1024)
+            cfg.ddp_bucket_mb = 50
+        else:
+            cfg.ring_algo = "basic"
+            cfg.collective_concurrency = 1
+            cfg.pipeline_depth = 3
+            cfg.demux_park_bytes = 2 * 1024 * 1024 * 1024
+            cfg.ddp_bucket_mb = 50
+        cfg.credit_min_chunk = 1024 * 1024
+        return cfg
+
+    def apply_to_env(self, only_if_unset: bool = True) -> Dict[str, str]:
+        """Write profile into os.environ; skip keys already set when only_if_unset."""
+        out: Dict[str, str] = {}
+        for env_key, field_name in self._ENV_MAP.items():
+            if only_if_unset and os.environ.get(env_key) is not None:
+                continue
+            val = getattr(self, field_name)
+            if isinstance(val, bool):
+                s = "1" if val else "0"
+            else:
+                s = str(val)
+            if s and s != "auto":
+                os.environ[env_key] = s
+                out[env_key] = s
+        return out
 
     def __str__(self) -> str:
         lines = ["MCCLConfig("]

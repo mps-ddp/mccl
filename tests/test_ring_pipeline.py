@@ -182,7 +182,7 @@ class TestPipelinedRing:
             timeout=420,
         )
 
-    @pytest.mark.parametrize("world_size", [4])
+    @pytest.mark.parametrize("world_size", [4, 6])
     def test_allreduce_plain_ring(self, world_size):
         run_workers(
             _allreduce_pipeline_fn, world_size=world_size,

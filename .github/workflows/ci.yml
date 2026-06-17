@@ -75,6 +75,9 @@ jobs:
       - name: DDP multi-bucket parity
         run: pytest -v tests/test_ddp_multibucket.py
 
+      - name: Ring algo correctness (basic vs chunked, ws=4)
+        run: pytest -v tests/test_ring_algo_correctness.py -k "world_size==4"
+
       - name: Failure injection
         run: pytest -v tests/test_failure_injection.py
 

@@ -89,7 +89,7 @@ class TestAllreduceVsReference:
     @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
     @pytest.mark.parametrize("op", ["SUM", "AVG", "MAX"])
     @pytest.mark.parametrize("algo", list(ALGO_ENVS.keys()))
-    @pytest.mark.parametrize("world_size", [2, 3])
+    @pytest.mark.parametrize("world_size", [2, 3, 4, 6])
     def test_allreduce(self, dtype, op, algo, world_size):
         if op == "MAX" and algo == "fp32_cpu_reduce" and dtype != "float32":
             pytest.skip("cpu reduce env only affects fp32")
@@ -113,7 +113,7 @@ class TestAllreduceVsReference:
         }
         run_workers(_allreduce_check_fn, world_size=2, env=env, timeout=300)
 
-    @pytest.mark.parametrize("world_size", [3, 4])
+    @pytest.mark.parametrize("world_size", [3, 4, 6])
     def test_chunked_ring_schedule(self, world_size):
         """ws >= 3 chunked ring (the corrected allgather schedule): every
         chunk must carry every rank's contribution."""

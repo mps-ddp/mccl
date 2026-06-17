@@ -5,6 +5,7 @@
 #include <c10/util/BFloat16.h>
 #include <cstddef>
 #include <cstdint>
+#include <ATen/ATen.h>
 
 namespace mccl {
 
@@ -50,5 +51,11 @@ void cpu_accumulate_and_scale_bf16(c10::BFloat16* dst, const c10::BFloat16* src,
 /// dst and src are raw float* pointers, count is number of float elements.
 void cpu_reduce_op(float* dst, const float* src, int64_t count,
                    c10d::ReduceOp::RedOpType op);
+
+/// Integral / bool reductions on CPU-visible MPS buffers (tree allreduce path).
+void cpu_reduce_op_integral(void* dst, const void* src, int64_t count,
+                            at::ScalarType dtype, c10d::ReduceOp::RedOpType op);
+void cpu_scale_inplace_integral(void* buf, int64_t count, at::ScalarType dtype,
+                                float scale);
 
 } // namespace mccl

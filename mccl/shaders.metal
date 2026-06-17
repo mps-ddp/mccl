@@ -550,3 +550,156 @@ kernel void accumulate_scale_bf16(
     }
 }
 #endif
+
+// ── Integral / bool reductions (DDP usage maps, Lightning sync) ─────
+
+kernel void accumulate_chunk_i32(
+    device int* dst           [[buffer(0)]],
+    device const int* src     [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    binary_vec_op<kOpAdd, int, int4>(dst, src, base, aligned, count, gid);
+}
+
+kernel void accumulate_chunk_i64(
+    device long* dst          [[buffer(0)]],
+    device const long* src    [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    binary_vec_op<kOpAdd, long, long4>(dst, src, base, aligned, count, gid);
+}
+
+kernel void accumulate_chunk_u8(
+    device uchar* dst         [[buffer(0)]],
+    device const uchar* src   [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    binary_vec_op<kOpAdd, uchar, uchar4>(dst, src, base, aligned, count, gid);
+}
+
+kernel void elementwise_min_i32(
+    device int* dst           [[buffer(0)]],
+    device const int* src     [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    binary_vec_op<kOpMin, int, int4>(dst, src, base, aligned, count, gid);
+}
+
+kernel void elementwise_max_i32(
+    device int* dst           [[buffer(0)]],
+    device const int* src     [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    binary_vec_op<kOpMax, int, int4>(dst, src, base, aligned, count, gid);
+}
+
+kernel void elementwise_product_i32(
+    device int* dst           [[buffer(0)]],
+    device const int* src     [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    binary_vec_op<kOpMul, int, int4>(dst, src, base, aligned, count, gid);
+}
+
+kernel void scale_inplace_i32(
+    device int* buf           [[buffer(0)]],
+    constant float& scale     [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    if (base + kElementsPerThread <= count) {
+        for (uint i = base; i < min(base + kElementsPerThread, count); ++i) {
+            buf[i] = int(round(float(buf[i]) * scale));
+        }
+    } else {
+        for (uint i = base; i < min(base + kElementsPerThread, count); ++i) {
+            buf[i] = int(round(float(buf[i]) * scale));
+        }
+    }
+}
+
+kernel void elementwise_min_i64(
+    device long* dst          [[buffer(0)]],
+    device const long* src    [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    binary_vec_op<kOpMin, long, long4>(dst, src, base, aligned, count, gid);
+}
+
+kernel void elementwise_max_i64(
+    device long* dst          [[buffer(0)]],
+    device const long* src    [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    binary_vec_op<kOpMax, long, long4>(dst, src, base, aligned, count, gid);
+}
+
+kernel void elementwise_product_i64(
+    device long* dst          [[buffer(0)]],
+    device const long* src    [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    binary_vec_op<kOpMul, long, long4>(dst, src, base, aligned, count, gid);
+}
+
+kernel void elementwise_min_u8(
+    device uchar* dst         [[buffer(0)]],
+    device const uchar* src   [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    binary_vec_op<kOpMin, uchar, uchar4>(dst, src, base, aligned, count, gid);
+}
+
+kernel void elementwise_max_u8(
+    device uchar* dst         [[buffer(0)]],
+    device const uchar* src   [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    binary_vec_op<kOpMax, uchar, uchar4>(dst, src, base, aligned, count, gid);
+}
+
+kernel void elementwise_product_u8(
+    device uchar* dst         [[buffer(0)]],
+    device const uchar* src   [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    binary_vec_op<kOpMul, uchar, uchar4>(dst, src, base, aligned, count, gid);
+}

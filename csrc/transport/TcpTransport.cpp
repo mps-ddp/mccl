@@ -302,13 +302,16 @@ TcpTransport::TcpTransport(int rank, int world_size, const TransportConfig& conf
         const int concurrency = demux_collective_concurrency();
         const int cwin = demux_credit_window();
         const size_t max_coll = demux_max_collective_bytes();
-        // In-flight bound: concurrent collectives × credit window × max bucket (+2× margin).
-        size_t scaled = static_cast<size_t>(concurrency) *
+        // In-flight bound: world_size x concurrent collectives x credit window
+        // x max bucket (+2x margin).  Scales with ws so late ranks at ws=8+
+        // can park ahead-of-schedule buckets from multiple neighbors.
+        size_t scaled = static_cast<size_t>(world_size_) *
+                        static_cast<size_t>(concurrency) *
                         static_cast<size_t>(cwin) * max_coll * 2;
-        park_limit_bytes_ = std::min<size_t>(scaled, 4ULL << 30);
+        park_limit_bytes_ = std::min<size_t>(scaled, 2ULL << 30);
         MCCL_INFO("Rank %d: demux park_limit=%zu bytes "
-                  "(concurrency=%d credit_window=%d max_collective=%zu)",
-                  rank_, park_limit_bytes_, concurrency, cwin, max_coll);
+                  "(world_size=%d concurrency=%d credit_window=%d max_collective=%zu)",
+                  rank_, park_limit_bytes_, world_size_, concurrency, cwin, max_coll);
     }
 
     if (auto* v = std::getenv("MCCL_TRANSPORT_CRC")) {

@@ -185,3 +185,20 @@ class TestChunkedConcurrencyStress:
             env=env,
             timeout=600,
         )
+
+    @pytest.mark.parametrize("world_size", [8])
+    def test_chunked_concurrency2_25mb_ws8(self, world_size):
+        """25 MB fp32 bucket vs f64 reference at ws=8 (training default scale)."""
+        env = {
+            "MCCL_RING_ALGO": "chunked",
+            "MCCL_COLLECTIVE_CONCURRENCY": "2",
+            "MCCL_RING_PIPELINE": "0",
+            "MCCL_TEST_SIZES": "6553600",
+            "MCCL_TEST_RTOL": "5e-5",
+        }
+        run_workers(
+            _allreduce_vs_f64_reference_fn,
+            world_size=world_size,
+            env=env,
+            timeout=1200,
+        )

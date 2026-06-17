@@ -1,5 +1,14 @@
 # Changelog
 
+## v4.8 — Ring pipeline correctness at ws=8+
+
+### Fixed
+- **Pipeline TX gate/credit protocol**: always wait on gate and credit for step `g` even when `send_bytes==0` (no wire send); fixes credit misalignment deadlocks on multi-node.
+- **Demux park limit**: scale with `world_size × MCCL_COLLECTIVE_CONCURRENCY` (2GB cap) as documented in v4.4.
+
+### Added
+- Tests: ws=8 async 25MB buckets, odd chunk boundaries, skewed-start lockstep, 25MB f64 gradient reference.
+
 ## v4.4 — Mac cluster scaling (ws > 4)
 
 ### Fixed

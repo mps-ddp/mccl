@@ -96,15 +96,16 @@ def _rs_ag_pipeline_fn(rank, world_size):
 
 
 def _concurrent_large_buckets_fn(rank, world_size):
-    """DDP-scale async buckets: ~33 MB ring chunks at ws=5, concurrency=2.
+    """DDP-scale async buckets: large ring chunks, concurrency=2.
 
     Pre-transport_collective_mu_ this interleaved on the wire and deadlocked.
     """
+    import os
     import torch
     import torch.distributed as dist
 
-    # 2*ws chunks; ~8.43M elems/chunk fp32 ≈ 33.7 MB (matches cluster DDP bucket scale).
-    n = 84_286_720
+    # Default: ws=5 cluster regression (~33.7 MB/chunk). Override via env for ws=8 etc.
+    n = int(os.environ.get("MCCL_TEST_LARGE_N", "84286720"))
     sizes = [n] * 12
     tensors = []
     works = []
@@ -146,6 +147,21 @@ def _concurrent_buckets_fn(rank, world_size):
         expected = float(i % 40 + 1) * total
         bad = (t.cpu() != expected).sum().item()
         assert bad == 0, f"bucket {i}: {bad} corrupted elements"
+
+
+def _odd_chunk_boundary_fn(rank, world_size):
+    """Sizes with remainder mod 2*ws force empty/partial chunks on some ring steps."""
+    import os
+    import torch
+    import torch.distributed as dist
+
+    sizes = [int(s) for s in os.environ["MCCL_TEST_SIZES"].split(",")]
+    for n in sizes:
+        t = torch.full((n,), float(rank + 1) * 3.0, dtype=torch.float32, device="mps")
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        expected = float(sum(r + 1 for r in range(world_size)) * 3)
+        bad = (t.cpu() - expected).abs().max().item()
+        assert bad < 1e-3, f"n={n}: max_err={bad}"
 
 
 def _skewed_start_flood_fn(rank, world_size):
@@ -258,6 +274,36 @@ class TestConcurrentCollectives:
             timeout=900,
         )
 
+    @pytest.mark.parametrize("pipeline", ["0", "1"])
+    def test_async_large_buckets_ws8(self, pipeline):
+        """ws=8 DDP-scale async buckets (25 MB tensor, concurrency=2)."""
+        run_workers(
+            _concurrent_large_buckets_fn, world_size=8,
+            env={
+                "MCCL_COLLECTIVE_CONCURRENCY": "2",
+                "MCCL_RING_PIPELINE": pipeline,
+                "MCCL_TEST_LARGE_N": "6553600",
+            },
+            timeout=1200,
+        )
+
+
+class TestOddChunkBoundary:
+    @pytest.mark.parametrize("pipeline", ["0", "1"])
+    def test_odd_sizes_ws8(self, pipeline):
+        # Remainders mod 16 (2*ws at ws=8) exercise zero-byte ring steps.
+        sizes = "6553599,6553601,13107199,26214403"
+        run_workers(
+            _odd_chunk_boundary_fn, world_size=8,
+            env={
+                "MCCL_RING_ALGO": "chunked",
+                "MCCL_COLLECTIVE_CONCURRENCY": "2",
+                "MCCL_RING_PIPELINE": pipeline,
+                "MCCL_TEST_SIZES": sizes,
+            },
+            timeout=900,
+        )
+
 
 class TestDemuxInterleave:
     @pytest.mark.parametrize("world_size", [4])
@@ -278,4 +324,17 @@ class TestCreditFlowControl:
                 "MCCL_CREDIT_MIN_CHUNK": str(1024 * 1024),
             },
             timeout=420,
+        )
+
+    @pytest.mark.parametrize("world_size", [8])
+    def test_skewed_start_lockstep_ws8(self, world_size):
+        """Late rank + lock-step ring + concurrency=2; park limit must scale."""
+        run_workers(
+            _skewed_start_flood_fn, world_size=world_size,
+            env={
+                "MCCL_RING_PIPELINE": "0",
+                "MCCL_COLLECTIVE_CONCURRENCY": "2",
+                "MCCL_CREDIT_MIN_CHUNK": "0",
+            },
+            timeout=900,
         )

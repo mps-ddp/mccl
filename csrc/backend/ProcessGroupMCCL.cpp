@@ -329,8 +329,8 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
             for (size_t g = 0; g < nsteps; ++g) {
                 const RingStep& st = plan[g];
                 if (st.send_idx < 0) continue;
+
                 size_t send_bytes = chunk_bytes(st.send_idx);
-                if (send_bytes == 0) continue;
 
                 uint64_t fence_val = 0;
                 if (!gates.wait_gate(g, &fence_val, ctx.watchdog, ctx.seq)) {
@@ -353,27 +353,30 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
 
                 ctx.watchdog->touch(ctx.seq);
 
-                at::Tensor& send_chunk = chunks[st.send_idx];
-                MPSBufferView view = extract_mps_buffer(send_chunk);
-                const void* src = nullptr;
-                if (view.cpu_accessible && view.cpu_ptr) {
-                    src = view.cpu_ptr;  // zero-copy from unified memory
-                } else {
-                    if (!tx_staging || tx_staging_size < send_bytes) {
-                        tx_staging = std::make_unique<PooledBuffer>(
-                            staging_memory_pool(), send_bytes);
-                        tx_staging_size = send_bytes;
+                if (send_bytes > 0) {
+                    at::Tensor& send_chunk = chunks[st.send_idx];
+                    MPSBufferView view = extract_mps_buffer(send_chunk);
+                    const void* src = nullptr;
+                    if (view.cpu_accessible && view.cpu_ptr) {
+                        src = view.cpu_ptr;  // zero-copy from unified memory
+                    } else {
+                        if (!tx_staging || tx_staging_size < send_bytes) {
+                            tx_staging = std::make_unique<PooledBuffer>(
+                                staging_memory_pool(), send_bytes);
+                            tx_staging_size = send_bytes;
+                        }
+                        blit_tensor_to_buffer(send_chunk, tx_staging->data());
+                        src = tx_staging->data();
                     }
-                    blit_tensor_to_buffer(send_chunk, tx_staging->data());
-                    src = tx_staging->data();
-                }
 
-                MCCL_CHECK(ctx.transport->send_chunks(
-                               ctx.right, ctx.wire_op, ctx.seq, st.send_tid,
-                               src, send_bytes),
-                           "ring pipeline send step " + std::to_string(g) +
-                           " (seq=" + std::to_string(ctx.seq) + ") failed");
-                ctx.metrics->record_transport_bytes(send_bytes, true);
+                    MCCL_CHECK(ctx.transport->send_chunks(
+                                   ctx.right, ctx.wire_op, ctx.seq, st.send_tid,
+                                   src, send_bytes),
+                               "ring pipeline send step " + std::to_string(g) +
+                               " (seq=" + std::to_string(ctx.seq) + ") failed");
+                    ctx.metrics->record_transport_bytes(send_bytes, true);
+                }
+                // send_bytes==0: no wire traffic; gate/credit protocol still ran.
             }
         } catch (...) {
             tx_error = std::current_exception();

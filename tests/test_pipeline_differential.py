@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(
     reason="MCCL pipeline differential requires macOS Apple Silicon",
 )
 
-SIZES = [262_144, 6_553_599]
+SIZES = [262_144, 6_553_599, 25_165_824]
 WORLD_SIZES = [3, 4, 6, 8, 12]
 CONCURRENCIES = [1, 2, 3]
 

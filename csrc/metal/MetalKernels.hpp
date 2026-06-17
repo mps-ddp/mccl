@@ -25,6 +25,11 @@ void metal_elementwise_product(const at::Tensor& dst, const at::Tensor& src);
 void metal_reduce_op(const at::Tensor& dst, const at::Tensor& src,
                      c10d::ReduceOp::RedOpType op);
 
+/// Reduce then fence dst (and src lifetime) before the buffer is sent or reused.
+/// Returns MCCL fence value when event sync is available, else 0 after queue drain.
+uint64_t metal_reduce_op_fenced(const at::Tensor& dst, const at::Tensor& src,
+                                c10d::ReduceOp::RedOpType op);
+
 /// buf *= scale element-wise on GPU via Metal compute.
 void metal_scale_inplace(const at::Tensor& buf, double scale);
 

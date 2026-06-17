@@ -171,7 +171,7 @@ class TestRingAlgoVsReference:
 class TestChunkedConcurrencyStress:
     """chunked + concurrency=2 is the old training default; verify correctness."""
 
-    @pytest.mark.parametrize("world_size", [4, 6])
+    @pytest.mark.parametrize("world_size", [4, 6, 8])
     def test_chunked_concurrency2_allreduce(self, world_size):
         env = {
             "MCCL_RING_ALGO": "chunked",

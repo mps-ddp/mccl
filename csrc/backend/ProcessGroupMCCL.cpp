@@ -46,22 +46,18 @@ bool use_chunked_ring_default() {
             if (s == "basic" || s == "ring" || s == "plain") return false;
             return true;
         }
-        // ws>4: chunked ring + default concurrency overwhelms demux (fails at 6–8 workers).
-        if (auto* ws = std::getenv("WORLD_SIZE")) {
-            long n = std::atol(ws);
-            if (n > 4) return false;
-        }
-        return true;
+        return true;  // chunked ring default at all world sizes
     }();
     return enabled;
 }
 
 bool ring_fallback_basic_enabled(int world_size) {
+    (void)world_size;
     if (auto* v = std::getenv("MCCL_RING_FALLBACK_BASIC")) {
         std::string s(v);
         return !(s == "0" || s == "false" || s == "no" || s == "off");
     }
-    return world_size > 4;
+    return false;  // opt-in only
 }
 
 bool is_supported_reduce_dtype(at::ScalarType dtype) {
@@ -135,6 +131,21 @@ inline int credit_window() {
     return ring_pipeline_depth() + 2;
 }
 
+inline std::chrono::milliseconds recv_wait_limit() {
+    static auto limit = [] {
+        if (auto* v = std::getenv("MCCL_RECV_TIMEOUT_MS")) {
+            long long ms = std::atoll(v);
+            if (ms > 0) return std::chrono::milliseconds(ms);
+        }
+        if (auto* v = std::getenv("MCCL_WATCHDOG_TIMEOUT_MS")) {
+            long long ms = std::atoll(v);
+            if (ms > 0) return std::chrono::milliseconds(ms);
+        }
+        return std::chrono::milliseconds(300'000);  // 5 min default
+    }();
+    return limit;
+}
+
 // ── Streaming ring pipeline ──────────────────────────────────────────
 //
 // NCCL-style execution of a ring schedule: a TX thread streams chunks to the
@@ -187,9 +198,22 @@ struct RingGates {
         }
         cv.notify_all();
     }
-    bool wait_gate(size_t g, uint64_t* fence_val) {
+    bool wait_gate(size_t g, uint64_t* fence_val,
+                   Watchdog* watchdog = nullptr, uint32_t seq = 0) {
+        const auto poll = std::chrono::milliseconds(2000);
+        const auto limit = recv_wait_limit();
+        const auto start = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lock(mu);
-        cv.wait(lock, [&] { return failed || open[g]; });
+        while (!failed && !open[g]) {
+            if (watchdog) watchdog->touch(seq);
+            if (cv.wait_for(lock, poll, [&] { return failed || open[g]; })) {
+                break;
+            }
+            if (std::chrono::steady_clock::now() - start > limit) {
+                failed = true;
+                return false;
+            }
+        }
         if (failed) return false;
         *fence_val = fence[g];
         return true;
@@ -219,6 +243,17 @@ struct IncomingKeepAlive {
         }
     }
 };
+
+/// Metal reduce with mandatory fence before chunk bytes may be sent or overwritten.
+inline uint64_t reduce_chunk_metal_fenced(at::Tensor& dst, at::Tensor incoming,
+                                          c10d::ReduceOp::RedOpType op,
+                                          std::vector<at::Tensor>* keep_tensors) {
+    uint64_t fence = metal_reduce_op_fenced(dst, incoming, op);
+    if (keep_tensors) {
+        keep_tensors->push_back(std::move(incoming));
+    }
+    return fence;
+}
 
 struct RingPipelineCtx {
     Transport* transport;
@@ -298,7 +333,11 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
                 if (send_bytes == 0) continue;
 
                 uint64_t fence_val = 0;
-                if (!gates.wait_gate(g, &fence_val)) return;  // RX failed
+                if (!gates.wait_gate(g, &fence_val, ctx.watchdog, ctx.seq)) {
+                    MCCL_CHECK(false, "ring pipeline send gate wait failed at step " +
+                               std::to_string(g) + " (seq=" +
+                               std::to_string(ctx.seq) + ")");
+                }
                 if (fence_val > 0) wait_for_mccl_fence(fence_val);
 
                 // Don't outrun the consumer: before sending step g, the right
@@ -426,21 +465,11 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
                     } else {
                         at::Tensor incoming = torch::empty_like(rchunk);
                         unstage_from_recv(incoming, recv_dst[g], rbytes);
-                        metal_reduce_op(rchunk, incoming, ctx.red_op);
-                        // Pin until the caller's final queue drain: the
-                        // kernel reads `incoming` asynchronously.
-                        if (ctx.incoming_keep) {
-                            ctx.incoming_keep->push_back(std::move(incoming));
-                        } else {
-                            metal_sync_queue_only();
-                        }
-                        if (use_event_fence) {
-                            uint64_t v = next_event_value();
-                            signal_mccl_fence_gpu(v);
-                            chunk_pending[st.recv_idx] = v;
-                            gate_fence = v;
-                        } else if (ctx.incoming_keep) {
-                            metal_sync_queue_only();
+                        gate_fence = reduce_chunk_metal_fenced(
+                            rchunk, std::move(incoming), ctx.red_op,
+                            ctx.incoming_keep);
+                        if (use_event_fence && gate_fence > 0) {
+                            chunk_pending[st.recv_idx] = gate_fence;
                         }
                     }
                     red_ms_accum += std::chrono::duration<double, std::milli>(
@@ -597,10 +626,6 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     int coll_threads = 2;
     if (auto* v = std::getenv("MCCL_COLLECTIVE_CONCURRENCY")) {
         coll_threads = static_cast<int>(std::min(4L, std::max(1L, std::atol(v))));
-    } else if (world_size > 4) {
-        coll_threads = 1;
-        MCCL_INFO("MCCL_COLLECTIVE_CONCURRENCY defaulting to 1 (world_size=%d > 4)",
-                  world_size);
     }
     if (world_size >= 3) {
         collective_pool_ = std::make_unique<ProgressEngine>(
@@ -685,17 +710,6 @@ ProcessGroupMCCL::ProcessGroupMCCL(
               ring_pipeline_depth());
     MCCL_INFO("  collective_pool     = %s",
               collective_pool_ ? "on" : "off (ws<3)");
-    if (getSize() > 4) {
-        MCCL_INFO("  ring_steps_per_bucket = %d (2*(N-1); demux pressure scales with "
-                  "MCCL_COLLECTIVE_CONCURRENCY)",
-                  2 * (getSize() - 1));
-        if (use_chunked_ring_default() && coll_threads > 1) {
-            MCCL_WARN("world_size=%d: chunked ring + collective_concurrency=%d can "
-                      "stress demux; lab profile uses MCCL_RING_ALGO=basic and "
-                      "MCCL_COLLECTIVE_CONCURRENCY=1",
-                      getSize(), coll_threads);
-        }
-    }
     MCCL_INFO("  compression         = %s", compressor_ ? compressor_->name().c_str() : "none");
     if (compressor_ && comp_mode == CompressionMode::TOPK) {
         MCCL_INFO("  topk_ratio          = %.4f", topk_ratio);
@@ -1064,9 +1078,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                                 if (red_op == c10d::ReduceOp::AVG) {
                                     metal_accumulate_and_scale(tensor_copy, incoming, 0.5);
                                 } else {
-                                    metal_reduce_op(tensor_copy, incoming, red_op);
+                                    metal_reduce_op_fenced(tensor_copy, incoming, red_op);
                                 }
-                                metal_sync_queue_only();
                             }
                             if (cpu_ok) {
                                 mps_stream_sync_after_cpu_mps_buffer_write();
@@ -1459,9 +1472,8 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
         if (op == c10d::ReduceOp::AVG) {
             metal_accumulate_and_scale(tensor, recv_tensor, 1.0 / 2.0);
         } else {
-            metal_reduce_op(tensor, recv_tensor, op);
+            metal_reduce_op_fenced(tensor, recv_tensor, op);
         }
-        metal_sync_queue_only();
     }
 }
 
@@ -1598,9 +1610,11 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
             } else {
                 at::Tensor incoming = torch::empty_like(recv_chunk);
                 unstage_from_recv(incoming, recv_buf_pool.data(), recv_bytes);
-                metal_reduce_op(recv_chunk, incoming, op);
-                incoming_keep.tensors.push_back(std::move(incoming));  // kernel is async
-                arm_chunk(recv_chunk_idx);
+                uint64_t v = reduce_chunk_metal_fenced(
+                    recv_chunk, std::move(incoming), op, &incoming_keep.tensors);
+                if (use_event_fence && v > 0) {
+                    chunk_pending[recv_chunk_idx] = v;
+                }
             }
         }
 
@@ -1814,9 +1828,11 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
             } else {
                 at::Tensor incoming = torch::empty_like(recv_chunk);
                 unstage_from_recv(incoming, recv_buf_pool.data(), recv_bytes);
-                metal_reduce_op(recv_chunk, incoming, op);
-                incoming_keep.tensors.push_back(std::move(incoming));  // kernel is async
-                arm_chunk(recv_idx);
+                uint64_t v = reduce_chunk_metal_fenced(
+                    recv_chunk, std::move(incoming), op, &incoming_keep.tensors);
+                if (use_event_fence && v > 0) {
+                    chunk_pending[recv_idx] = v;
+                }
             }
         }
 
@@ -1970,7 +1986,7 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
             for (int peer = 1; peer < ws; peer++) {
                 at::Tensor incoming = torch::empty_like(tensor);
                 compressed_recv(peer, OpType::ALLREDUCE, seq, 0, incoming);
-                metal_reduce_op(tensor, incoming, op);
+                metal_reduce_op_fenced(tensor, incoming, op);
                 incoming_keep.tensors.push_back(std::move(incoming));
             }
 
@@ -2902,9 +2918,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                 } else {
                     at::Tensor incoming = torch::empty_like(chunks[recv_idx]);
                     unstage_from_recv(incoming, recv_buf.data(), nbytes);
-                    metal_reduce_op(chunks[recv_idx], incoming, rs_op);
-                    incoming_keep.tensors.push_back(std::move(incoming));  // kernel is async
-                    arm_chunk(recv_idx);
+                    reduce_chunk_metal_fenced(
+                        chunks[recv_idx], std::move(incoming), rs_op,
+                        &incoming_keep.tensors);
                 }
 
                 metrics_->record_transport_bytes(nbytes, true);

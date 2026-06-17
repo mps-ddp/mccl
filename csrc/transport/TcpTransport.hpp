@@ -161,6 +161,7 @@ private:
     // pure headroom (concurrency x window x chunk plus socket buffers);
     // overflowing it indicates a real desync and fails loudly.
     size_t park_limit_bytes_ = 512ULL << 20;  // MCCL_DEMUX_PARK_BYTES
+    std::chrono::milliseconds recv_timeout_{std::chrono::minutes(5)};
 
     std::vector<Connection> peers_;
     std::vector<std::unique_ptr<PeerRouter>> routers_;

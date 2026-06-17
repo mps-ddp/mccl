@@ -20,6 +20,42 @@ namespace mccl {
 
 namespace {
 
+inline int demux_pipeline_depth() {
+    auto* v = std::getenv("MCCL_PIPELINE_DEPTH");
+    long n = v ? std::atol(v) : 2;
+    return static_cast<int>(std::min(8L, std::max(1L, n)));
+}
+
+inline int demux_collective_concurrency() {
+    auto* v = std::getenv("MCCL_COLLECTIVE_CONCURRENCY");
+    long n = v ? std::atol(v) : 2;
+    return static_cast<int>(std::min(4L, std::max(1L, n)));
+}
+
+inline int demux_credit_window() {
+    return demux_pipeline_depth() + 2;
+}
+
+inline size_t demux_max_collective_bytes() {
+    if (auto* v = std::getenv("MCCL_DEMUX_MAX_COLLECTIVE_BYTES")) {
+        long long n = std::atoll(v);
+        if (n > 0) return static_cast<size_t>(n);
+    }
+    return 64ULL << 20;
+}
+
+inline std::chrono::milliseconds demux_recv_timeout() {
+    if (auto* v = std::getenv("MCCL_RECV_TIMEOUT_MS")) {
+        long long ms = std::atoll(v);
+        if (ms > 0) return std::chrono::milliseconds(ms);
+    }
+    if (auto* v = std::getenv("MCCL_WATCHDOG_TIMEOUT_MS")) {
+        long long ms = std::atoll(v);
+        if (ms > 0) return std::chrono::milliseconds(ms);
+    }
+    return std::chrono::minutes(5);
+}
+
 /// Scan network interfaces for a Thunderbolt bridge.
 /// Returns the IP address string if found, empty string otherwise.
 /// Looks for interfaces named "bridge*" or "en*" with link-local 169.254.x.x
@@ -258,41 +294,25 @@ TcpTransport::TcpTransport(int rank, int world_size, const TransportConfig& conf
     MCCL_CHECK(rank >= 0 && rank < world_size, "Invalid rank");
     MCCL_CHECK(world_size >= 2, "world_size must be >= 2");
 
-    // Scale the small-message threshold with world size when not pinned by
-    // env: the recursive-doubling tree costs ~log2(N) full-payload rounds
-    // per rank vs the ring's 2(N-1) latency-bound steps, so the tree wins
-    // for progressively larger payloads as N grows (latency dominates the
-    // ring at 2(N-1) hops).  256 KiB at N<=4, scaling to 1.5 MiB at N=24.
-    if (!std::getenv("MCCL_SMALL_MSG_THRESHOLD") && world_size > 4) {
-        size_t scaled = config_.small_msg_threshold *
-                        (static_cast<size_t>(world_size) / 4);
-        config_.small_msg_threshold =
-            std::min<size_t>(scaled, 2 * 1024 * 1024);
-        MCCL_INFO("Rank %d: small_msg_threshold auto-scaled to %zu for "
-                  "world_size=%d (set MCCL_SMALL_MSG_THRESHOLD to override)",
-                  rank_, config_.small_msg_threshold, world_size);
+    recv_timeout_ = demux_recv_timeout();
+
+    if (auto* v = std::getenv("MCCL_DEMUX_PARK_BYTES")) {
+        park_limit_bytes_ = static_cast<size_t>(std::atoll(v));
+    } else {
+        const int concurrency = demux_collective_concurrency();
+        const int cwin = demux_credit_window();
+        const size_t max_coll = demux_max_collective_bytes();
+        // In-flight bound: concurrent collectives × credit window × max bucket (+2× margin).
+        size_t scaled = static_cast<size_t>(concurrency) *
+                        static_cast<size_t>(cwin) * max_coll * 2;
+        park_limit_bytes_ = std::min<size_t>(scaled, 4ULL << 30);
+        MCCL_INFO("Rank %d: demux park_limit=%zu bytes "
+                  "(concurrency=%d credit_window=%d max_collective=%zu)",
+                  rank_, park_limit_bytes_, concurrency, cwin, max_coll);
     }
 
     if (auto* v = std::getenv("MCCL_TRANSPORT_CRC")) {
         crc_enabled_ = (std::string(v) == "1" || std::string(v) == "true");
-    }
-    if (auto* v = std::getenv("MCCL_DEMUX_PARK_BYTES")) {
-        park_limit_bytes_ = static_cast<size_t>(std::atoll(v));
-    } else {
-        // Scale demux park with world size and in-flight collectives so a fast
-        // rank does not trip park_limit_bytes_ when concurrency>1 at ws>=8.
-        int concurrency = 2;
-        if (auto* cv = std::getenv("MCCL_COLLECTIVE_CONCURRENCY")) {
-            concurrency = static_cast<int>(
-                std::min(4L, std::max(1L, std::atol(cv))));
-        }
-        size_t scaled = (512ULL << 20) *
-                        static_cast<size_t>(std::max(1, world_size / 4)) *
-                        static_cast<size_t>(concurrency);
-        park_limit_bytes_ = std::min<size_t>(scaled, 2ULL << 30);
-        MCCL_INFO("Rank %d: demux park_limit auto-scaled to %zu bytes "
-                  "(world_size=%d concurrency=%d; set MCCL_DEMUX_PARK_BYTES to override)",
-                  rank_, park_limit_bytes_, world_size_, concurrency);
     }
 
     if (static_cast<uint32_t>(config_.port_base) +
@@ -849,10 +869,30 @@ RecvTicket TcpTransport::post_recv(int peer_rank, OpType op, uint32_t seq,
 
 bool TcpTransport::wait_recv(const RecvTicket& ticket) {
     MCCL_CHECK(ticket != nullptr, "wait_recv: null ticket");
+    const auto deadline = std::chrono::steady_clock::now() + recv_timeout_;
     std::unique_lock<std::mutex> lk(ticket->mu);
-    ticket->cv.wait(lk, [&] {
-        return (ticket->done || ticket->conn_closed) && !ticket->reader_busy;
-    });
+    while (true) {
+        if ((ticket->done || ticket->conn_closed) && !ticket->reader_busy) {
+            break;
+        }
+        if (ticket->cv.wait_until(lk, deadline, [&] {
+                return (ticket->done || ticket->conn_closed) && !ticket->reader_busy;
+            })) {
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw MCCLError(
+                "wait_recv timed out after " +
+                std::to_string(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        recv_timeout_).count()) +
+                "ms (peer=" + std::to_string(ticket->peer) +
+                " seq=" + std::to_string(ticket->seq) +
+                " tid=" + std::to_string(ticket->tid) +
+                " received=" + std::to_string(ticket->received) + "/" +
+                std::to_string(ticket->nbytes) + ")");
+        }
+    }
     if (ticket->error) std::rethrow_exception(ticket->error);
     if (ticket->conn_closed && ticket->received < ticket->nbytes) return false;
     return true;

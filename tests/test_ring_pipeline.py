@@ -229,7 +229,7 @@ class TestDemuxInterleave:
 
 
 class TestCreditFlowControl:
-    @pytest.mark.parametrize("world_size", [4])
+    @pytest.mark.parametrize("world_size", [4, 7, 8])
     def test_skewed_start_bounded_by_credits(self, world_size):
         run_workers(
             _skewed_start_flood_fn, world_size=world_size,

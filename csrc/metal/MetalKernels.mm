@@ -9,6 +9,7 @@
 #include "metal/MetalKernels.hpp"
 #include "metal/MPSInterop.hpp"
 #include "metal/AccelerateOps.hpp"
+#include "metal/EventSync.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 #include "common/TensorChecks.hpp"
@@ -738,6 +739,18 @@ void metal_reduce_op(const at::Tensor& dst, const at::Tensor& src,
             throw MCCLError("Unsupported ReduceOp: " +
                             std::to_string(static_cast<int>(op)));
     }
+}
+
+uint64_t metal_reduce_op_fenced(const at::Tensor& dst, const at::Tensor& src,
+                                c10d::ReduceOp::RedOpType op) {
+    metal_reduce_op(dst, src, op);
+    if (event_sync_available()) {
+        uint64_t v = next_event_value();
+        signal_mccl_fence_gpu(v);
+        return v;
+    }
+    metal_sync_queue_only();
+    return 0;
 }
 
 void metal_sync() {

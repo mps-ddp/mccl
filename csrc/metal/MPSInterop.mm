@@ -10,6 +10,7 @@
 
 #include "metal/MPSInterop.hpp"
 #include "metal/EventSync.hpp"
+#include "runtime/MCCLDeviceMutex.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 #include "common/TensorChecks.hpp"
@@ -112,6 +113,7 @@ void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
     // otherwise (e.g. ensure_shared_storage passes a fresh allocation) the
     // data would land in the pool and `dst` would stay uninitialized.
     if (dst == pool.ptr && pool.mtl_wrapper && nbytes <= pool.capacity) {
+        std::lock_guard<std::recursive_mutex> dev_lock(mccl_device_ops_mutex());
         @autoreleasepool {
             id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
             id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
@@ -136,6 +138,7 @@ void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
     // Encode every chunk blit into ONE command buffer with a single
     // commit + wait at the end.  Per-chunk commit/waitUntilCompleted turned
     // a multi-chunk transfer into N CPU<->GPU round trips.
+    std::lock_guard<std::recursive_mutex> dev_lock(mccl_device_ops_mutex());
     @autoreleasepool {
         NSMutableArray<id<MTLBuffer>>* wrappers = [NSMutableArray array];
         id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
@@ -173,6 +176,7 @@ void chunked_blit_from_staging(const void* src, size_t nbytes,
                                 id<MTLBuffer> dst_buf, size_t dst_offset) {
     StagingPool& pool = staging_pool();
     if (src == pool.ptr && pool.mtl_wrapper && nbytes <= pool.capacity) {
+        std::lock_guard<std::recursive_mutex> dev_lock(mccl_device_ops_mutex());
         @autoreleasepool {
             id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
             id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
@@ -192,6 +196,7 @@ void chunked_blit_from_staging(const void* src, size_t nbytes,
     const uint8_t* src_bytes = static_cast<const uint8_t*>(src);
 
     // Single command buffer for all chunks (see chunked_blit_to_staging).
+    std::lock_guard<std::recursive_mutex> dev_lock(mccl_device_ops_mutex());
     @autoreleasepool {
         NSMutableArray<id<MTLBuffer>>* wrappers = [NSMutableArray array];
         id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
@@ -382,6 +387,7 @@ void mps_stream_sync_after_cpu_mps_buffer_write() {
 }
 
 void mccl_queue_drain() {
+    std::lock_guard<std::recursive_mutex> lock(mccl_device_ops_mutex());
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
         [cmd commit];
@@ -399,21 +405,21 @@ uint64_t mps_event_sync_nonblocking() {
         auto* v = std::getenv("MCCL_EVENT_SYNC");
         if (v && (std::string(v) == "0" || std::string(v) == "false" ||
                   std::string(v) == "no")) {
-            MCCL_WARN("MCCL_EVENT_SYNC=0: MTLSharedEvent path disabled, "
-                       "falling back to mps_stream_sync");
+            MCCL_WARN("MCCL_EVENT_SYNC=0: skipping global MPS stream sync; "
+                       "collective staging uses MCCL-queue blit fence");
             return true;
         }
         return false;
     }();
 
     if (!force_stream_sync && event_sync_available()) {
-        uint64_t val = next_event_value();
+        uint64_t val = next_mps_event_value();
         commit_mps_and_signal(val);
         return val;
-    } else {
-        mps_stream_sync();
-        return 0;
     }
+    // No torch::mps::synchronize() from engine threads — stage_for_send_collective
+    // fences tensor bytes via blit+wait on the MCCL queue.
+    return 0;
 }
 
 void mps_event_sync() {
@@ -465,6 +471,19 @@ StagingBuffer stage_for_send_nosync(const at::Tensor& tensor) {
     void* staging = pool.ensure(view.nbytes, cached_device());
     chunked_blit_to_staging(src_buf, view.byte_offset, staging, view.nbytes);
 
+    return StagingBuffer{staging, view.nbytes};
+}
+
+StagingBuffer stage_for_send_collective(const at::Tensor& tensor) {
+    check_single_tensor(tensor);
+
+    MPSBufferView view = extract_mps_buffer(tensor);
+    id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
+    StagingPool& pool = staging_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
+    void* staging = pool.ensure(view.nbytes, cached_device());
+    chunked_blit_to_staging(src_buf, view.byte_offset, staging, view.nbytes);
+    MCCL_TRACE("stage_for_send_collective: blit+wait %zu bytes", view.nbytes);
     return StagingBuffer{staging, view.nbytes};
 }
 

@@ -355,19 +355,13 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
 
                 if (send_bytes > 0) {
                     at::Tensor& send_chunk = chunks[st.send_idx];
-                    MPSBufferView view = extract_mps_buffer(send_chunk);
-                    const void* src = nullptr;
-                    if (view.cpu_accessible && view.cpu_ptr) {
-                        src = view.cpu_ptr;  // zero-copy from unified memory
-                    } else {
-                        if (!tx_staging || tx_staging_size < send_bytes) {
-                            tx_staging = std::make_unique<PooledBuffer>(
-                                staging_memory_pool(), send_bytes);
-                            tx_staging_size = send_bytes;
-                        }
-                        blit_tensor_to_buffer(send_chunk, tx_staging->data());
-                        src = tx_staging->data();
+                    if (!tx_staging || tx_staging_size < send_bytes) {
+                        tx_staging = std::make_unique<PooledBuffer>(
+                            staging_memory_pool(), send_bytes);
+                        tx_staging_size = send_bytes;
                     }
+                    blit_tensor_to_buffer(send_chunk, tx_staging->data());
+                    const void* src = tx_staging->data();
 
                     MCCL_CHECK(ctx.transport->send_chunks(
                                    ctx.right, ctx.wire_op, ctx.seq, st.send_tid,
@@ -560,13 +554,9 @@ inline bool prefer_cpu_unified_buffer_path(const at::Tensor& tensor) {
     return true;
 }
 
-// Non-blocking: encode signal + commit, return event value (0 = already synced).
-// The engine thread must call wait_for_mps(val) before reading tensor data.
-inline uint64_t sync_mps_nonblocking(bool overlap) {
-    if (overlap) {
-        return mps_event_sync_nonblocking();
-    }
-    mps_stream_sync();
+// Collective MPS ordering: per-tensor blit fence in stage_for_send_collective().
+// No global torch::mps::synchronize() or commit_mps from engine threads.
+inline uint64_t sync_mps_nonblocking(bool /*overlap*/) {
     return 0;
 }
 
@@ -629,6 +619,10 @@ ProcessGroupMCCL::ProcessGroupMCCL(
     int coll_threads = 2;
     if (auto* v = std::getenv("MCCL_COLLECTIVE_CONCURRENCY")) {
         coll_threads = static_cast<int>(std::min(4L, std::max(1L, std::atol(v))));
+    }
+    if (world_size >= 6 && coll_threads > 1) {
+        MCCL_INFO("MCCL_COLLECTIVE_CONCURRENCY capped to 1 for world_size=%d", world_size);
+        coll_threads = 1;
     }
     if (world_size >= 3) {
         collective_pool_ = std::make_unique<ProgressEngine>(
@@ -1031,19 +1025,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 [this, tensor_copy, seq, red_op, sync_val, defer_mps_sync_to_engine,
                  peer, nbytes, shared_recv_buf]() mutable {
                     begin_execute(seq);  // watchdog arm + execute-start metric
-                    if (defer_mps_sync_to_engine) {
-                        if (overlap_comm_ && event_sync_available()) {
-                            uint64_t v = next_event_value();
-                            commit_mps_and_signal(v);
-                            wait_for_mps(v);
-                        } else {
-                            mps_stream_sync();
-                        }
-                    } else if (sync_val > 0) {
-                        wait_for_mps(sync_val);
-                    }
-
-                    StagingBuffer staged = stage_for_send_nosync(tensor_copy);
+                    StagingBuffer staged = stage_for_send_collective(tensor_copy);
                     auto net_t0 = std::chrono::steady_clock::now();
                     MCCL_CHECK(transport_->send_recv_overlap(
                         peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes,
@@ -1087,7 +1069,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                             if (cpu_ok) {
                                 mps_stream_sync_after_cpu_mps_buffer_write();
                             }
-                            if (overlap_comm_) signal_mccl_done(next_event_value());
+                            if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
 
                             auto red_t1 = std::chrono::steady_clock::now();
                             double red_ms = std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
@@ -1122,17 +1104,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
             net_engine_for(peer).submit(
                 [this, tensor_copy, seq, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
                     begin_execute(seq);
-                    if (defer_mps_sync_to_engine) {
-                        if (overlap_comm_ && event_sync_available()) {
-                            uint64_t v = next_event_value();
-                            commit_mps_and_signal(v);
-                            wait_for_mps(v);
-                        } else {
-                            mps_stream_sync();
-                        }
-                    } else if (sync_val > 0) {
-                        wait_for_mps(sync_val);
-                    }
                     allreduce_small(tensor_copy, seq, red_op);
                     MCCL_INFO("allreduce seq=%u: algo=small nbytes=%zu", seq, tensor_nbytes(tensor_copy));
                 },
@@ -1158,17 +1129,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
             [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
                 begin_execute(seq);
                 std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
-                if (defer_mps_sync_to_engine) {
-                    if (overlap_comm_ && event_sync_available()) {
-                        uint64_t v = next_event_value();
-                        commit_mps_and_signal(v);
-                        wait_for_mps(v);
-                    } else {
-                        mps_stream_sync();
-                    }
-                } else if (sync_val > 0) {
-                    wait_for_mps(sync_val);
-                }
                 const auto exec_t0 = std::chrono::steady_clock::now();
                 const char* algo = "unknown";
                 if (nbytes <= transport_->config().small_msg_threshold) {
@@ -1252,7 +1212,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
         [this, flat_copy, tensors_copy, seq, ws, nbytes, red_op, sync_val]() mutable {
             begin_execute(seq);
             std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
-            if (sync_val > 0) wait_for_mps(sync_val);
             if (ws == 2) {
                 allreduce_two_rank(flat_copy, seq, red_op);
             } else if (ws >= 3) {
@@ -1305,7 +1264,7 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
                     fp32_cpu_reduce_enabled();
 
     if (use_fast) {
-        StagingBuffer staged = stage_for_send_nosync(tensor);
+        StagingBuffer staged = stage_for_send_collective(tensor);
 
         constexpr size_t RS_AG_THRESHOLD = 8 * 1024 * 1024;  // 8 MB
         constexpr size_t REDUCE_CHUNK = 2 * 1024 * 1024;   // 2 MB
@@ -1404,7 +1363,7 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
                 "allreduce_two_rank AG send_recv_overlap failed");
 
             auto net_t1 = std::chrono::steady_clock::now();
-            if (overlap_comm_) signal_mccl_done(next_event_value());
+            if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
 
             double net_ms = std::chrono::duration<double, std::milli>(net_t1 - net_t0).count();
             double gbps = (nbytes * 2.0 * 8.0) / (net_ms / 1000.0) / 1e9;
@@ -1445,7 +1404,7 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
             }
             auto red_t1 = std::chrono::steady_clock::now();
 
-            if (overlap_comm_) signal_mccl_done(next_event_value());
+            if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
 
             double net_ms = std::chrono::duration<double, std::milli>(net_t1 - net_t0).count();
             double red_ms = std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
@@ -1562,7 +1521,7 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
     };
     auto arm_chunk = [&](int idx) {
         if (use_event_fence) {
-            uint64_t v = next_event_value();
+            uint64_t v = next_fence_event_value();
             signal_mccl_fence_gpu(v);
             chunk_pending[idx] = v;
         } else if (!use_cpu) {
@@ -1591,7 +1550,7 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
         StagingBuffer staged = {nullptr, 0};
         if (send_bytes > 0) {
             fence_chunk(send_chunk_idx);
-            staged = stage_for_send_nosync(send_chunk);
+            staged = stage_for_send_collective(send_chunk);
         }
 
         MCCL_CHECK(transport_->send_recv_overlap(
@@ -1648,7 +1607,7 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
         StagingBuffer staged = {nullptr, 0};
         if (send_bytes > 0) {
             fence_chunk(send_chunk_idx);
-            staged = stage_for_send_nosync(send_chunk);
+            staged = stage_for_send_collective(send_chunk);
         }
 
         MCCL_CHECK(transport_->send_recv_overlap(
@@ -1680,7 +1639,7 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
             MPSBufferView view = extract_mps_buffer(tensor);
             cpu_scale_inplace(static_cast<float*>(view.cpu_ptr), total_elems, 1.0f / ws);
         }
-        if (overlap_comm_) signal_mccl_done(next_event_value());
+        if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
         mps_stream_sync_after_cpu_mps_buffer_write();
     } else {
         if (op == c10d::ReduceOp::AVG) {
@@ -1782,7 +1741,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
     };
     auto arm_chunk = [&](int idx) {
         if (use_event_fence) {
-            uint64_t v = next_event_value();
+            uint64_t v = next_fence_event_value();
             signal_mccl_fence_gpu(v);
             chunk_pending[idx] = v;
         } else if (!use_cpu) {
@@ -1809,7 +1768,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
         StagingBuffer staged = {nullptr, 0};
         if (send_bytes > 0) {
             fence_chunk(send_idx);
-            staged = stage_for_send_nosync(send_chunk);
+            staged = stage_for_send_collective(send_chunk);
         }
 
         MCCL_CHECK(transport_->send_recv_overlap(
@@ -1859,7 +1818,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
         StagingBuffer staged = {nullptr, 0};
         if (send_bytes > 0) {
             fence_chunk(send_idx);
-            staged = stage_for_send_nosync(send_chunk);
+            staged = stage_for_send_collective(send_chunk);
         }
 
         MCCL_CHECK(transport_->send_recv_overlap(
@@ -1892,7 +1851,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
             cpu_scale_inplace(static_cast<float*>(view.cpu_ptr),
                               total_elems, 1.0f / ws);
         }
-        if (overlap_comm_) signal_mccl_done(next_event_value());
+        if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
         mps_stream_sync_after_cpu_mps_buffer_write();
     } else {
         if (op == c10d::ReduceOp::AVG) {
@@ -1953,16 +1912,16 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
                 cpu_scale_inplace(dst, count, 1.0f / ws);
             }
 
-            StagingBuffer staged = stage_for_send_nosync(tensor);
+            StagingBuffer staged = stage_for_send_collective(tensor);
             for (int peer = 1; peer < ws; peer++) {
                 MCCL_CHECK(transport_->send_chunks(peer, OpType::ALLREDUCE, seq, 1,
                                                    staged.data, nbytes),
                            "allreduce_small send to rank " + std::to_string(peer) + " failed");
                 metrics_->record_transport_bytes(nbytes, true);
             }
-            if (overlap_comm_) signal_mccl_done(next_event_value());
+            if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
         } else {
-            StagingBuffer staged = stage_for_send_nosync(tensor);
+            StagingBuffer staged = stage_for_send_collective(tensor);
             MCCL_CHECK(transport_->send_chunks(0, OpType::ALLREDUCE, seq, 0,
                                                staged.data, nbytes),
                        "allreduce_small send to rank 0 failed");
@@ -1972,7 +1931,7 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
                                                dst, nbytes),
                        "allreduce_small recv from rank 0 failed");
             metrics_->record_transport_bytes(nbytes, false);
-            if (overlap_comm_) signal_mccl_done(next_event_value());
+            if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
         }
         mps_stream_sync_after_cpu_mps_buffer_write();
     } else {
@@ -2131,7 +2090,7 @@ void ProcessGroupMCCL::allreduce_tree_small(at::Tensor& tensor, uint32_t seq,
         }
     }
 
-    if (overlap_comm_) signal_mccl_done(next_event_value());
+    if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
     mps_stream_sync_after_cpu_mps_buffer_write();
 
     const double net_ms = std::chrono::duration<double, std::milli>(
@@ -2395,7 +2354,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
             [this, tensor_copy, seq, root, nbytes, use_ring, sync_val_bc]() mutable {
                 begin_execute(seq);
                 std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
-                if (sync_val_bc > 0) wait_for_mps(sync_val_bc);
                 const auto exec_t0 = std::chrono::steady_clock::now();
                 if (use_ring) {
                     broadcast_ring_pipelined(tensor_copy, seq, root);
@@ -2403,7 +2361,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
                     broadcast_tree_small(tensor_copy, seq, root);
                 }
                 // Bytes are recorded per slice/round inside the algorithms.
-                if (overlap_comm_) signal_mccl_done(next_event_value());
+                if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
                 mps_stream_sync_after_cpu_mps_buffer_write();
                 const double exec_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - exec_t0).count();
@@ -2462,7 +2420,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
             try {
                 reduce_engine_->submit(
                     [this]() {
-                        if (overlap_comm_) signal_mccl_done(next_event_value());
+                        if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
                     },
                     [this, work_ptr, seq]() {
                         unregister_work(seq);
@@ -2492,8 +2450,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
         reduce_engine_->submit(
             [this, tensor_copy, seq, sync_val_bc, staged_buf]() mutable {
                 begin_execute(seq);
-                if (sync_val_bc > 0) wait_for_mps(sync_val_bc);
-                StagingBuffer staged = stage_for_send_nosync(tensor_copy);
+                StagingBuffer staged = stage_for_send_collective(tensor_copy);
                 memcpy(staged_buf->data(), staged.data, staged.nbytes);
             },
             [this, staged_buf, seq, root, ws, nbytes, state, finish_fanout]() mutable {
@@ -2538,7 +2495,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
         net_engine_for(root).submit(
             [this, tensor_copy, root, seq, nbytes, sync_val_bc]() mutable {
                 begin_execute(seq);
-                if (sync_val_bc > 0) wait_for_mps(sync_val_bc);
                 bool use_cpu = prefer_cpu_unified_buffer_path(tensor_copy);
                 if (use_cpu) {
                     MPSBufferView view = extract_mps_buffer(tensor_copy);
@@ -2553,7 +2509,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
                     unstage_from_recv(tensor_copy, recv_buf.data(), nbytes);
                 }
                 metrics_->record_transport_bytes(nbytes, false);
-                if (overlap_comm_) signal_mccl_done(next_event_value());
+                if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
                 if (use_cpu) {
                     mps_stream_sync_after_cpu_mps_buffer_write();
                 }
@@ -2674,7 +2630,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
         [this, input_copy, outputs_copy, seq, rank, ws, nbytes, sync_val_ag]() mutable {
             begin_execute(seq);
             std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
-            if (sync_val_ag > 0) wait_for_mps(sync_val_ag);
             bool use_cpu = (input_copy.scalar_type() == at::kFloat) &&
                            prefer_cpu_unified_buffer_path(input_copy);
 
@@ -2684,14 +2639,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                 memcpy(out_view.cpu_ptr, in_view.cpu_ptr, nbytes);
             } else {
                 outputs_copy[rank].copy_(input_copy);
-                // Order the copy before TX reads the bytes (engine thread).
-                if (overlap_comm_ && event_sync_available()) {
-                    uint64_t v = next_event_value();
-                    commit_mps_and_signal(v);
-                    wait_for_mps(v);
-                } else {
-                    mps_stream_sync();
-                }
             }
 
             int left = (rank - 1 + ws) % ws;
@@ -2730,7 +2677,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                 // nosync staging is safe here: allgather issues no async MCCL
                 // kernels, the pre-collective MPS sync already ordered
                 // PyTorch's writes, and unstage blits complete synchronously.
-                StagingBuffer staged = stage_for_send_nosync(outputs_copy[send_idx]);
+                StagingBuffer staged = stage_for_send_collective(outputs_copy[send_idx]);
 
                 void* recv_dst;
                 if (use_cpu) {
@@ -2757,7 +2704,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
             if (use_cpu) {
                 mps_stream_sync_after_cpu_mps_buffer_write();
             }
-            if (overlap_comm_) signal_mccl_done(next_event_value());
+            if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
         },
         [this, work_ptr, seq]() {
             unregister_work(seq);
@@ -2838,7 +2785,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
         [this, output_copy, inputs_copy, seq, rank, ws, nbytes, rs_op, sync_val_rs]() mutable {
             begin_execute(seq);
             std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
-            if (sync_val_rs > 0) wait_for_mps(sync_val_rs);
             int left = (rank - 1 + ws) % ws;
             int right = (rank + 1) % ws;
             bool use_cpu = (inputs_copy[0].scalar_type() == at::kFloat) &&
@@ -2888,7 +2834,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
             };
             auto arm_chunk = [&](int idx) {
                 if (use_event_fence) {
-                    uint64_t v = next_event_value();
+                    uint64_t v = next_fence_event_value();
                     signal_mccl_fence_gpu(v);
                     chunk_pending[idx] = v;
                 } else if (!use_cpu) {
@@ -2904,7 +2850,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                 uint32_t recv_tid = (static_cast<uint32_t>(step) << 16) | recv_idx;
 
                 if (!use_cpu) fence_chunk(send_idx);
-                StagingBuffer staged = stage_for_send_nosync(chunks[send_idx]);
+                StagingBuffer staged = stage_for_send_collective(chunks[send_idx]);
 
                 MCCL_CHECK(transport_->send_recv_overlap(
                     right, OpType::REDUCE_SCATTER, seq, step_tid,
@@ -2937,18 +2883,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                 MPSBufferView src_view = extract_mps_buffer(chunks[my_chunk]);
                 MPSBufferView dst_view = extract_mps_buffer(output_copy);
                 memcpy(dst_view.cpu_ptr, src_view.cpu_ptr, nbytes);
-                if (overlap_comm_) signal_mccl_done(next_event_value());
+                if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
                 mps_stream_sync_after_cpu_mps_buffer_write();
             } else {
                 metal_sync_queue_only();
                 output_copy.copy_(chunks[my_chunk]);
-                // Event path may touch PyTorch MPS from this thread. Non-overlap: MCCL
-                // queue is drained before copy_; next collective syncs MPS before use.
-                if (overlap_comm_ && event_sync_available()) {
-                    uint64_t val = next_event_value();
-                    commit_mps_and_signal(val);
-                    wait_for_mps(val);
-                }
             }
         },
         [this, work_ptr, seq]() {
@@ -3005,8 +2944,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
     net_engine_for(dstRank).submit(
         [this, tensor, dstRank, seq, tag, nbytes, sync_val_s]() mutable {
             begin_execute(seq);
-            if (sync_val_s > 0) wait_for_mps(sync_val_s);
-            StagingBuffer staged = stage_for_send_nosync(tensor);
+            StagingBuffer staged = stage_for_send_collective(tensor);
             MCCL_CHECK(transport_->send_chunks(dstRank, OpType::SEND, seq,
                                                static_cast<uint32_t>(tag),
                                                staged.data, staged.nbytes),

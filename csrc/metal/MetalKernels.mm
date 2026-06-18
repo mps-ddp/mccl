@@ -745,7 +745,7 @@ uint64_t metal_reduce_op_fenced(const at::Tensor& dst, const at::Tensor& src,
                                 c10d::ReduceOp::RedOpType op) {
     metal_reduce_op(dst, src, op);
     if (event_sync_available()) {
-        uint64_t v = next_event_value();
+        uint64_t v = next_fence_event_value();
         signal_mccl_fence_gpu(v);
         return v;
     }

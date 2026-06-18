@@ -322,6 +322,7 @@ CPP_SOURCES = [
     "csrc/runtime/HealthMonitor.cpp",
     "csrc/runtime/Metrics.cpp",
     "csrc/runtime/MemoryPool.cpp",
+    "csrc/runtime/MCCLDeviceMutex.cpp",
     "csrc/compression/Compression.cpp",
     "csrc/compression/FP16Compression.cpp",
     "csrc/compression/TopKCompression.cpp",

@@ -61,6 +61,9 @@ StagingBuffer stage_for_send(const at::Tensor& tensor);
 /// Caller MUST ensure all GPU work on the tensor is already flushed.
 StagingBuffer stage_for_send_nosync(const at::Tensor& tensor);
 
+/// Collective send staging: always blit+wait on MCCL queue (safe under DDP overlap).
+StagingBuffer stage_for_send_collective(const at::Tensor& tensor);
+
 /// Unstage received bytes back into an MPS tensor's buffer.
 /// Handles the CPU→GPU direction (write-back after network receive).
 void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes);

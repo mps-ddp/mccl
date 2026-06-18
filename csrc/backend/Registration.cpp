@@ -11,6 +11,7 @@
 #include "runtime/Metrics.hpp"
 #include "metal/MetalKernels.hpp"
 #include "metal/MPSInterop.hpp"
+#include "metal/EventSync.hpp"
 #include "metal/AccelerateOps.hpp"
 #include "common/Logging.hpp"
 #include "common/Version.hpp"
@@ -103,6 +104,30 @@ PYBIND11_MODULE(_C, m) {
         if (pg) pg->reset_metrics();
     }, "Reset all metric counters",
        py::call_guard<py::gil_scoped_release>());
+
+    m.def("_test_event_sync_fence_churn",
+          [](int ws) {
+              mccl::event_sync_init();
+              if (!mccl::event_sync_available()) {
+                  return false;
+              }
+              uint64_t v1 = mccl::next_mps_event_value();
+              mccl::commit_mps_and_signal(v1);
+              mccl::wait_for_mps(v1);
+              const int steps = std::max(0, 2 * (ws - 1));
+              for (int i = 0; i < steps; ++i) {
+                  uint64_t fv = mccl::next_fence_event_value();
+                  mccl::signal_mccl_fence_gpu(fv);
+                  mccl::wait_for_mccl_fence(fv);
+              }
+              uint64_t v2 = mccl::next_mps_event_value();
+              mccl::commit_mps_and_signal(v2);
+              mccl::wait_for_mps(v2);
+              return true;
+          },
+          py::arg("ws"),
+          "Simulate ring_chunked fence churn; must not hang wait_for_mps",
+          py::call_guard<py::gil_scoped_release>());
 
     m.attr("__version__") = MCCL_VERSION_STRING;
     m.attr("__protocol_version__") = MCCL_PROTOCOL_VERSION;

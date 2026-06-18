@@ -87,3 +87,30 @@ assert obj[0] == "/tmp/lightning_logs/version_0", repr(obj)
             world_size=5,
             port=36700,
         )
+
+    def test_allgather_int64_ws6(self):
+        """DDP param verify exchanges small int64 metadata via all_gather."""
+        _run(
+            """
+n_trainable = 111 + rank
+inp = torch.tensor([n_trainable], dtype=torch.long, device="cpu")
+outs = [torch.zeros(1, dtype=torch.long, device="cpu") for _ in range(world_size)]
+dist.all_gather(outs, inp)
+expected = [111 + r for r in range(world_size)]
+got = [int(t.item()) for t in outs]
+assert got == expected, f"rank {rank}: got {got} expected {expected}"
+""",
+            world_size=6,
+            port=36800,
+        )
+
+    def test_broadcast_object_list_ws8(self):
+        _run(
+            """
+obj = ["/tmp/lightning_logs/version_0"] if rank == 0 else [None]
+dist.broadcast_object_list(obj, src=0)
+assert obj[0] == "/tmp/lightning_logs/version_0", repr(obj)
+""",
+            world_size=8,
+            port=36900,
+        )

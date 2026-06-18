@@ -2257,18 +2257,14 @@ void ProcessGroupMCCL::broadcast_tree_small(at::Tensor& tensor,
     const size_t nbytes = tensor_nbytes(tensor);
     const int relid = (rank - root + ws) % ws;
 
-    MPSBufferView view = extract_mps_buffer(tensor);
-    uint8_t* base = static_cast<uint8_t*>(view.cpu_ptr);
-    std::unique_ptr<PooledBuffer> staged;
-    std::unique_ptr<PooledBuffer> root_send;
+    // Never recv/send from tensor unified-memory cpu_ptr over TCP — use one
+    // pooled wire buffer per rank, then copy into the output tensor on non-root.
+    auto tree_buf = std::make_unique<PooledBuffer>(staging_memory_pool(), nbytes);
+    uint8_t* base = static_cast<uint8_t*>(tree_buf->data());
+
     if (relid == 0) {
         StagingBuffer send_staged = stage_for_send_collective(tensor);
-        root_send = std::make_unique<PooledBuffer>(staging_memory_pool(), send_staged.nbytes);
-        memcpy(root_send->data(), send_staged.data, send_staged.nbytes);
-        base = static_cast<uint8_t*>(root_send->data());
-    } else if (!view.cpu_accessible || !view.cpu_ptr) {
-        staged = std::make_unique<PooledBuffer>(staging_memory_pool(), nbytes);
-        base = static_cast<uint8_t*>(staged->data());
+        memcpy(base, send_staged.data, send_staged.nbytes);
     }
 
     const auto bt_t0 = std::chrono::steady_clock::now();
@@ -2295,8 +2291,8 @@ void ProcessGroupMCCL::broadcast_tree_small(at::Tensor& tensor,
         }
     }
 
-    if (staged && relid != 0) {
-        blit_buffer_to_tensor(staged->data(), tensor);
+    if (relid != 0) {
+        unstage_from_recv(tensor, base, nbytes);
     }
 
     metrics_->record_phase(seq, 0,
@@ -2668,7 +2664,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                                     c10d::ReduceOp::SUM, use_cpu};
                 run_ring_pipeline(ctx, outputs_copy, plan, /*lookahead=*/1);
             } else {
-            PooledBuffer recv_buf_fallback(staging_memory_pool(), use_cpu ? 0 : nbytes);
+            PooledBuffer recv_buf_fallback(staging_memory_pool(), nbytes);
 
             for (int step = 0; step < ws - 1; step++) {
                 watchdog_->touch(seq);  // per-step progress re-arms the deadline
@@ -2682,13 +2678,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                 // PyTorch's writes, and unstage blits complete synchronously.
                 StagingBuffer staged = stage_for_send_collective(outputs_copy[send_idx]);
 
-                void* recv_dst;
-                if (use_cpu) {
-                    MPSBufferView view = extract_mps_buffer(outputs_copy[recv_idx]);
-                    recv_dst = view.cpu_ptr;
-                } else {
-                    recv_dst = recv_buf_fallback.data();
-                }
+                void* recv_dst = recv_buf_fallback.data();
 
                 MCCL_CHECK(transport_->send_recv_overlap(
                     right, OpType::ALLGATHER, seq, step_tid,
@@ -2697,16 +2687,12 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                     recv_dst, nbytes),
                     "allgather step " + std::to_string(step) + " failed");
 
-                if (!use_cpu) {
-                    unstage_from_recv(outputs_copy[recv_idx], recv_dst, nbytes);
-                }
+                unstage_from_recv(outputs_copy[recv_idx], recv_dst, nbytes);
                 metrics_->record_transport_bytes(nbytes, true);
                 metrics_->record_transport_bytes(nbytes, false);
             }
             }  // end lock-step fallback
-            if (use_cpu) {
-                mps_stream_sync_after_cpu_mps_buffer_write();
-            }
+            mps_stream_sync_after_cpu_mps_buffer_write();
             if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
         },
         [this, work_ptr, seq]() {

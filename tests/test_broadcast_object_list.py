@@ -98,8 +98,8 @@ assert obj[0] == "/tmp/lightning_logs/version_0", repr(obj)
         _run(
             """
 n_trainable = 111 + rank
-inp = torch.tensor([n_trainable], dtype=torch.long, device="cpu")
-outs = [torch.zeros(1, dtype=torch.long, device="cpu") for _ in range(world_size)]
+inp = torch.tensor([n_trainable], dtype=torch.long, device="mps")
+outs = [torch.zeros(1, dtype=torch.long, device="mps") for _ in range(world_size)]
 dist.all_gather(outs, inp)
 expected = [111 + r for r in range(world_size)]
 got = [int(t.item()) for t in outs]
@@ -114,8 +114,8 @@ assert got == expected, f"rank {rank}: got {got} expected {expected}"
         _run(
             """
 n_trainable = 111
-inp = torch.ones(n_trainable, dtype=torch.long, device="cpu")
-outs = [torch.zeros(n_trainable, dtype=torch.long, device="cpu") for _ in range(world_size)]
+inp = torch.ones(n_trainable, dtype=torch.long, device="mps")
+outs = [torch.zeros(n_trainable, dtype=torch.long, device="mps") for _ in range(world_size)]
 dist.all_gather(outs, inp)
 for r, out in enumerate(outs):
     if not torch.equal(out, inp):
@@ -135,8 +135,8 @@ for r, out in enumerate(outs):
         _run(
             """
 n_trainable = 111
-inp = torch.tensor([n_trainable], dtype=torch.long, device="cpu")
-outs = [torch.zeros(1, dtype=torch.long, device="cpu") for _ in range(world_size)]
+inp = torch.tensor([n_trainable], dtype=torch.long, device="mps")
+outs = [torch.zeros(1, dtype=torch.long, device="mps") for _ in range(world_size)]
 dist.all_gather(outs, inp)
 expected = [111 for _ in range(world_size)]
 got = [int(t.item()) for t in outs]

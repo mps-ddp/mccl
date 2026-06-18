@@ -159,3 +159,22 @@ assert obj[0] == "/tmp/lightning_logs/version_0", repr(obj)
             world_size=8,
             port=36900,
         )
+
+    def test_broadcast_large_payload_ws8_ring_pipeline(self):
+        """broadcast_object_list data phase uses ring_pipelined when payload > small_msg_threshold."""
+        _run(
+            """
+# ~512KB — forces broadcast_ring_pipelined (not tree_small).
+n = 512 * 1024
+if rank == 0:
+    t = torch.arange(n, dtype=torch.uint8, device="cpu")
+else:
+    t = torch.zeros(n, dtype=torch.uint8, device="cpu")
+dist.broadcast(t, src=0)
+expected = torch.arange(n, dtype=torch.uint8, device="cpu")
+assert torch.equal(t.cpu(), expected), f"rank {rank}: large broadcast corrupt"
+""",
+            world_size=8,
+            port=37600,
+            extra_env={"MCCL_RING_PIPELINE": "1"},
+        )

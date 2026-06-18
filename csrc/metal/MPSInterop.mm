@@ -478,6 +478,15 @@ StagingBuffer stage_for_send_collective(const at::Tensor& tensor) {
     check_single_tensor(tensor);
 
     MPSBufferView view = extract_mps_buffer(tensor);
+
+    // CPU metadata tensors (DDP verify int64, broadcast_object_list sizes):
+    // read data_ptr directly — no MPS blit or shared StagingPool hop.
+    if (tensor.is_cpu() && view.cpu_ptr) {
+        MCCL_TRACE("stage_for_send_collective: CPU tensor direct path, %zu bytes",
+                   view.nbytes);
+        return StagingBuffer{view.cpu_ptr, view.nbytes};
+    }
+
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
     StagingPool& pool = staging_pool();
     std::lock_guard<std::mutex> lock(pool.mu);

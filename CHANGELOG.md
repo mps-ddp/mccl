@@ -1,5 +1,12 @@
 # Changelog
 
+## v5.3 — Multi-node broadcast wire buffers (broadcast_object_list / large init_sync)
+
+### Fixed
+- **`broadcast_ring_pipelined`**: large broadcasts (`nbytes > small_msg_threshold`, e.g. `broadcast_object_list` payloads) no longer recv/send into tensor unified-memory / `data_ptr` over TCP. Uses one pooled wire buffer per rank + `unstage_from_recv` on non-root — same rule as `broadcast_tree_small` (fixes multi-node `EOFError` on unpickle).
+- **Small fan-out broadcast recv** (`world_size < 4` non-root path): always recv into pooled buffer + `unstage_from_recv` (removed direct `cpu_ptr` recv).
+- **`stage_for_send_collective`**: CPU tensors use direct `data_ptr` (no StagingPool blit hop) for DDP verify / metadata collectives.
+
 ## v5.2 — Small allgather lock-step (DDP init_sync)
 
 ### Fixed

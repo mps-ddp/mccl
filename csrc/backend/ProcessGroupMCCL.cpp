@@ -2120,22 +2120,19 @@ void ProcessGroupMCCL::broadcast_ring_pipelined(at::Tensor& tensor,
     const bool is_root = (relid == 0);
     const bool is_tail = (relid == ws - 1);
 
+    // Never recv/send into tensor storage over TCP (MPS unified cpu_ptr or CPU
+    // data_ptr).  Same rule as broadcast_tree_small: one pooled wire buffer per
+    // rank, blit in at root and blit out on non-root after the ring completes.
+    auto wire_buf = std::make_unique<PooledBuffer>(staging_memory_pool(), nbytes);
+    uint8_t* base = static_cast<uint8_t*>(wire_buf->data());
+    if (is_root) {
+        blit_tensor_to_buffer(tensor, base);
+    }
+
     // Slice so the pipeline has parallelism without flooding tiny messages.
     size_t slice = std::min(transport_->config().chunk_bytes,
                             std::max<size_t>(256 * 1024, nbytes / 8));
     const size_t nslices = (nbytes + slice - 1) / slice;
-
-    MPSBufferView view = extract_mps_buffer(tensor);
-    uint8_t* base = static_cast<uint8_t*>(view.cpu_ptr);
-    std::unique_ptr<PooledBuffer> staged;
-    if (!view.cpu_accessible || !view.cpu_ptr) {
-        // Private-storage fallback: stage the whole tensor once.
-        staged = std::make_unique<PooledBuffer>(staging_memory_pool(), nbytes);
-        if (is_root) {
-            blit_tensor_to_buffer(tensor, staged->data());
-        }
-        base = static_cast<uint8_t*>(staged->data());
-    }
 
     auto slice_len = [&](size_t s) {
         return std::min(slice, nbytes - s * slice);
@@ -2222,10 +2219,9 @@ void ProcessGroupMCCL::broadcast_ring_pipelined(at::Tensor& tensor,
                     ++next_post;
                 }
             }
-            if (staged) {
-                // Blit the staged copy into the private tensor.
-                blit_buffer_to_tensor(staged->data(), tensor);
-            }
+        }
+        if (!is_root) {
+            unstage_from_recv(tensor, base, nbytes);
         }
     } catch (...) {
         err = std::current_exception();
@@ -2500,24 +2496,14 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
         net_engine_for(root).submit(
             [this, tensor_copy, root, seq, nbytes, sync_val_bc]() mutable {
                 begin_execute(seq);
-                bool use_cpu = prefer_cpu_unified_buffer_path(tensor_copy);
-                if (use_cpu) {
-                    MPSBufferView view = extract_mps_buffer(tensor_copy);
-                    MCCL_CHECK(transport_->recv_chunks(root, OpType::BROADCAST, seq, 0,
-                                                       view.cpu_ptr, nbytes),
-                               "broadcast recv from root failed");
-                } else {
-                    PooledBuffer recv_buf(staging_memory_pool(), nbytes);
-                    MCCL_CHECK(transport_->recv_chunks(root, OpType::BROADCAST, seq, 0,
-                                                       recv_buf.data(), nbytes),
-                               "broadcast recv from root failed");
-                    unstage_from_recv(tensor_copy, recv_buf.data(), nbytes);
-                }
+                PooledBuffer recv_buf(staging_memory_pool(), nbytes);
+                MCCL_CHECK(transport_->recv_chunks(root, OpType::BROADCAST, seq, 0,
+                                                   recv_buf.data(), nbytes),
+                           "broadcast recv from root failed");
+                unstage_from_recv(tensor_copy, recv_buf.data(), nbytes);
                 metrics_->record_transport_bytes(nbytes, false);
                 if (overlap_comm_) signal_mccl_done(next_mccl_event_value());
-                if (use_cpu) {
-                    mps_stream_sync_after_cpu_mps_buffer_write();
-                }
+                mps_stream_sync_after_cpu_mps_buffer_write();
             },
             [this, work_ptr, seq]() {
                 unregister_work(seq);

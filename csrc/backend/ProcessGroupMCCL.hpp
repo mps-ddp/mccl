@@ -123,6 +123,13 @@ private:
     /// rounds instead of ws-1 serial root sends.
     void broadcast_tree_small(at::Tensor& tensor, uint32_t seq, int root);
 
+    /// Rank-ordered star allgather for small payloads: each src sends to all
+    /// dst > src over the full mesh (deadlock-free).  Avoids ring allgather
+    /// on multi-node TCP where neighbor-only hops can leave slots zeroed.
+    void allgather_star_small(std::vector<at::Tensor>& outputs,
+                              const at::Tensor& input,
+                              uint32_t seq, size_t nbytes);
+
     // Compressed send/recv helpers
     void compressed_send(int peer, OpType op, uint32_t seq, uint32_t tid,
                          const at::Tensor& tensor);

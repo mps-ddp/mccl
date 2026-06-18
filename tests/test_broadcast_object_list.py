@@ -109,6 +109,27 @@ assert got == expected, f"rank {rank}: got {got} expected {expected}"
             port=36800,
         )
 
+    def test_allgather_int64_param_vec_ws8_prod_env(self):
+        """DDP verify all_gathers ~111 int64 numels (888 B) — cluster prod env."""
+        _run(
+            """
+n_trainable = 111
+inp = torch.ones(n_trainable, dtype=torch.long, device="cpu")
+outs = [torch.zeros(n_trainable, dtype=torch.long, device="cpu") for _ in range(world_size)]
+dist.all_gather(outs, inp)
+for r, out in enumerate(outs):
+    if not torch.equal(out, inp):
+        raise AssertionError(f"rank {rank}: slot {r} corrupted: {out[:8].tolist()}...")
+""",
+            world_size=8,
+            port=37250,
+            extra_env={
+                "MCCL_RING_PIPELINE": "0",
+                "MCCL_OVERLAP_COMM": "1",
+                "MCCL_COLLECTIVE_CONCURRENCY": "2",
+            },
+        )
+
     def test_allgather_int64_ws8_ring_pipeline(self):
         """DDP init_sync verify: int64 allgather with MCCL_RING_PIPELINE=1 (prod submit defaults)."""
         _run(

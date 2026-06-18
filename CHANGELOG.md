@@ -1,5 +1,13 @@
 # Changelog
 
+## v5.4 — Small allgather star (multi-node DDP init_sync)
+
+### Fixed
+- **`allgather` for `nbytes <= small_msg_threshold`**: use rank-ordered **star** exchange (direct mesh send src→dst) instead of lock-step **ring**. Ring neighbor hops could leave distant slots zeroed on multi-node TCP (`RuntimeError: Rank N has 111 params, rank 0 has inconsistent 0 params`) even with `MCCL_RING_PIPELINE=0` and mccl 0.5.0. Star matches the reliability model of `broadcast_tree_small` for small payloads.
+
+### Added
+- Test: `test_allgather_int64_param_vec_ws8_prod_env` (111×int64, `MCCL_OVERLAP_COMM=1`).
+
 ## v5.3 — Multi-node broadcast wire buffers (broadcast_object_list / large init_sync)
 
 ### Fixed

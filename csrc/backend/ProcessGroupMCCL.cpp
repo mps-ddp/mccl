@@ -2303,6 +2303,50 @@ void ProcessGroupMCCL::broadcast_tree_small(at::Tensor& tensor,
 }
 
 
+void ProcessGroupMCCL::allgather_star_small(std::vector<at::Tensor>& outputs,
+                                            const at::Tensor& input,
+                                            uint32_t seq, size_t nbytes) {
+    // Deadlock-free star: for each src in [0, ws), rank src sends its input to
+    // every dst > src; ranks dst > src recv into outputs[src].  Direct mesh
+    // hops (no ring forwarding) — reliable for DDP init_sync int64 metadata on
+    // multi-node TCP where lock-step ring could leave distant slots zeroed.
+    const int rank = getRank();
+    const int ws = getSize();
+
+    outputs[rank].copy_(input);
+
+    PooledBuffer wire(staging_memory_pool(), nbytes);
+    const auto ag_t0 = std::chrono::steady_clock::now();
+
+    for (int src = 0; src < ws; src++) {
+        watchdog_->touch(seq);
+        if (rank == src) {
+            StagingBuffer staged = stage_for_send_collective(input);
+            for (int dst = src + 1; dst < ws; dst++) {
+                MCCL_CHECK(transport_->send_chunks(
+                               dst, OpType::ALLGATHER, seq,
+                               static_cast<uint32_t>(rank),
+                               staged.data, nbytes),
+                           "allgather star send to rank " + std::to_string(dst));
+                metrics_->record_transport_bytes(nbytes, true);
+            }
+        } else if (rank > src) {
+            MCCL_CHECK(transport_->recv_chunks(
+                           src, OpType::ALLGATHER, seq,
+                           static_cast<uint32_t>(src),
+                           wire.data(), nbytes),
+                       "allgather star recv from rank " + std::to_string(src));
+            metrics_->record_transport_bytes(nbytes, false);
+            unstage_from_recv(outputs[src], wire.data(), nbytes);
+        }
+    }
+
+    metrics_->record_phase(seq, 0,
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - ag_t0).count(), 0);
+}
+
+
 // ── broadcast ───────────────────────────────────────────────────────
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
@@ -2636,7 +2680,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
             int right = (rank + 1) % ws;
 
             const size_t small_thresh = transport_->config().small_msg_threshold;
-            if (ring_pipeline_for_message(nbytes, small_thresh)) {
+            if (nbytes <= small_thresh) {
+                allgather_star_small(outputs_copy, input_copy, seq, nbytes);
+            } else if (ring_pipeline_for_message(nbytes, small_thresh)) {
                 // Streaming pipeline: forward chunk s while chunk s+1 arrives.
                 // send(s) = (rank-s), recv(s) = (rank-s-1) = send(s+1):
                 // lookahead 1; receives land zero-copy in the output tensors.

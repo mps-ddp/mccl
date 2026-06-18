@@ -2260,11 +2260,14 @@ void ProcessGroupMCCL::broadcast_tree_small(at::Tensor& tensor,
     MPSBufferView view = extract_mps_buffer(tensor);
     uint8_t* base = static_cast<uint8_t*>(view.cpu_ptr);
     std::unique_ptr<PooledBuffer> staged;
-    if (!view.cpu_accessible || !view.cpu_ptr) {
+    std::unique_ptr<PooledBuffer> root_send;
+    if (relid == 0) {
+        StagingBuffer send_staged = stage_for_send_collective(tensor);
+        root_send = std::make_unique<PooledBuffer>(staging_memory_pool(), send_staged.nbytes);
+        memcpy(root_send->data(), send_staged.data, send_staged.nbytes);
+        base = static_cast<uint8_t*>(root_send->data());
+    } else if (!view.cpu_accessible || !view.cpu_ptr) {
         staged = std::make_unique<PooledBuffer>(staging_memory_pool(), nbytes);
-        if (relid == 0) {
-            blit_tensor_to_buffer(tensor, staged->data());
-        }
         base = static_cast<uint8_t*>(staged->data());
     }
 

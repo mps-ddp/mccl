@@ -88,6 +88,12 @@ inline bool ring_pipeline_enabled() {
     return enabled;
 }
 
+// Ring pipeline is for large chunks only.  Small allgather (DDP param-count
+// int64 metadata, etc.) must use lock-step + pooled recv + unstage_from_recv.
+inline bool ring_pipeline_for_message(size_t nbytes, size_t small_msg_threshold) {
+    return ring_pipeline_enabled() && nbytes > small_msg_threshold;
+}
+
 // In-flight posted-receive depth for the RX side of ring pipelines.
 inline int ring_pipeline_depth() {
     static int depth = [] {
@@ -2643,7 +2649,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
             int left = (rank - 1 + ws) % ws;
             int right = (rank + 1) % ws;
 
-            if (ring_pipeline_enabled()) {
+            const size_t small_thresh = transport_->config().small_msg_threshold;
+            if (ring_pipeline_for_message(nbytes, small_thresh)) {
                 // Streaming pipeline: forward chunk s while chunk s+1 arrives.
                 // send(s) = (rank-s), recv(s) = (rank-s-1) = send(s+1):
                 // lookahead 1; receives land zero-copy in the output tensors.
@@ -2785,7 +2792,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
             // metal_sync_queue_only in the tail below before destruction.
             IncomingKeepAlive incoming_keep;
 
-            if (ring_pipeline_enabled()) {
+            const size_t small_thresh_rs = transport_->config().small_msg_threshold;
+            if (ring_pipeline_for_message(nbytes, small_thresh_rs)) {
                 // Streaming pipeline: send(s) = (rank+1-s) = recv(s-1), so
                 // lookahead 1; every received chunk is reduced into place
                 // while the next is already on the wire.

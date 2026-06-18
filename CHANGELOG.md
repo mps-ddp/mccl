@@ -1,5 +1,13 @@
 # Changelog
 
+## v5.2 — Small allgather lock-step (DDP init_sync)
+
+### Fixed
+- **Standalone `allgather` / `reduce_scatter` with `MCCL_RING_PIPELINE=1`**: small messages (below `small_msg_threshold`, e.g. DDP param-count int64 metadata) now use lock-step ring + pooled recv + `unstage_from_recv` instead of the streaming ring pipeline COPY path, which could report rank 0 as 0 params at ws=8 (`RuntimeError: Rank 1 has 111 params, rank 0 has 0`).
+
+### Added
+- Tests: `test_allgather_int64_ws8_ring_pipeline`, `test_ddp_init_sync_ws8_ring_pipeline`.
+
 ## v4.8 — Ring pipeline correctness at ws=8+
 
 ### Fixed

@@ -915,7 +915,52 @@ void ProcessGroupMCCL::rendezvous_collective_enter(uint32_t seq, const char* op)
 
 void ProcessGroupMCCL::arm_work_release(const c10::intrusive_ptr<WorkMCCL>& work) {
     if (work) {
-        work->set_release_token(publish_collective_release(overlap_comm_));
+        uint64_t token = publish_collective_release(overlap_comm_);
+        work->set_release_token(token);
+        if (token > 0) {
+            overlap_release_published_.store(token, std::memory_order_release);
+        }
+    }
+}
+
+void ProcessGroupMCCL::note_overlap_release_consumed(uint64_t token) {
+    if (token == 0) {
+        return;
+    }
+    uint64_t prev = overlap_release_consumed_.load(std::memory_order_relaxed);
+    while (token > prev &&
+           !overlap_release_consumed_.compare_exchange_weak(
+               prev, token, std::memory_order_release, std::memory_order_relaxed)) {
+    }
+}
+
+void ProcessGroupMCCL::wait_prior_overlap_release_on_producer() {
+    if (!overlap_comm_ || !event_sync_available()) {
+        return;
+    }
+    const uint64_t published =
+        overlap_release_published_.load(std::memory_order_acquire);
+    uint64_t consumed = overlap_release_consumed_.load(std::memory_order_acquire);
+    if (published <= consumed) {
+        return;
+    }
+    wait_for_mccl(published);
+    overlap_release_consumed_.store(published, std::memory_order_release);
+}
+
+uint64_t ProcessGroupMCCL::sync_mps_for_collective() {
+    wait_prior_overlap_release_on_producer();
+    if (!event_sync_available()) {
+        return 0;
+    }
+    uint64_t v = next_mps_event_value();
+    commit_mps_and_signal(v);
+    return v;
+}
+
+void note_active_overlap_release_consumed(uint64_t token) {
+    if (ProcessGroupMCCL* pg = get_active_pg()) {
+        pg->note_overlap_release_consumed(token);
     }
 }
 
@@ -1140,7 +1185,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     // Always fence on the calling (autograd) thread — non-blocking commit+signal.
     // Engine threads wait on the returned event; they must not sync PyTorch's MPS
     // stream themselves (thread-unsafe → objc_release SIGSEGV under DDP overlap).
-    uint64_t sync_val = sync_mps_nonblocking(overlap_comm_);
+    uint64_t sync_val = sync_mps_for_collective();
     (void)defer_mps_sync_to_engine;
     auto sync_t1 = std::chrono::steady_clock::now();
     double sync_ms = std::chrono::duration<double, std::milli>(sync_t1 - sync_t0).count();
@@ -1346,7 +1391,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
     metrics_->op_start(seq, "allreduce_coalesced", nbytes);
 
     auto sync_t0 = std::chrono::steady_clock::now();
-    uint64_t sync_val = sync_mps_nonblocking(overlap_comm_);
+    uint64_t sync_val = sync_mps_for_collective();
     auto sync_t1 = std::chrono::steady_clock::now();
     metrics_->record_phase(seq, std::chrono::duration<double, std::milli>(sync_t1 - sync_t0).count(), 0, 0);
 
@@ -2678,7 +2723,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
     watchdog_->watch(seq, "broadcast");
     metrics_->op_start(seq, "broadcast", nbytes);
 
-    uint64_t sync_val_bc = sync_mps_nonblocking(overlap_comm_);
+    uint64_t sync_val_bc = sync_mps_for_collective();
 
     // ws == 2: serial ALLREDUCE-wire send/recv (same path as fp32 allreduce).
     if (ws == 2) {
@@ -2844,7 +2889,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
     watchdog_->watch(seq, "allgather");
     metrics_->op_start(seq, "allgather", nbytes * ws);
 
-    uint64_t sync_val_ag = sync_mps_nonblocking(overlap_comm_);
+    uint64_t sync_val_ag = sync_mps_for_collective();
 
     ProgressEngine& ag_engine =
         (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
@@ -2993,7 +3038,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
     watchdog_->watch(seq, "reduce_scatter");
     metrics_->op_start(seq, "reduce_scatter", nbytes * ws);
 
-    uint64_t sync_val_rs = sync_mps_nonblocking(overlap_comm_);
+    uint64_t sync_val_rs = sync_mps_for_collective();
 
     ProgressEngine& rs_engine =
         (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
@@ -3157,7 +3202,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
     watchdog_->watch(seq, "send");
     metrics_->op_start(seq, "send", nbytes);
 
-    uint64_t sync_val_s = sync_mps_nonblocking(overlap_comm_);
+    uint64_t sync_val_s = sync_mps_for_collective();
 
     net_engine_for(dstRank).submit(
         [this, tensor, dstRank, seq, tag, nbytes, sync_val_s, work_ptr]() mutable {

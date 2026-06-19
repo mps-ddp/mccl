@@ -1,5 +1,11 @@
 # Changelog
 
+## v5.8 — Overlap producer pipeline fence (step-0 backward Metal fix)
+
+### Fixed
+- **Producer pipeline fence**: with `MCCL_OVERLAP_COMM=1`, each new collective on the autograd thread calls `wait_prior_overlap_release_on_producer()` before `commit_mps_and_signal`. Bucket *N+1* no longer commits PyTorch MPS while bucket *N* MCCL GPU work is still in flight (step-0 backward `command buffer exited with error status`).
+- **Release cursor**: `arm_work_release` publishes monotonic tokens; `Work::wait` updates the consumed cursor so producer and consumer fences stay aligned.
+
 ## v5.7 — DDP consumer release (NCCL stream-return semantics)
 
 ### Fixed

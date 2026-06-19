@@ -84,6 +84,19 @@ public:
     void log_metrics() const { metrics_->log_summary(); }
     void reset_metrics() { metrics_->reset(); }
 
+    /// Engine thread: publish GPU release token for DDP/autograd Work::wait().
+    void arm_work_release(const c10::intrusive_ptr<WorkMCCL>& work);
+
+    /// Autograd thread (overlap): wait for prior bucket's MCCL GPU work before the
+    /// next commit_mps_and_signal — prevents PyTorch MPS encode racing in-flight MCCL.
+    void wait_prior_overlap_release_on_producer();
+
+    /// Work::wait consumer path: keep producer consumed cursor in sync.
+    void note_overlap_release_consumed(uint64_t token);
+
+    /// Producer fence + MPS commit+signal on the calling (autograd) thread.
+    uint64_t sync_mps_for_collective();
+
 private:
     void init_transport();
     void on_watchdog_abort(uint32_t seq, const std::string& msg);
@@ -153,9 +166,6 @@ private:
         metrics_->op_execute_start(seq);
     }
 
-    /// Engine thread: publish GPU release token for DDP/autograd Work::wait().
-    void arm_work_release(const c10::intrusive_ptr<WorkMCCL>& work);
-
     /// Store barrier so every rank enters the collective before any wire I/O.
     /// Without this, a fast rank can send/complete before a slow rank posts recv.
     void rendezvous_collective_enter(uint32_t seq, const char* op);
@@ -191,6 +201,9 @@ private:
     std::atomic<uint32_t> collective_seq_{0};
     bool transport_initialized_ = false;
     bool overlap_comm_ = true;
+    /// Monotonic MCCL release tokens: producer waits before next MPS commit (overlap).
+    std::atomic<uint64_t> overlap_release_published_{0};
+    std::atomic<uint64_t> overlap_release_consumed_{0};
 
     mutable std::mutex work_registry_mu_;
     std::unordered_map<uint32_t, c10::weak_intrusive_ptr<WorkMCCL>> work_registry_;
@@ -204,5 +217,8 @@ c10::intrusive_ptr<c10d::Backend> createProcessGroupMCCL(
 
 void set_active_pg(ProcessGroupMCCL* pg);
 void clear_active_pg_if(ProcessGroupMCCL* pg);
+ProcessGroupMCCL* get_active_pg();
+/// Called from WorkMCCL::wait to advance the overlap producer cursor.
+void note_active_overlap_release_consumed(uint64_t token);
 
 } // namespace mccl

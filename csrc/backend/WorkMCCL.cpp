@@ -8,6 +8,8 @@
 
 namespace mccl {
 
+void note_active_overlap_release_consumed(uint64_t token);
+
 WorkMCCL::WorkMCCL(c10d::OpType opType, uint32_t seq,
                    std::vector<at::Tensor> outputTensors)
     : c10d::Work(-1, opType), seq_(seq),
@@ -129,6 +131,7 @@ void WorkMCCL::wait_consumer_release() {
     const uint64_t token = release_token_.load(std::memory_order_acquire);
     if (token > 0) {
         wait_for_mccl(token);
+        note_active_overlap_release_consumed(token);
         return;
     }
     if (event_sync_available()) {

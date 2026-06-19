@@ -43,6 +43,7 @@ def run_workers(
         port = next_port()
 
     src = textwrap.dedent(inspect.getsource(fn))
+    fn_name = fn.__name__
     env_lines = ""
     for k, v in (env or {}).items():
         env_lines += f"os.environ[{k!r}] = {v!r}\n"
@@ -62,10 +63,11 @@ def run_workers(
         "device_id=torch.device('mps:0'))\n"
         "try:\n"
         f"{textwrap.indent(src, '    ')}"
-        "    fn(rank, world_size)\n"
+        f"    {fn_name}(rank, world_size)\n"
         "finally:\n"
-        "    dist.destroy_process_group()\n"
-        "    os._exit(0)\n"
+        "    if dist.is_initialized():\n"
+        "        dist.destroy_process_group()\n"
+        "os._exit(0)  # success only — avoids MCCL atexit hang; failures above skip this\n"
     )
 
     procs = []
@@ -75,7 +77,6 @@ def run_workers(
             env={**os.environ},
         )
         procs.append(p)
-        time.sleep(0.4)
 
     codes = []
     deadline = time.monotonic() + timeout

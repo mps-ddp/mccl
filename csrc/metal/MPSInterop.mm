@@ -487,18 +487,24 @@ StagingBuffer stage_for_send_collective(const at::Tensor& tensor) {
         return StagingBuffer{view.cpu_ptr, view.nbytes};
     }
 
+    mps_stream_sync();
+    mccl_queue_drain();
+
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
     StagingPool& pool = staging_pool();
     std::lock_guard<std::mutex> lock(pool.mu);
     void* staging = pool.ensure(view.nbytes, cached_device());
     chunked_blit_to_staging(src_buf, view.byte_offset, staging, view.nbytes);
+    mccl_queue_drain();
     MCCL_TRACE("stage_for_send_collective: blit+wait %zu bytes", view.nbytes);
     return StagingBuffer{staging, view.nbytes};
 }
 
 void blit_tensor_to_buffer(const at::Tensor& tensor, void* dst) {
     MPSBufferView view = extract_mps_buffer(tensor);
-    if (view.cpu_accessible && view.cpu_ptr) {
+    // MPS tensors must blit from the device buffer; cpu_ptr may be stale for
+    // Metal consumers (mirrors stage_for_send_collective send-side policy).
+    if (tensor.is_cpu() && view.cpu_accessible && view.cpu_ptr) {
         memcpy(dst, view.cpu_ptr, view.nbytes);
         return;
     }
@@ -510,30 +516,52 @@ void blit_tensor_to_buffer(const at::Tensor& tensor, void* dst) {
 
 void blit_buffer_to_tensor(const void* src, const at::Tensor& tensor) {
     MPSBufferView view = extract_mps_buffer(tensor);
-    if (view.cpu_accessible && view.cpu_ptr) {
+    // MPS tensors must blit into the device buffer; cpu_ptr memcpy leaves
+    // Metal kernels reading stale GPU memory (breaks ring allreduce recv).
+    if (tensor.is_cpu() && view.cpu_accessible && view.cpu_ptr) {
         memcpy(view.cpu_ptr, src, view.nbytes);
         return;
     }
-    MCCL_CHECK((reinterpret_cast<uintptr_t>(src) & (PAGE - 1)) == 0,
-               "blit_buffer_to_tensor: src must be page-aligned");
+
+    const void* blit_src = src;
+    StagingPool& pool = staging_pool();
+    std::lock_guard<std::mutex> lock(pool.mu);
+    // Pooled wire buffers are 64-byte aligned; Metal blit requires PAGE.
+    if ((reinterpret_cast<uintptr_t>(src) & (PAGE - 1)) != 0 || src != pool.ptr) {
+        void* staging = pool.ensure(view.nbytes, cached_device());
+        memcpy(staging, src, view.nbytes);
+        blit_src = staging;
+    }
+
     id<MTLBuffer> dst_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
-    chunked_blit_from_staging(src, view.nbytes, dst_buf, view.byte_offset);
+    chunked_blit_from_staging(blit_src, view.nbytes, dst_buf, view.byte_offset);
 }
 
-void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes) {
+void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes,
+                       bool cpu_unified_stage) {
     check_single_tensor(tensor);
     MCCL_CHECK(nbytes == tensor_nbytes(tensor),
                "unstage size mismatch");
 
     MPSBufferView view = extract_mps_buffer(tensor);
 
-    if (view.cpu_accessible && view.cpu_ptr) {
+    if (tensor.is_cpu() && view.cpu_accessible && view.cpu_ptr) {
         MCCL_TRACE("unstage_from_recv: direct memcpy path, %zu bytes", nbytes);
         memcpy(view.cpu_ptr, src, nbytes);
         return;
     }
 
-    MCCL_DEBUG("unstage_from_recv: blit fallback for %zu bytes", nbytes);
+    // fp32 unified MPS: memcpy into shared cpu_ptr for vDSP reduce (wire
+    // staging).  Avoids blit+sync from ProgressEngine threads (can hang on
+    // torch::mps::synchronize).  stage_for_send / copy_ callers sync later.
+    if (cpu_unified_stage && view.cpu_accessible && view.cpu_ptr &&
+        tensor.scalar_type() == at::kFloat) {
+        MCCL_TRACE("unstage_from_recv: unified fp32 cpu staging, %zu bytes", nbytes);
+        memcpy(view.cpu_ptr, src, nbytes);
+        return;
+    }
+
+    MCCL_DEBUG("unstage_from_recv: blit path for %zu bytes", nbytes);
 
     id<MTLBuffer> dst_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
 
@@ -548,6 +576,7 @@ void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes)
     }
 
     chunked_blit_from_staging(blit_src, nbytes, dst_buf, view.byte_offset);
+    mccl_queue_drain();
 }
 
 } // namespace mccl

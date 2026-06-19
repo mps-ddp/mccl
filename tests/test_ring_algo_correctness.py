@@ -54,10 +54,14 @@ def _allreduce_vs_f64_reference_fn(rank, world_size):
         base = torch.randn(n, dtype=torch.float64) * (1.0 + (torch.arange(n) % 97) * 1e-4)
         mine = (base + float(rank) * 1e-3).to(torch.float32).to("mps")
 
-        expected = sum(
-            (base + float(r) * 1e-3).to(torch.float32).to(torch.float64)
-            for r in range(world_size)
-        )
+        contribs = []
+        for r in range(world_size):
+            torch.manual_seed(17_000 + n + r * 1_000_003)
+            b = torch.randn(n, dtype=torch.float64) * (
+                1.0 + (torch.arange(n) % 97) * 1e-4
+            )
+            contribs.append((b + float(r) * 1e-3).to(torch.float32).to(torch.float64))
+        expected = sum(contribs)
 
         dist.all_reduce(mine, op=dist.ReduceOp.SUM)
         got = mine.cpu().to(torch.float64)

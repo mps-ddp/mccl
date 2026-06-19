@@ -65,8 +65,10 @@ StagingBuffer stage_for_send_nosync(const at::Tensor& tensor);
 StagingBuffer stage_for_send_collective(const at::Tensor& tensor);
 
 /// Unstage received bytes back into an MPS tensor's buffer.
-/// Handles the CPU→GPU direction (write-back after network receive).
-void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes);
+/// cpu_unified_stage: memcpy into shared cpu_ptr for fp32 vDSP reduce (no GPU
+/// blit); callers that need GPU-visible data (broadcast copy_) leave this false.
+void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes,
+                       bool cpu_unified_stage = false);
 
 /// Copy a (possibly private-storage) tensor's bytes into a caller-owned,
 /// PAGE-ALIGNED host buffer (e.g. a PooledBuffer).  Shared storage: memcpy;

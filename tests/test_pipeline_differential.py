@@ -28,6 +28,7 @@ _OUT_DIR = Path(tempfile.gettempdir()) / "mccl_pipe_diff"
 
 def _allreduce_save_fn(rank, world_size):
     import os
+    from pathlib import Path
 
     import torch
     import torch.distributed as dist
@@ -47,6 +48,7 @@ def _allreduce_save_fn(rank, world_size):
 
 def _compare_saved_fn(rank, world_size):
     import os
+    from pathlib import Path
 
     import torch
 

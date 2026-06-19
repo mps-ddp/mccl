@@ -3,10 +3,20 @@
 ## v5.4 — Small allgather star (multi-node DDP init_sync)
 
 ### Fixed
-- **`allgather` for `nbytes <= small_msg_threshold`**: use rank-ordered **star** exchange (direct mesh send src→dst) instead of lock-step **ring**. Ring neighbor hops could leave distant slots zeroed on multi-node TCP (`RuntimeError: Rank N has 111 params, rank 0 has inconsistent 0 params`) even with `MCCL_RING_PIPELINE=0` and mccl 0.5.0. Star matches the reliability model of `broadcast_tree_small` for small payloads.
+- **`allgather_star_small` completeness**: send to all `dst != src` (not only `dst > src`).
+- **`recv_chunks` on BROADCAST/ALLGATHER**: mesh hops use symmetric `collective_send_only` / `collective_recv_only` on the ALLREDUCE wire opcode (`send_recv_overlap` with nbytes on both legs). One-sided `send_chunks`/`recv_chunks` and BROADCAST/ALLGATHER demux tags dropped payload on multi-hop paths.
+- **2-rank broadcast**: mirror `allreduce_two_rank` transport — default fp32 uses `compressed_send`/`compressed_recv` with separate `recv_tensor` + root ack recv; `MCCL_FP32_CPU_REDUCE=1` uses symmetric `send_recv_overlap`.
+- **ws≥3 small broadcast**: root-star (`broadcast_star_small`) replaces tree/fanout for payloads below `small_msg_threshold`.
+- **small allgather**: star uses compressed send/recv + ack (same wire as broadcast).
+- **Collective entry sync**: store rendezvous (`rendezvous_collective_enter`) before broadcast/allgather wire I/O so fast ranks cannot send before slow ranks post recv.
+- **`wait_recv`**: fail loudly on `received < nbytes` instead of returning success.
+- **MPS recv → Metal reduce**: `unstage_from_recv` / `blit_buffer_to_tensor` no longer memcpy into unified `cpu_ptr` for MPS tensors (Metal kernels read device memory). Fixes ring allreduce, ring pipeline, and DDP gradient multibucket parity.
+- **Metal default for allreduce**: CPU unified-buffer reduce (tree, ring `cpu_ptr`, inplace pipeline recv) is opt-in only (`MCCL_FP32_CPU_REDUCE=1`). Default uses Metal kernels + blit staging for all dtypes.
+- **`metal_reduce_op_fenced`**: wait on fence / queue drain before return so async engine paths (two-rank split, ring) expose completed gradients to DDP.
 
 ### Added
 - Test: `test_allgather_int64_param_vec_ws8_prod_env` (111×int64, `MCCL_OVERLAP_COMM=1`).
+- Test: `test_allgather_distinct_values_ws8` (per-rank unique scalars; catches incomplete star).
 
 ## v5.3 — Multi-node broadcast wire buffers (broadcast_object_list / large init_sync)
 

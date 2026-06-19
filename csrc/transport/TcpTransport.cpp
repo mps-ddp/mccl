@@ -897,7 +897,16 @@ bool TcpTransport::wait_recv(const RecvTicket& ticket) {
         }
     }
     if (ticket->error) std::rethrow_exception(ticket->error);
-    if (ticket->conn_closed && ticket->received < ticket->nbytes) return false;
+    if (ticket->received < ticket->nbytes) {
+        if (ticket->conn_closed) return false;
+        throw MCCLError(
+            "wait_recv: incomplete message (received " +
+            std::to_string(ticket->received) + "/" +
+            std::to_string(ticket->nbytes) + " bytes, peer=" +
+            std::to_string(ticket->peer) + " seq=" +
+            std::to_string(ticket->seq) + " tid=" +
+            std::to_string(ticket->tid) + ")");
+    }
     return true;
 }
 

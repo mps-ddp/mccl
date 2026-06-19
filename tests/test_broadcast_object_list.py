@@ -16,6 +16,11 @@ pytestmark = pytest.mark.skipif(
 
 
 def _run(body: str, world_size: int, port: int, extra_env: dict | None = None) -> None:
+    """Spawn ``world_size`` MCCL workers running ``body`` (uses ``rank``, ``world_size``).
+
+    Worker exit codes must reflect assertion failures.  Do not put ``os._exit(0)``
+    inside ``finally`` — that runs even when ``assert`` fails and reports exit 0.
+    """
     extra_lines = ""
     if extra_env:
         for k, v in extra_env.items():
@@ -37,8 +42,9 @@ def _run(body: str, world_size: int, port: int, extra_env: dict | None = None) -
         "try:\n"
         f"{textwrap.indent(body.strip(), '    ')}\n"
         "finally:\n"
-        "    dist.destroy_process_group()\n"
-        "    os._exit(0)\n"
+        "    if dist.is_initialized():\n"
+        "        dist.destroy_process_group()\n"
+        "os._exit(0)  # success only — avoids MCCL atexit hang; failures above skip this\n"
     )
     procs = []
     for r in range(world_size):
@@ -145,6 +151,22 @@ assert got == expected, f"rank {rank}: got {got} expected {expected}"
             world_size=8,
             port=37000,
             extra_env={"MCCL_RING_PIPELINE": "1", "MCCL_COLLECTIVE_CONCURRENCY": "2"},
+        )
+
+    def test_allgather_distinct_values_ws8(self):
+        """Each rank contributes a unique scalar; every rank must gather all slots."""
+        _run(
+            """
+inp = torch.tensor([rank], dtype=torch.long, device="mps")
+outs = [torch.zeros(1, dtype=torch.long, device="mps") for _ in range(world_size)]
+dist.all_gather(outs, inp)
+got = [int(t.item()) for t in outs]
+expected = list(range(world_size))
+assert got == expected, f"rank {rank}: got {got} expected {expected}"
+""",
+            world_size=8,
+            port=37200,
+            extra_env={"MCCL_RING_PIPELINE": "1"},
         )
 
     def test_ddp_init_sync_ws8_ring_pipeline(self):

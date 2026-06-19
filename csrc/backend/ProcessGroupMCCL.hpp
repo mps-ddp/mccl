@@ -123,6 +123,14 @@ private:
     /// rounds instead of ws-1 serial root sends.
     void broadcast_tree_small(at::Tensor& tensor, uint32_t seq, int root);
 
+    /// Root star broadcast (small payloads, ws >= 3): root sends to each peer
+    /// with the same compressed send/recv ack pattern as broadcast_two_rank.
+    void broadcast_star_small(at::Tensor& tensor, uint32_t seq, int root);
+
+    /// Two-rank broadcast (ws == 2): serial send/recv on the ALLREDUCE wire
+    /// path (verified for fp32 on TCP demux).
+    void broadcast_two_rank(at::Tensor& tensor, uint32_t seq, int root);
+
     /// Rank-ordered star allgather for small payloads: each src sends to all
     /// dst > src over the full mesh (deadlock-free).  Avoids ring allgather
     /// on multi-node TCP where neighbor-only hops can leave slots zeroed.
@@ -134,7 +142,7 @@ private:
     void compressed_send(int peer, OpType op, uint32_t seq, uint32_t tid,
                          const at::Tensor& tensor);
     void compressed_recv(int peer, OpType op, uint32_t seq, uint32_t tid,
-                         const at::Tensor& tensor);
+                         const at::Tensor& tensor, bool cpu_unified_stage = false);
 
     /// First line of every collective's execute lambda: arms the watchdog
     /// deadline and stamps Metrics::op_execute_start with the COLLECTIVE seq
@@ -144,6 +152,10 @@ private:
         watchdog_->touch(seq);
         metrics_->op_execute_start(seq);
     }
+
+    /// Store barrier so every rank enters the collective before any wire I/O.
+    /// Without this, a fast rank can send/complete before a slow rank posts recv.
+    void rendezvous_collective_enter(uint32_t seq, const char* op);
 
     // Work registry: tracks all in-flight Work objects so watchdog/health
     // callbacks can mark them as failed without waiting for the I/O to unblock.

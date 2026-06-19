@@ -4,10 +4,13 @@
 
 #include <dlfcn.h>
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
+#include <string>
 
 #include "metal/MetalKernels.hpp"
 #include "metal/MPSInterop.hpp"
+#include "runtime/MemoryPool.hpp"
 #include "metal/AccelerateOps.hpp"
 #include "metal/EventSync.hpp"
 #include "common/Errors.hpp"
@@ -175,6 +178,13 @@ bool binary_vector_aligned(const MPSBufferView& dst_view, const MPSBufferView& s
 }
 
 bool should_use_small_cpu_path(const at::Tensor& tensor) {
+    static bool cpu_reduce = [] {
+        auto* v = std::getenv("MCCL_FP32_CPU_REDUCE");
+        if (!v) return false;
+        std::string s(v);
+        return s == "1" || s == "true" || s == "on" || s == "yes";
+    }();
+    if (!cpu_reduce) return false;
     auto dtype = tensor.scalar_type();
     return (dtype == at::kHalf || dtype == at::kBFloat16) &&
            tensor.numel() <= small_gpu_threshold() &&
@@ -193,6 +203,28 @@ id<MTLCommandBuffer> acquire_command_buffer(KernelCache& c, const char* label) {
 
 void finish_command_buffer(id<MTLCommandBuffer> cmd) {
     [cmd commit];
+}
+
+/// Unified fp32: seed dst from GPU, reduce with staged src, blit back.
+/// Metal GPU binary ops read stale bytes on Apple Silicon UMA after wire recv.
+bool unified_fp32_binary_reduce(const at::Tensor& dst, const at::Tensor& src,
+                                c10d::ReduceOp::RedOpType op) {
+    if (dst.scalar_type() != at::kFloat) return false;
+    MPSBufferView dst_view = extract_mps_buffer(dst);
+    MPSBufferView src_view = extract_mps_buffer(src);
+    if (!dst_view.cpu_accessible || !dst_view.cpu_ptr ||
+        !src_view.cpu_accessible) {
+        return false;
+    }
+    StagingBuffer dst_staged = stage_for_send(dst);
+    memcpy(dst_view.cpu_ptr, dst_staged.data, dst_view.nbytes);
+    StagingBuffer src_staged = stage_for_send(src);
+    cpu_reduce_op(static_cast<float*>(dst_view.cpu_ptr),
+                  static_cast<const float*>(src_staged.data),
+                  dst.numel(), op);
+    blit_buffer_to_tensor(dst_view.cpu_ptr, dst);
+    mps_stream_sync_after_cpu_mps_buffer_write();
+    return true;
 }
 
 void cpu_small_reduce(const at::Tensor& dst, const at::Tensor& src,
@@ -483,6 +515,11 @@ void metal_accumulate_chunk(const at::Tensor& dst, const at::Tensor& src) {
     MPSBufferView dst_view = extract_mps_buffer(dst);
     MPSBufferView src_view = extract_mps_buffer(src);
 
+    // Unified MPS memory: GPU binary kernels read stale bytes after recv blit.
+    if (unified_fp32_binary_reduce(dst, src, c10d::ReduceOp::SUM)) {
+        return;
+    }
+
     id<MTLBuffer> dst_buf = (__bridge id<MTLBuffer>)dst_view.mtl_buffer;
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)src_view.mtl_buffer;
 
@@ -657,6 +694,7 @@ void metal_elementwise_min(const at::Tensor& dst, const at::Tensor& src) {
     KernelCache& c = cache();
     MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
+    if (unified_fp32_binary_reduce(dst, src, c10d::ReduceOp::MIN)) return;
     if (should_use_small_cpu_binary_path(dst, src)) {
         cpu_small_reduce(dst, src, c10d::ReduceOp::MIN);
         return;
@@ -679,6 +717,7 @@ void metal_elementwise_max(const at::Tensor& dst, const at::Tensor& src) {
     KernelCache& c = cache();
     MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
+    if (unified_fp32_binary_reduce(dst, src, c10d::ReduceOp::MAX)) return;
     if (should_use_small_cpu_binary_path(dst, src)) {
         cpu_small_reduce(dst, src, c10d::ReduceOp::MAX);
         return;
@@ -701,6 +740,7 @@ void metal_elementwise_product(const at::Tensor& dst, const at::Tensor& src) {
     KernelCache& c = cache();
     MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
+    if (unified_fp32_binary_reduce(dst, src, c10d::ReduceOp::PRODUCT)) return;
     if (should_use_small_cpu_binary_path(dst, src)) {
         cpu_small_reduce(dst, src, c10d::ReduceOp::PRODUCT);
         return;
@@ -743,7 +783,13 @@ void metal_reduce_op(const at::Tensor& dst, const at::Tensor& src,
 
 uint64_t metal_reduce_op_fenced(const at::Tensor& dst, const at::Tensor& src,
                                 c10d::ReduceOp::RedOpType op) {
+    const bool cpu_unified_fp32 =
+        dst.scalar_type() == at::kFloat && tensor_cpu_accessible(dst) &&
+        tensor_cpu_accessible(src);
     metal_reduce_op(dst, src, op);
+    if (cpu_unified_fp32) {
+        return 0;
+    }
     if (event_sync_available()) {
         uint64_t v = next_fence_event_value();
         signal_mccl_fence_gpu(v);

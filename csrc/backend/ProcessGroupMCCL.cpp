@@ -4,6 +4,7 @@
 #include "metal/EventSync.hpp"
 #include "metal/AccelerateOps.hpp"
 #include "transport/rdma/RdmaTransport.hpp"
+#include "common/CollectiveEnv.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 #include "common/TensorChecks.hpp"
@@ -604,7 +605,24 @@ inline bool prefer_cpu_unified_buffer_path(const at::Tensor& tensor) {
 
 // Collective MPS ordering: per-tensor blit fence in stage_for_send_collective().
 // No global torch::mps::synchronize() or commit_mps from engine threads.
+// Producer MPS fence, run on the CALLING thread (DDP fires allreduce on the
+// autograd thread).  Commits PyTorch's pending backward MPS work and signals
+// mps_event to a fresh monotonic value, returned for the engine thread to wait
+// on via wait_for_mps().
+//
+// CRITICAL: engine/ProgressEngine threads must NEVER call torch::mps::synchronize()
+// or torch::mps::commit().  PyTorch's MPS stream is single-producer; a
+// synchronize/commit from an engine thread concurrent with the autograd thread's
+// encodeToCommandBuffer corrupts the shared command buffer and crashes with
+// objc_release inside mps_convolution_backward (the cluster SIGSEGV).  Signaling
+// here (same thread as the backward encode) is serialized and non-blocking; the
+// engine then waits on the MTLSharedEvent, which never touches PyTorch's stream.
 inline uint64_t sync_mps_nonblocking(bool /*overlap*/) {
+    if (event_sync_available()) {
+        uint64_t v = next_mps_event_value();
+        commit_mps_and_signal(v);
+        return v;
+    }
     return 0;
 }
 
@@ -723,13 +741,15 @@ ProcessGroupMCCL::ProcessGroupMCCL(
 
     // Collective executor pool for ws>=3 ring collectives: k workers start
     // collectives in seq order but run them concurrently (bucket overlap).
-    int coll_threads = 2;
-    if (auto* v = std::getenv("MCCL_COLLECTIVE_CONCURRENCY")) {
-        coll_threads = static_cast<int>(std::min(4L, std::max(1L, std::atol(v))));
-    }
-    if (world_size >= 6 && coll_threads > 1) {
-        MCCL_INFO("MCCL_COLLECTIVE_CONCURRENCY capped to 1 for world_size=%d", world_size);
-        coll_threads = 1;
+    int coll_threads = effective_collective_concurrency(world_size);
+    if (world_size >= 5 && coll_threads == 1) {
+        if (auto* v = std::getenv("MCCL_COLLECTIVE_CONCURRENCY")) {
+            int requested = static_cast<int>(std::min(4L, std::max(1L, std::atol(v))));
+            if (requested > 1) {
+                MCCL_INFO("MCCL_COLLECTIVE_CONCURRENCY capped to 1 for world_size=%d",
+                          world_size);
+            }
+        }
     }
     if (world_size >= 3) {
         collective_pool_ = std::make_unique<ProgressEngine>(
@@ -1111,17 +1131,14 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     metrics_->op_start(seq, "allreduce", nbytes);
 
     auto sync_t0 = std::chrono::steady_clock::now();
-    uint64_t sync_val = 0;
-    if (!defer_mps_sync_to_engine) {
-        sync_val = sync_mps_nonblocking(overlap_comm_);
-    }
+    // Always fence on the calling (autograd) thread — non-blocking commit+signal.
+    // Engine threads wait on the returned event; they must not sync PyTorch's MPS
+    // stream themselves (thread-unsafe → objc_release SIGSEGV under DDP overlap).
+    uint64_t sync_val = sync_mps_nonblocking(overlap_comm_);
+    (void)defer_mps_sync_to_engine;
     auto sync_t1 = std::chrono::steady_clock::now();
     double sync_ms = std::chrono::duration<double, std::milli>(sync_t1 - sync_t0).count();
     metrics_->record_phase(seq, sync_ms, 0, 0);
-
-    if (defer_mps_sync_to_engine) {
-        MCCL_DEBUG("allreduce seq=%u: asyncOp=true, MPS sync deferred to ProgressEngine", seq);
-    }
 
     if (ws == 2) {
         // ── Two-rank path: ALL network I/O goes through net_engine_for(peer) ──
@@ -1142,6 +1159,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 [this, tensor_copy, seq, red_op, sync_val, defer_mps_sync_to_engine,
                  peer, nbytes, shared_recv_buf]() mutable {
                     begin_execute(seq);  // watchdog arm + execute-start metric
+                    if (sync_val) wait_for_mps(sync_val);
                     StagingBuffer staged = stage_for_send_collective(tensor_copy);
                     auto net_t0 = std::chrono::steady_clock::now();
                     MCCL_CHECK(transport_->send_recv_overlap(
@@ -1225,6 +1243,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
             net_engine_for(peer).submit(
                 [this, tensor_copy, seq, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
                     begin_execute(seq);
+                    if (sync_val) wait_for_mps(sync_val);
                     allreduce_small(tensor_copy, seq, red_op);
                     MCCL_INFO("allreduce seq=%u: algo=small nbytes=%zu", seq, tensor_nbytes(tensor_copy));
                 },
@@ -1248,6 +1267,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         collective_pool_->submit(
             [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine]() mutable {
                 begin_execute(seq);
+                if (sync_val) wait_for_mps(sync_val);
                 std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
                 const auto exec_t0 = std::chrono::steady_clock::now();
                 const char* algo = "unknown";
@@ -1331,6 +1351,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
     coalesced_engine.submit(
         [this, flat_copy, tensors_copy, seq, ws, nbytes, red_op, sync_val]() mutable {
             begin_execute(seq);
+            if (sync_val) wait_for_mps(sync_val);
             std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
             if (ws == 2) {
                 allreduce_two_rank(flat_copy, seq, red_op);
@@ -2664,6 +2685,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
         net_engine_for(peer).submit(
             [this, tensor_copy, seq, root, sync_val_bc]() mutable {
                 begin_execute(seq);
+                if (sync_val_bc) wait_for_mps(sync_val_bc);
                 broadcast_two_rank(tensor_copy, seq, root);
                 metrics_->record_transport_bytes(tensor_nbytes(tensor_copy), true);
                 metrics_->record_transport_bytes(tensor_nbytes(tensor_copy), false);
@@ -2695,6 +2717,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
         collective_pool_->submit(
             [this, tensor_copy, seq, root, nbytes, use_ring, sync_val_bc]() mutable {
                 begin_execute(seq);
+                if (sync_val_bc) wait_for_mps(sync_val_bc);
                 std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
                 const auto exec_t0 = std::chrono::steady_clock::now();
                 if (use_ring) {
@@ -2826,6 +2849,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
     ag_engine.submit(
         [this, input_copy, outputs_copy, seq, rank, ws, nbytes, sync_val_ag]() mutable {
             begin_execute(seq);
+            if (sync_val_ag) wait_for_mps(sync_val_ag);
             std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
             bool use_cpu = (input_copy.scalar_type() == at::kFloat) &&
                            prefer_cpu_unified_buffer_path(input_copy);
@@ -2974,6 +2998,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
     rs_engine.submit(
         [this, output_copy, inputs_copy, seq, rank, ws, nbytes, rs_op, sync_val_rs]() mutable {
             begin_execute(seq);
+            if (sync_val_rs) wait_for_mps(sync_val_rs);
             std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
             int left = (rank - 1 + ws) % ws;
             int right = (rank + 1) % ws;
@@ -3135,6 +3160,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
     net_engine_for(dstRank).submit(
         [this, tensor, dstRank, seq, tag, nbytes, sync_val_s]() mutable {
             begin_execute(seq);
+            if (sync_val_s) wait_for_mps(sync_val_s);
             StagingBuffer staged = stage_for_send_collective(tensor);
             MCCL_CHECK(transport_->send_chunks(dstRank, OpType::SEND, seq,
                                                static_cast<uint32_t>(tag),

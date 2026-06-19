@@ -9,20 +9,24 @@ instead of wedging CI.
 import inspect
 import itertools
 import os
+import random
 import subprocess
 import sys
 import textwrap
 import time
 
-# Each call grabs a fresh port window to avoid TIME_WAIT collisions between
-# tests.  MCCL_PORT_BASE = port + 100 must not collide with MASTER_PORT.
+# Each call grabs a fresh port window to avoid TIME_WAIT / parallel-pytest collisions.
+# MCCL_PORT_BASE = port + 100; ranks listen on port_base .. port_base+world_size-1.
 _port_counter = itertools.count(0)
 _PORT_LO = 36000
 _PORT_STRIDE = 211  # > 100 (port_base offset) + world_size head room
 
 
 def next_port() -> int:
-    return _PORT_LO + (next(_port_counter) * _PORT_STRIDE) % 24000
+    pid_slot = (os.getpid() % 97) * _PORT_STRIDE
+    seq_slot = (next(_port_counter) * _PORT_STRIDE) % 24000
+    jitter = random.randint(0, 40)
+    return _PORT_LO + pid_slot + seq_slot + jitter
 
 
 def run_workers(

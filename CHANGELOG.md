@@ -1,5 +1,11 @@
 # Changelog
 
+## v5.5 — ws≥5 collective concurrency cap
+
+### Fixed
+- **`effective_collective_concurrency`**: ws≥5 caps `MCCL_COLLECTIVE_CONCURRENCY` to 1 in both the collective pool and demux park-limit scaling. Prevents ENOBUFS / peer death when env requests concurrency=2 with large async DDP buckets (cluster ws=5 regression).
+- **Test harness**: `mccl_test_utils.next_port()` uses pid+jitter to avoid EADDRINUSE when pytest runs files in parallel.
+
 ## v5.4 — Small allgather star (multi-node DDP init_sync)
 
 ### Fixed

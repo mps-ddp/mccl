@@ -432,7 +432,14 @@ void mps_event_sync() {
 StagingBuffer stage_for_send(const at::Tensor& tensor) {
     check_single_tensor(tensor);
 
-    mps_stream_sync();
+    // Engine threads must not torch::mps::synchronize() (thread-unsafe vs autograd
+    // encode → objc_release SIGSEGV).  When event sync is available the caller has
+    // already waited on the producer's mps_event (wait_for_mps), so the gradient is
+    // GPU-complete and we only drain MCCL's own queue.  Legacy fallback (no shared
+    // events) keeps the blocking stream sync.
+    if (!event_sync_available()) {
+        mps_stream_sync();
+    }
     mccl_queue_drain();
 
     MPSBufferView view = extract_mps_buffer(tensor);
@@ -487,7 +494,11 @@ StagingBuffer stage_for_send_collective(const at::Tensor& tensor) {
         return StagingBuffer{view.cpu_ptr, view.nbytes};
     }
 
-    mps_stream_sync();
+    // See stage_for_send: never torch::mps::synchronize() from engine threads when
+    // shared events are available — the caller waited on the producer mps_event.
+    if (!event_sync_available()) {
+        mps_stream_sync();
+    }
     mccl_queue_drain();
 
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;

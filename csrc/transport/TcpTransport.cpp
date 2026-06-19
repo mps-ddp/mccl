@@ -1,4 +1,5 @@
 #include "transport/TcpTransport.hpp"
+#include "common/CollectiveEnv.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 #include "common/Version.hpp"
@@ -26,10 +27,8 @@ inline int demux_pipeline_depth() {
     return static_cast<int>(std::min(8L, std::max(1L, n)));
 }
 
-inline int demux_collective_concurrency() {
-    auto* v = std::getenv("MCCL_COLLECTIVE_CONCURRENCY");
-    long n = v ? std::atol(v) : 2;
-    return static_cast<int>(std::min(4L, std::max(1L, n)));
+inline int demux_collective_concurrency(int world_size) {
+    return effective_collective_concurrency(world_size);
 }
 
 inline int demux_credit_window() {
@@ -299,7 +298,7 @@ TcpTransport::TcpTransport(int rank, int world_size, const TransportConfig& conf
     if (auto* v = std::getenv("MCCL_DEMUX_PARK_BYTES")) {
         park_limit_bytes_ = static_cast<size_t>(std::atoll(v));
     } else {
-        const int concurrency = demux_collective_concurrency();
+        const int concurrency = demux_collective_concurrency(world_size_);
         const int cwin = demux_credit_window();
         const size_t max_coll = demux_max_collective_bytes();
         // In-flight bound: world_size x concurrent collectives x credit window

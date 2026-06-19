@@ -1,11 +1,14 @@
 # Changelog
 
-## v5.6 — DDP consumer release (NCCL stream-return semantics)
+## v5.7 — DDP consumer release (NCCL stream-return semantics)
 
 ### Fixed
 - **`WorkMCCL::wait` consumer fence**: `publish_collective_release` arms an MCCL shared-event token per collective; the autograd/DDP thread must `wait_for_mccl` in `Work::wait` before PyTorch MPS resumes encoding. Previously `markComplete` consumed the release on the ProgressEngine thread, so overlapped buckets could resume backward on stale reduced gradients (train/val boundary Metal command-buffer death).
 - **`barrier`**: arms the same release token so `dist.barrier()` at epoch boundaries fences the MCCL queue when `MCCL_OVERLAP_COMM=1`.
 - **Token=0 fallback**: `Work::wait` drains the MCCL queue when EventSync is on but no per-op token was published (e.g. overlap off).
+
+### Added
+- **`test_ddp_consumer_release.py`**: weight-trajectory parity without grad `.item()` sync between backward and `optimizer.step`; train→barrier→rank-skewed val→train; barrier + post-barrier allreduce + MPS burst. Catches the engine-thread `release_waited_` bug that grad-only parity masked.
 
 ## v5.5 — ws≥5 collective concurrency cap
 

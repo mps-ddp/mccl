@@ -89,10 +89,6 @@ void WorkMCCL::markComplete() {
         completed_ = true;
         success_ = true;
     }
-    // Future callbacks (e.g. DDP comm-hook continuations) run inline in
-    // markCompleted; invoke them OUTSIDE mutex_ so a callback that calls
-    // isCompleted()/result() cannot self-deadlock.  exception_/outputs_ are
-    // immutable once completed_ is set (double-completion returns early).
     finishWorkMCCLFuture();
     cv_.notify_all();
     MCCL_TRACE("WorkMCCL seq=%u completed successfully", seq_);

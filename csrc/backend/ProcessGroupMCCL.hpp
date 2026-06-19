@@ -153,6 +153,9 @@ private:
         metrics_->op_execute_start(seq);
     }
 
+    /// Engine thread: publish GPU release token for DDP/autograd Work::wait().
+    void arm_work_release(const c10::intrusive_ptr<WorkMCCL>& work);
+
     /// Store barrier so every rank enters the collective before any wire I/O.
     /// Without this, a fast rank can send/complete before a slow rank posts recv.
     void rendezvous_collective_enter(uint32_t seq, const char* op);

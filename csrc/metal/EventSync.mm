@@ -206,4 +206,16 @@ uint64_t next_event_value() {
     return next_mps_event_value();
 }
 
+uint64_t publish_collective_release(bool overlap_comm) {
+    if (!overlap_comm || !event_sync_available()) {
+        return 0;
+    }
+    uint64_t v = next_mccl_event_value();
+  // GPU signal: blits/reduces on MCCL queue are visible before the autograd thread
+  // resumes PyTorch MPS encode (DDP Work::wait consumer fence — NCCL stream semantics).
+    signal_mccl_done_gpu(v);
+    signal_mccl_done(v);
+    return v;
+}
+
 } // namespace mccl

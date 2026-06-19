@@ -1,6 +1,10 @@
 #include "backend/WorkMCCL.hpp"
+#include "metal/EventSync.hpp"
+#include "metal/MPSInterop.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
+
+#include <torch/mps.h>
 
 namespace mccl {
 
@@ -22,6 +26,7 @@ bool WorkMCCL::wait(std::chrono::milliseconds timeout) {
 
     if (completed_) {
         if (exception_) std::rethrow_exception(exception_);
+        wait_consumer_release();
         return success_;
     }
 
@@ -38,6 +43,7 @@ bool WorkMCCL::wait(std::chrono::milliseconds timeout) {
     }
 
     if (exception_) std::rethrow_exception(exception_);
+    wait_consumer_release();
     return success_;
 }
 
@@ -114,6 +120,31 @@ void WorkMCCL::markError(std::exception_ptr err) {
     finishWorkMCCLFuture();
     cv_.notify_all();
     MCCL_ERROR("WorkMCCL seq=%u failed: %s", seq_, msg.c_str());
+}
+
+void WorkMCCL::set_release_token(uint64_t token) {
+    release_token_.store(token, std::memory_order_release);
+}
+
+void WorkMCCL::wait_consumer_release() {
+    if (release_waited_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    const uint64_t token = release_token_.load(std::memory_order_acquire);
+    if (token > 0) {
+        wait_for_mccl(token);
+        return;
+    }
+    if (event_sync_available()) {
+        mccl_queue_drain();
+        return;
+    }
+    for (const auto& t : outputs_) {
+        if (t.defined() && t.is_mps()) {
+            torch::mps::synchronize();
+            return;
+        }
+    }
 }
 
 } // namespace mccl

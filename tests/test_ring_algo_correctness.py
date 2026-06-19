@@ -206,3 +206,40 @@ class TestChunkedConcurrencyStress:
             env=env,
             timeout=1200,
         )
+
+    @pytest.mark.parametrize("world_size", [4, 8])
+    def test_submit_job_settings_allreduce_64mb(self, world_size):
+        """64 MB fp32 allreduce at current submit_job.sh (conc=2, ring pipeline ON)."""
+        env = {
+            "MCCL_RING_ALGO": "ring_chunked",
+            "MCCL_COLLECTIVE_CONCURRENCY": "2",
+            "MCCL_RING_PIPELINE": "1",
+            "MCCL_OVERLAP_COMM": "1",
+            "MCCL_PIPELINE_DEPTH": "1",
+            "MCCL_TEST_SIZES": "16777216",  # 64 MiB fp32
+            "MCCL_TEST_RTOL": "5e-5",
+        }
+        run_workers(
+            _allreduce_vs_f64_reference_fn,
+            world_size=world_size,
+            env=env,
+            timeout=1200,
+        )
+
+    @pytest.mark.parametrize("world_size", [4, 8])
+    def test_submit_job_settings_ddp_gradient_parity(self, world_size):
+        """Multi-bucket DDP backward at submit_job 64 MB bucket cap."""
+        env = {
+            "MCCL_RING_ALGO": "ring_chunked",
+            "MCCL_COLLECTIVE_CONCURRENCY": "2",
+            "MCCL_RING_PIPELINE": "1",
+            "MCCL_OVERLAP_COMM": "1",
+            "MCCL_TEST_BUCKET_MB": "64",
+            "MCCL_TEST_RTOL": "5e-4",
+        }
+        run_workers(
+            _ddp_gradient_parity_fn,
+            world_size=world_size,
+            env=env,
+            timeout=1200,
+        )

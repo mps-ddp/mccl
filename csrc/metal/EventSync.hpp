@@ -32,4 +32,8 @@ uint64_t next_mccl_event_value();
 /// Deprecated: aliases next_mps_event_value(). Do not use for fence/mccl signals.
 uint64_t next_event_value();
 
+/// Engine thread: GPU+CPU release after collective writes land in output tensors.
+/// Returns 0 when overlap/event sync is off (consumer uses legacy drain in Work::wait).
+uint64_t publish_collective_release(bool overlap_comm);
+
 } // namespace mccl

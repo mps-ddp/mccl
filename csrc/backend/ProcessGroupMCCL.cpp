@@ -741,15 +741,14 @@ ProcessGroupMCCL::ProcessGroupMCCL(
 
     // Collective executor pool for ws>=3 ring collectives: k workers start
     // collectives in seq order but run them concurrently (bucket overlap).
+    const int requested_conc = collective_concurrency_requested();
     int coll_threads = effective_collective_concurrency(world_size);
-    if (world_size >= 5 && coll_threads == 1) {
-        if (auto* v = std::getenv("MCCL_COLLECTIVE_CONCURRENCY")) {
-            int requested = static_cast<int>(std::min(4L, std::max(1L, std::atol(v))));
-            if (requested > 1) {
-                MCCL_INFO("MCCL_COLLECTIVE_CONCURRENCY capped to 1 for world_size=%d",
-                          world_size);
-            }
-        }
+    if (requested_conc > coll_threads) {
+        MCCL_INFO(
+            "MCCL_COLLECTIVE_CONCURRENCY capped %d -> %d for world_size=%d "
+            "(demux_max_collective_bytes=%zu budget=%zu)",
+            requested_conc, coll_threads, world_size,
+            demux_max_collective_bytes(), demux_inflight_budget_bytes(world_size));
     }
     if (world_size >= 3) {
         collective_pool_ = std::make_unique<ProgressEngine>(

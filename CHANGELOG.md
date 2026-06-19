@@ -1,5 +1,26 @@
 # Changelog
 
+### Fixed
+- **`stage_for_send_collective`**: drop redundant pre/post ``mccl_queue_drain()`` when EventSync is on — ``chunked_blit_to_staging`` already ``waitUntilCompleted`` on the MCCL queue (orders behind prior reduces). Removes two empty-buffer GPU barriers per DDP bucket.
+
+## v6.1 — Concurrency ceiling 8 + bucket budget
+
+### Changed
+- **`collective_concurrency_max`**: ``MCCL_MAX_COLLECTIVE_CONCURRENCY`` (default 8) replaces hard ``min(requested, 2)``.
+- **`demux_inflight_budget_bytes`**: caps effective concurrency as ``budget / DDP_bucket`` (override ``MCCL_DEMUX_INFLIGHT_BUDGET_BYTES``). ws=8 default budget 128 MiB → conc=4 at 8 MiB buckets, conc=2 at 25 MiB, conc=1 at 64 MiB+.
+
+### Added
+- **`test_conc4_small_bucket_ddp_multibucket`**: ws=8, 8 MiB buckets, ``MCCL_COLLECTIVE_CONCURRENCY=4``.
+
+## v6.0 — Bucket-aware collective concurrency
+
+### Changed
+- **`effective_collective_concurrency`**: replaces blind ws≥5 → 1 cap. `MCCL_COLLECTIVE_CONCURRENCY=2` is allowed when `MCCL_DEMUX_MAX_COLLECTIVE_BYTES` ≤ 25 MiB (ws≥5) or ≤ 16 MiB (ws≥8). Larger DDP buckets force concurrency 1 to avoid TCP demux / ENOBUFS under overlapped 64 MiB ring collectives.
+- Wire **`MCCL_DEMUX_MAX_COLLECTIVE_BYTES`** to **`DDP_BUCKET_MB`** on workers so bucket growth auto-serializes collectives.
+
+### Added
+- **`test_collective_concurrency_v6.py`**: dual async allreduce + DDP multibucket at ws=5/8; small-bucket concurrency=2 vs large-bucket cap-to-1.
+
 ## v5.8 — Overlap producer pipeline fence (step-0 backward Metal fix)
 
 ### Fixed

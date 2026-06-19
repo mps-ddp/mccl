@@ -18,15 +18,30 @@ import time
 # Each call grabs a fresh port window to avoid TIME_WAIT / parallel-pytest collisions.
 # MCCL_PORT_BASE = port + 100; ranks listen on port_base .. port_base+world_size-1.
 _port_counter = itertools.count(0)
-_PORT_LO = 36000
-_PORT_STRIDE = 211  # > 100 (port_base offset) + world_size head room
+_PORT_LO = 22000
+_PORT_MAX = 65400  # port + 100 + world_size must stay <= 65535
+_PORT_BUCKET = 200  # min gap between sequential tests (master + mccl listeners)
 
 
 def next_port() -> int:
-    pid_slot = (os.getpid() % 97) * _PORT_STRIDE
-    seq_slot = (next(_port_counter) * _PORT_STRIDE) % 24000
-    jitter = random.randint(0, 40)
-    return _PORT_LO + pid_slot + seq_slot + jitter
+    n = next(_port_counter)
+    pid_off = (os.getpid() % 64) * 800
+    seq_off = (n % 80) * _PORT_BUCKET
+    jitter = random.randint(0, 19)
+    span = _PORT_MAX - _PORT_LO
+    return _PORT_LO + (pid_off + seq_off + jitter) % span
+
+
+def _submit_job_mccl_env(bucket_mb: int = 25) -> dict[str, str]:
+    return {
+        "MCCL_OVERLAP_COMM": "1",
+        "MCCL_RING_ALGO": "ring_chunked",
+        "MCCL_RING_PIPELINE": "0",
+        "MCCL_COLLECTIVE_CONCURRENCY": "2",
+        "MCCL_MAX_COLLECTIVE_CONCURRENCY": "8",
+        "MCCL_PIPELINE_DEPTH": "2",
+        "MCCL_DEMUX_MAX_COLLECTIVE_BYTES": str(int(bucket_mb) * 1024 * 1024),
+    }
 
 
 def run_workers(
@@ -81,6 +96,7 @@ def run_workers(
             env={**os.environ},
         )
         procs.append(p)
+        time.sleep(0.15)
 
     codes = []
     deadline = time.monotonic() + timeout

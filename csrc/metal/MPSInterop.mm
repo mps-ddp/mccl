@@ -494,20 +494,22 @@ StagingBuffer stage_for_send_collective(const at::Tensor& tensor) {
         return StagingBuffer{view.cpu_ptr, view.nbytes};
     }
 
-    // See stage_for_send: never torch::mps::synchronize() from engine threads when
-    // shared events are available — the caller waited on the producer mps_event.
+    // Legacy fallback when shared events are unavailable.
     if (!event_sync_available()) {
         mps_stream_sync();
+        mccl_queue_drain();
     }
-    mccl_queue_drain();
+    // Caller already wait_for_mps(producer fence) before staging.  Blit encodes on
+    // the MCCL queue and waitUntilCompleted (inside chunked_blit_to_staging) orders
+    // behind all prior MCCL command buffers — no extra mccl_queue_drain() before or
+    // after (those were redundant empty-buffer GPU barriers every DDP bucket).
 
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
     StagingPool& pool = staging_pool();
     std::lock_guard<std::mutex> lock(pool.mu);
     void* staging = pool.ensure(view.nbytes, cached_device());
     chunked_blit_to_staging(src_buf, view.byte_offset, staging, view.nbytes);
-    mccl_queue_drain();
-    MCCL_TRACE("stage_for_send_collective: blit+wait %zu bytes", view.nbytes);
+    MCCL_TRACE("stage_for_send_collective: blit %zu bytes", view.nbytes);
     return StagingBuffer{staging, view.nbytes};
 }
 

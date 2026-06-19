@@ -18,7 +18,7 @@ import platform
 
 import pytest
 
-from mccl_test_utils import run_workers
+from mccl_test_utils import run_workers, _submit_job_mccl_env
 
 pytestmark = pytest.mark.skipif(
     platform.system() != "Darwin" or platform.machine() not in ("arm64", "aarch64"),
@@ -114,23 +114,11 @@ def _ddp_conv_overlap_fn(rank, world_size):
               flush=True)
 
 
-# Submit-job MCCL env: overlap ON, event sync default ON, chunked ring, conc=1.
-_SUBMIT_ENV = {
-    "MCCL_OVERLAP_COMM": "1",
-    "MCCL_RING_ALGO": "ring_chunked",
-    "MCCL_RING_PIPELINE": "0",
-    "MCCL_COLLECTIVE_CONCURRENCY": "1",
-    "MCCL_PIPELINE_DEPTH": "1",
-}
+# Submit-job MCCL env (see mccl_test_utils._submit_job_mccl_env).
+_SUBMIT_ENV = _submit_job_mccl_env(25)
 
-# Current submit_job.sh defaults (2026-06): conc=2, ring pipeline ON, 64 MB buckets.
-_SUBMIT_ENV_NOW = {
-    "MCCL_OVERLAP_COMM": "1",
-    "MCCL_RING_ALGO": "ring_chunked",
-    "MCCL_RING_PIPELINE": "1",
-    "MCCL_COLLECTIVE_CONCURRENCY": "2",
-    "MCCL_PIPELINE_DEPTH": "1",
-}
+# Legacy alias: same as submit_job.sh today.
+_SUBMIT_ENV_NOW = _submit_job_mccl_env(25)
 
 
 @pytest.mark.parametrize("world_size", [4, 8])
@@ -157,14 +145,14 @@ def test_ddp_conv_overlap_tiny_buckets_stress(world_size):
 
 @pytest.mark.parametrize("world_size", [4, 8])
 def test_ddp_conv_overlap_submit_job_settings(world_size):
-    """DDP conv backward parity at current submit_job.sh MCCL knobs (conc=2, pipeline=1)."""
+    """DDP conv backward parity at current submit_job.sh MCCL knobs."""
     run_workers(
         _ddp_conv_overlap_fn,
         world_size=world_size,
         env={
             **_SUBMIT_ENV_NOW,
             "MCCL_TEST_ITERS": "25",
-            "MCCL_TEST_BUCKET_MB": "64",
+            "MCCL_TEST_BUCKET_MB": "25",
             "MCCL_TEST_RTOL": "2e-3",
         },
         timeout=1200,

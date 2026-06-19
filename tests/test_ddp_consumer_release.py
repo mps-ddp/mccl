@@ -18,20 +18,14 @@ import platform
 
 import pytest
 
-from mccl_test_utils import run_workers
+from mccl_test_utils import run_workers, _submit_job_mccl_env
 
 pytestmark = pytest.mark.skipif(
     platform.system() != "Darwin" or platform.machine() not in ("arm64", "aarch64"),
     reason="MCCL consumer-release tests require macOS Apple Silicon",
 )
 
-_SUBMIT_ENV = {
-    "MCCL_OVERLAP_COMM": "1",
-    "MCCL_RING_ALGO": "ring_chunked",
-    "MCCL_RING_PIPELINE": "1",
-    "MCCL_COLLECTIVE_CONCURRENCY": "2",
-    "MCCL_PIPELINE_DEPTH": "1",
-}
+_SUBMIT_ENV = _submit_job_mccl_env(64)
 
 
 def _ddp_no_cpu_sync_trajectory_fn(rank, world_size):

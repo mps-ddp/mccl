@@ -35,14 +35,6 @@ inline int demux_credit_window() {
     return demux_pipeline_depth() + 2;
 }
 
-inline size_t demux_max_collective_bytes() {
-    if (auto* v = std::getenv("MCCL_DEMUX_MAX_COLLECTIVE_BYTES")) {
-        long long n = std::atoll(v);
-        if (n > 0) return static_cast<size_t>(n);
-    }
-    return 64ULL << 20;
-}
-
 inline std::chrono::milliseconds demux_recv_timeout() {
     if (auto* v = std::getenv("MCCL_RECV_TIMEOUT_MS")) {
         long long ms = std::atoll(v);

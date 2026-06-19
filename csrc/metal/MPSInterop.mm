@@ -233,8 +233,72 @@ void chunked_blit_from_staging(const void* src, size_t nbytes,
 
 
 bool tensor_cpu_accessible(const at::Tensor& tensor) {
+    if (tensor.is_cpu()) {
+        return tensor.is_contiguous();
+    }
     id<MTLBuffer> buffer = at::mps::getMTLBufferStorage(tensor);
     return buffer != nil && buffer.storageMode == MTLStorageModeShared;
+}
+
+std::string mps_storage_mode_string(const at::Tensor& tensor) {
+    if (tensor.is_cpu()) {
+        return "cpu";
+    }
+    id<MTLBuffer> buffer = at::mps::getMTLBufferStorage(tensor);
+    if (buffer == nil) {
+        return "none";
+    }
+    switch (buffer.storageMode) {
+        case MTLStorageModeShared:
+            return "shared";
+        case MTLStorageModeManaged:
+            return "managed";
+        case MTLStorageModePrivate:
+            return "private";
+        default:
+            return "unknown";
+    }
+}
+
+bool collective_send_uses_blit(const at::Tensor& tensor) {
+    // Mirrors stage_for_send_collective: only CPU metadata uses direct data_ptr.
+    if (tensor.is_cpu()) {
+        MPSBufferView view = extract_mps_buffer(tensor);
+        return view.cpu_ptr == nullptr;
+    }
+    if (unified_collective_enabled() && tensor_cpu_accessible(tensor)) {
+        return false;
+    }
+    return true;
+}
+
+bool stage_for_send_uses_blit(const at::Tensor& tensor) {
+    if (tensor.is_cpu()) {
+        return false;
+    }
+    if (unified_collective_enabled() && tensor_cpu_accessible(tensor)) {
+        return false;
+    }
+    return !tensor_cpu_accessible(tensor);
+}
+
+bool unified_collective_enabled() {
+    auto* v = std::getenv("MCCL_UNIFIED_COLLECTIVE");
+    if (!v) return false;
+    std::string s(v);
+    return s == "1" || s == "true" || s == "on" || s == "yes";
+}
+
+bool unified_metal_collective_path(const at::Tensor& tensor) {
+    return unified_collective_enabled() && tensor_cpu_accessible(tensor);
+}
+
+void* tensor_wire_recv_ptr(const at::Tensor& tensor) {
+    if (!unified_metal_collective_path(tensor)) {
+        return nullptr;
+    }
+    MPSBufferView view = extract_mps_buffer(tensor);
+    return view.cpu_ptr;
 }
 
 at::Tensor ensure_shared_storage(const at::Tensor& tensor) {
@@ -499,10 +563,16 @@ StagingBuffer stage_for_send_collective(const at::Tensor& tensor) {
         mps_stream_sync();
         mccl_queue_drain();
     }
-    // Caller already wait_for_mps(producer fence) before staging.  Blit encodes on
-    // the MCCL queue and waitUntilCompleted (inside chunked_blit_to_staging) orders
-    // behind all prior MCCL command buffers — no extra mccl_queue_drain() before or
-    // after (those were redundant empty-buffer GPU barriers every DDP bucket).
+    // Caller already wait_for_mps(producer fence) before staging.
+
+    if (unified_collective_enabled() && view.cpu_accessible && view.cpu_ptr) {
+        MCCL_TRACE("stage_for_send_collective: unified cpu_ptr path, %zu bytes",
+                   view.nbytes);
+        return StagingBuffer{view.cpu_ptr, view.nbytes};
+    }
+
+    // Blit encodes on the MCCL queue and waitUntilCompleted orders behind prior
+    // MCCL work — required for private storage and when unified path is off.
 
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
     StagingPool& pool = staging_pool();
@@ -564,9 +634,16 @@ void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes,
         return;
     }
 
-    // fp32 unified MPS: memcpy into shared cpu_ptr for vDSP reduce (wire
-    // staging).  Avoids blit+sync from ProgressEngine threads (can hang on
-    // torch::mps::synchronize).  stage_for_send / copy_ callers sync later.
+    // Unified shared MPS: memcpy wire bytes into cpu_ptr; Metal kernels read the
+    // same MTLStorageModeShared buffer (no blit).  Requires producer fence before
+    // send and MCCL fence after reduce before reusing chunk bytes.
+    if (unified_collective_enabled() && view.cpu_accessible && view.cpu_ptr) {
+        MCCL_TRACE("unstage_from_recv: unified metal cpu_ptr, %zu bytes", nbytes);
+        memcpy(view.cpu_ptr, src, nbytes);
+        return;
+    }
+
+    // Legacy fp32 vDSP staging (MCCL_FP32_CPU_REDUCE=1 only).
     if (cpu_unified_stage && view.cpu_accessible && view.cpu_ptr &&
         tensor.scalar_type() == at::kFloat) {
         MCCL_TRACE("unstage_from_recv: unified fp32 cpu staging, %zu bytes", nbytes);

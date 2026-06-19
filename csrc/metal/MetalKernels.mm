@@ -783,13 +783,7 @@ void metal_reduce_op(const at::Tensor& dst, const at::Tensor& src,
 
 uint64_t metal_reduce_op_fenced(const at::Tensor& dst, const at::Tensor& src,
                                 c10d::ReduceOp::RedOpType op) {
-    const bool cpu_unified_fp32 =
-        dst.scalar_type() == at::kFloat && tensor_cpu_accessible(dst) &&
-        tensor_cpu_accessible(src);
     metal_reduce_op(dst, src, op);
-    if (cpu_unified_fp32) {
-        return 0;
-    }
     if (event_sync_available()) {
         uint64_t v = next_fence_event_value();
         signal_mccl_fence_gpu(v);

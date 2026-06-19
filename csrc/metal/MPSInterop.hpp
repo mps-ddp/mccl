@@ -84,6 +84,27 @@ void blit_buffer_to_tensor(const void* src, const at::Tensor& tensor);
 /// Performs a lightweight runtime check (no sync, no copy).
 bool tensor_cpu_accessible(const at::Tensor& tensor);
 
+/// Human-readable MTLStorageMode for an MPS tensor ("cpu", "private", "shared",
+/// "managed", "none"). Used by Python tests to document why DDP grads cannot use
+/// the wire cpu_ptr fast path.
+std::string mps_storage_mode_string(const at::Tensor& tensor);
+
+/// True when ``stage_for_send_collective`` blits instead of reading cpu_ptr.
+bool collective_send_uses_blit(const at::Tensor& tensor);
+
+/// True when ``stage_for_send`` blits instead of reading cpu_ptr.
+bool stage_for_send_uses_blit(const at::Tensor& tensor);
+
+/// Opt-in: ``MCCL_UNIFIED_COLLECTIVE=1`` — after producer MPS fence, send from
+/// shared ``cpu_ptr`` and recv/reduce on unified buffer when safe (torch 2.12+).
+bool unified_collective_enabled();
+
+/// Unified send/recv + Metal reduce (not vDSP CPU reduce).
+bool unified_metal_collective_path(const at::Tensor& tensor);
+
+/// When unified, returns ``cpu_ptr`` for direct TCP recv; else nullptr.
+void* tensor_wire_recv_ptr(const at::Tensor& tensor);
+
 /// If the tensor uses private Metal storage, copy it into a new tensor
 /// backed by shared (cpu_accessible) storage and return that. If already
 /// shared, returns the original tensor with no copy. Caller must have

@@ -15,6 +15,8 @@
 #include "metal/AccelerateOps.hpp"
 #include "common/Logging.hpp"
 #include "common/Version.hpp"
+#include "common/TensorChecks.hpp"
+#include "common/Errors.hpp"
 
 #include <mutex>
 
@@ -104,6 +106,80 @@ PYBIND11_MODULE(_C, m) {
         if (pg) pg->reset_metrics();
     }, "Reset all metric counters",
        py::call_guard<py::gil_scoped_release>());
+
+    m.def("_tensor_cpu_accessible",
+          [](const at::Tensor& tensor) {
+              return mccl::tensor_cpu_accessible(tensor);
+          },
+          py::arg("tensor"),
+          "True when MTLBuffer storage is Shared (CPU can read/write without blit)");
+
+    m.def("_mps_storage_mode",
+          [](const at::Tensor& tensor) {
+              return mccl::mps_storage_mode_string(tensor);
+          },
+          py::arg("tensor"),
+          "MTLStorageMode name: cpu|private|shared|managed|none");
+
+    m.def("_collective_send_uses_blit",
+          [](const at::Tensor& tensor) {
+              return mccl::collective_send_uses_blit(tensor);
+          },
+          py::arg("tensor"),
+          "True when stage_for_send_collective blits instead of reading cpu_ptr");
+
+    m.def("_stage_for_send_uses_blit",
+          [](const at::Tensor& tensor) {
+              return mccl::stage_for_send_uses_blit(tensor);
+          },
+          py::arg("tensor"),
+          "True when stage_for_send blits private MPS storage to staging pool");
+
+    m.def("_unified_collective_enabled",
+          []() { return mccl::unified_collective_enabled(); },
+          "True when MCCL_UNIFIED_COLLECTIVE=1");
+
+    m.def("_unstage_from_recv",
+          [](const at::Tensor& tensor, const at::Tensor& src, bool cpu_unified_stage) {
+              MCCL_CHECK(src.is_cpu() && src.is_contiguous(),
+                         "_unstage_from_recv: src must be contiguous CPU tensor");
+              MCCL_CHECK(static_cast<size_t>(src.numel()) * src.element_size() ==
+                             mccl::tensor_nbytes(tensor),
+                         "_unstage_from_recv: src nbytes mismatch");
+              mccl::unstage_from_recv(
+                  tensor, src.data_ptr(),
+                  static_cast<size_t>(src.numel()) * src.element_size(),
+                  cpu_unified_stage);
+          },
+          py::arg("tensor"),
+          py::arg("src"),
+          py::arg("cpu_unified_stage") = false,
+          "Test helper: copy wire bytes into tensor (blit or unified cpu_ptr path)");
+
+    m.def("_ensure_shared_storage",
+          [](const at::Tensor& tensor) {
+              mccl::mps_stream_sync();
+              return mccl::ensure_shared_storage(tensor);
+          },
+          py::arg("tensor"),
+          "Blit private MPS bytes into a new CPU/shared buffer (opt-in copy, not zero-copy)");
+
+    m.def("_stage_for_send_collective_bench",
+          [](const at::Tensor& tensor, int iters) {
+              mccl::mps_stream_sync();
+              auto t0 = std::chrono::steady_clock::now();
+              const int n = std::max(1, iters);
+              for (int i = 0; i < n; ++i) {
+                  mccl::StagingBuffer staged = mccl::stage_for_send_collective(tensor);
+                  (void)staged;
+              }
+              auto t1 = std::chrono::steady_clock::now();
+              return std::chrono::duration<double, std::milli>(t1 - t0).count() /
+                     static_cast<double>(n);
+          },
+          py::arg("tensor"),
+          py::arg("iters") = 20,
+          "Average ms per stage_for_send_collective (after mps sync)");
 
     m.def("_test_event_sync_fence_churn",
           [](int ws) {

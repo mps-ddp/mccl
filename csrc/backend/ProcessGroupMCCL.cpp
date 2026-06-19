@@ -262,20 +262,18 @@ inline uint64_t reduce_chunk_metal_fenced(at::Tensor& dst, at::Tensor incoming,
     return fence;
 }
 
-/// fp32 unified MPS: accumulate wire bytes into chunk via shared cpu_ptr
-/// (avoids incoming-tensor staging coherence issues on ws>=3).
-inline void reduce_wire_into_chunk_fp32(at::Tensor& chunk, const void* wire,
-                                        size_t nbytes,
-                                        c10d::ReduceOp::RedOpType op) {
-    MPSBufferView cv = extract_mps_buffer(chunk);
-    MCCL_CHECK(cv.cpu_accessible && cv.cpu_ptr,
-               "reduce_wire_into_chunk_fp32 requires unified fp32 storage");
-    StagingBuffer seed = stage_for_send(chunk);
-    memcpy(cv.cpu_ptr, seed.data, nbytes);
-    cpu_reduce_op(static_cast<float*>(cv.cpu_ptr),
-                  static_cast<const float*>(wire), chunk.numel(), op);
-    blit_buffer_to_tensor(cv.cpu_ptr, chunk);
-    metal_sync_queue_only();
+/// Metal GPU reduce: wire -> incoming cpu_ptr (no blit) -> metal_reduce kernel.
+inline uint64_t reduce_wire_metal_unified(
+    at::Tensor& dst_chunk, const void* wire, size_t nbytes,
+    c10d::ReduceOp::RedOpType op, std::vector<at::Tensor>* keep_tensors) {
+    at::Tensor incoming = torch::empty_like(dst_chunk);
+    unstage_from_recv(incoming, wire, nbytes);
+    return reduce_chunk_metal_fenced(dst_chunk, std::move(incoming), op, keep_tensors);
+}
+
+/// Allgather COPY: wire -> chunk cpu_ptr (no blit).
+inline void copy_wire_unified(at::Tensor& dst_chunk, const void* wire, size_t nbytes) {
+    unstage_from_recv(dst_chunk, wire, nbytes);
 }
 
 struct RingPipelineCtx {
@@ -314,17 +312,24 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
     // only reads these buffers (never blits from MPS on an engine thread).
     std::vector<std::unique_ptr<PooledBuffer>> send_staging(chunks.size());
     std::vector<size_t> send_staging_nbytes(chunks.size(), 0);
+    std::vector<const void*> send_direct(chunks.size(), nullptr);
     auto stage_chunk_for_tx = [&](int idx) {
         if (idx < 0) return;
         size_t nbytes = chunk_bytes(idx);
         if (nbytes == 0) return;
+        StagingBuffer staged = stage_for_send_collective(chunks[idx]);
+        if (unified_metal_collective_path(chunks[idx])) {
+            send_direct[idx] = staged.data;
+            send_staging_nbytes[idx] = nbytes;
+            return;
+        }
         if (!send_staging[idx] || send_staging_nbytes[idx] < nbytes) {
             send_staging[idx] = std::make_unique<PooledBuffer>(
                 staging_memory_pool(), nbytes);
             send_staging_nbytes[idx] = nbytes;
         }
-        StagingBuffer staged = stage_for_send(chunks[idx]);
         memcpy(send_staging[idx]->data(), staged.data, nbytes);
+        send_direct[idx] = send_staging[idx]->data();
     };
 
     // First `lookahead` sends are this rank's own chunks (no prior RX reduce).
@@ -394,10 +399,10 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
                 ctx.watchdog->touch(ctx.seq);
 
                 if (send_bytes > 0) {
-                    MCCL_CHECK(send_staging[st.send_idx],
+                    MCCL_CHECK(send_direct[st.send_idx],
                                "ring pipeline missing send staging for chunk " +
                                std::to_string(st.send_idx));
-                    const void* src = send_staging[st.send_idx]->data();
+                    const void* src = send_direct[st.send_idx];
 
                     MCCL_CHECK(ctx.transport->send_chunks(
                                    ctx.right, ctx.wire_op, ctx.seq, st.send_tid,
@@ -446,8 +451,14 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
                     wait_for_mccl_fence(chunk_pending[st.recv_idx]);
                     chunk_pending[st.recv_idx] = 0;
                 }
-                // Always recv into scratch + blit: cpu_ptr zero-copy leaves
-                // Metal consumers reading stale GPU memory on unified MPS.
+                at::Tensor& copy_chunk = chunks[st.recv_idx];
+                if (unified_metal_collective_path(copy_chunk)) {
+                    void* wire_dst = tensor_wire_recv_ptr(copy_chunk);
+                    if (wire_dst) {
+                        dst = wire_dst;
+                        recv_inplace[g] = 1;
+                    }
+                }
             }
             if (!dst) {
                 int slot = static_cast<int>(g) % depth;
@@ -489,10 +500,10 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
                         cpu_reduce_op(static_cast<float*>(view.cpu_ptr),
                                       static_cast<const float*>(recv_dst[g]),
                                       rchunk.numel(), ctx.red_op);
-                    } else if (tensor_cpu_accessible(rchunk) &&
-                               rchunk.scalar_type() == at::kFloat) {
-                        reduce_wire_into_chunk_fp32(
-                            rchunk, recv_dst[g], rbytes, ctx.red_op);
+                    } else if (unified_metal_collective_path(rchunk)) {
+                        gate_fence = reduce_wire_metal_unified(
+                            rchunk, recv_dst[g], rbytes, ctx.red_op,
+                            ctx.incoming_keep);
                     } else {
                         at::Tensor incoming = torch::empty_like(rchunk);
                         unstage_from_recv(incoming, recv_dst[g], rbytes);
@@ -507,12 +518,8 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
                         std::chrono::steady_clock::now() - red_t0).count();
                 } else {
                     if (!recv_inplace[g]) {
-                        if (tensor_cpu_accessible(rchunk) &&
-                            rchunk.scalar_type() == at::kFloat) {
-                            MPSBufferView view = extract_mps_buffer(rchunk);
-                            memcpy(view.cpu_ptr, recv_dst[g], rbytes);
-                            blit_buffer_to_tensor(view.cpu_ptr, rchunk);
-                            metal_sync_queue_only();
+                        if (unified_metal_collective_path(rchunk)) {
+                            copy_wire_unified(rchunk, recv_dst[g], rbytes);
                         } else {
                             blit_buffer_to_tensor(recv_dst[g], rchunk);
                             if (!ctx.use_cpu) {
@@ -601,6 +608,21 @@ inline bool fp32_cpu_reduce_enabled() {
 inline bool prefer_cpu_unified_buffer_path(const at::Tensor& tensor) {
     if (!fp32_cpu_reduce_enabled()) return false;
     return tensor_cpu_accessible(tensor);
+}
+
+/// fp32 unified MPS vDSP path (MCCL_FP32_CPU_REDUCE=1 only).
+inline void reduce_wire_into_chunk_fp32(at::Tensor& chunk, const void* wire,
+                                        size_t nbytes,
+                                        c10d::ReduceOp::RedOpType op) {
+    MPSBufferView cv = extract_mps_buffer(chunk);
+    MCCL_CHECK(cv.cpu_accessible && cv.cpu_ptr,
+               "reduce_wire_into_chunk_fp32 requires unified fp32 storage");
+    StagingBuffer seed = stage_for_send(chunk);
+    memcpy(cv.cpu_ptr, seed.data, nbytes);
+    cpu_reduce_op(static_cast<float*>(cv.cpu_ptr),
+                  static_cast<const float*>(wire), chunk.numel(), op);
+    blit_buffer_to_tensor(cv.cpu_ptr, chunk);
+    metal_sync_queue_only();
 }
 
 // Collective MPS ordering: per-tensor blit fence in stage_for_send_collective().
@@ -1609,7 +1631,39 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
         metrics_->record_transport_bytes(nbytes, true);
         metrics_->record_transport_bytes(nbytes, false);
         mps_stream_sync_after_cpu_mps_buffer_write();
-    } else if (tensor.scalar_type() == at::kFloat && cpu_ok) {
+    } else if (unified_metal_collective_path(tensor) && tensor.scalar_type() == at::kFloat &&
+               !compressor_) {
+        StagingBuffer staged = stage_for_send_collective(tensor);
+        at::Tensor incoming = torch::empty_like(tensor);
+        void* recv_wire = tensor_wire_recv_ptr(incoming);
+        PooledBuffer recv_buf(staging_memory_pool(), nbytes);
+        void* recv_dst = recv_wire ? recv_wire : recv_buf.data();
+        if (rank == 0) {
+            MCCL_CHECK(transport_->send_chunks(
+                           peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes),
+                       "allreduce_two_rank unified send failed");
+            MCCL_CHECK(transport_->recv_chunks(
+                           peer, OpType::ALLREDUCE, seq, 0, recv_dst, nbytes),
+                       "allreduce_two_rank unified recv failed");
+        } else {
+            MCCL_CHECK(transport_->recv_chunks(
+                           peer, OpType::ALLREDUCE, seq, 0, recv_dst, nbytes),
+                       "allreduce_two_rank unified recv failed");
+            MCCL_CHECK(transport_->send_chunks(
+                           peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes),
+                       "allreduce_two_rank unified send failed");
+        }
+        if (!recv_wire) {
+            unstage_from_recv(incoming, recv_buf.data(), nbytes);
+        }
+        if (op == c10d::ReduceOp::AVG) {
+            metal_accumulate_and_scale(tensor, incoming, 0.5);
+        } else {
+            metal_reduce_op_fenced(tensor, incoming, op);
+        }
+        metrics_->record_transport_bytes(nbytes, true);
+        metrics_->record_transport_bytes(nbytes, false);
+    } else if (tensor.scalar_type() == at::kFloat && cpu_ok && fp32_cpu_reduce_enabled()) {
         StagingBuffer staged = stage_for_send(tensor);
         PooledBuffer recv_buf(staging_memory_pool(), nbytes);
         if (rank == 0) {
@@ -1770,14 +1824,24 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
         StagingBuffer staged = {nullptr, 0};
         if (send_bytes > 0) {
             fence_chunk(send_chunk_idx);
-            staged = stage_for_send(send_chunk);
+            staged = stage_for_send_collective(send_chunk);
+        }
+
+        void* recv_wire_dst = recv_buf_pool.data();
+        at::Tensor incoming_direct;
+        if (recv_bytes > 0 && unified_metal_collective_path(recv_chunk)) {
+            incoming_direct = torch::empty_like(recv_chunk);
+            void* direct = tensor_wire_recv_ptr(incoming_direct);
+            if (direct) {
+                recv_wire_dst = direct;
+            }
         }
 
         MCCL_CHECK(transport_->send_recv_overlap(
             right, OpType::ALLREDUCE, seq, step_tid,
             staged.data, send_bytes,
             left, OpType::ALLREDUCE, seq, recv_tid,
-            recv_buf_pool.data(), recv_bytes),
+            recv_wire_dst, recv_bytes),
             "allreduce_ring_chunked reduce-scatter step " + std::to_string(step) + " failed");
 
         if (recv_bytes > 0) {
@@ -1787,10 +1851,21 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
                     static_cast<float*>(chunk_view.cpu_ptr),
                     static_cast<const float*>(recv_buf_pool.data()),
                     recv_chunk.numel(), op);
-            } else if (tensor_cpu_accessible(recv_chunk) &&
-                       recv_chunk.scalar_type() == at::kFloat) {
-                reduce_wire_into_chunk_fp32(
-                    recv_chunk, recv_buf_pool.data(), recv_bytes, op);
+            } else if (unified_metal_collective_path(recv_chunk) &&
+                       recv_wire_dst != recv_buf_pool.data()) {
+                uint64_t v = reduce_chunk_metal_fenced(
+                    recv_chunk, std::move(incoming_direct), op,
+                    &incoming_keep.tensors);
+                if (use_event_fence && v > 0) {
+                    chunk_pending[recv_chunk_idx] = v;
+                }
+            } else if (unified_metal_collective_path(recv_chunk)) {
+                uint64_t v = reduce_wire_metal_unified(
+                    recv_chunk, recv_buf_pool.data(), recv_bytes, op,
+                    &incoming_keep.tensors);
+                if (use_event_fence && v > 0) {
+                    chunk_pending[recv_chunk_idx] = v;
+                }
             } else {
                 at::Tensor incoming = torch::empty_like(recv_chunk);
                 unstage_from_recv(incoming, recv_buf_pool.data(), recv_bytes);
@@ -1831,30 +1906,35 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
         StagingBuffer staged = {nullptr, 0};
         if (send_bytes > 0) {
             fence_chunk(send_chunk_idx);
-            staged = stage_for_send(send_chunk);
+            staged = stage_for_send_collective(send_chunk);
+        }
+
+        void* ag_recv_dst = recv_buf_pool.data();
+        if (recv_bytes > 0 && unified_metal_collective_path(recv_chunk)) {
+            void* direct = tensor_wire_recv_ptr(recv_chunk);
+            if (direct) {
+                ag_recv_dst = direct;
+            }
         }
 
         MCCL_CHECK(transport_->send_recv_overlap(
             right, OpType::ALLREDUCE, seq, step_tid,
             staged.data, send_bytes,
             left, OpType::ALLREDUCE, seq, recv_tid_ag,
-            recv_buf_pool.data(), recv_bytes),
+            ag_recv_dst, recv_bytes),
             "allreduce_ring_chunked allgather step " + std::to_string(step) + " failed");
 
         if (recv_bytes > 0) {
-            // The incoming chunk replaces local data; make sure no reduce
-            // kernel from the RS phase is still in flight on it.
             fence_chunk(recv_chunk_idx);
             if (use_cpu) {
                 MPSBufferView chunk_view = extract_mps_buffer(recv_chunk);
-                memcpy(chunk_view.cpu_ptr, recv_buf_pool.data(), recv_bytes);
-            } else if (tensor_cpu_accessible(recv_chunk) &&
-                       recv_chunk.scalar_type() == at::kFloat) {
-                MPSBufferView chunk_view = extract_mps_buffer(recv_chunk);
-                memcpy(chunk_view.cpu_ptr, recv_buf_pool.data(), recv_bytes);
-                blit_buffer_to_tensor(chunk_view.cpu_ptr, recv_chunk);
-                metal_sync_queue_only();
-            } else {
+                if (ag_recv_dst == recv_buf_pool.data()) {
+                    memcpy(chunk_view.cpu_ptr, recv_buf_pool.data(), recv_bytes);
+                }
+            } else if (unified_metal_collective_path(recv_chunk) &&
+                       ag_recv_dst == recv_buf_pool.data()) {
+                copy_wire_unified(recv_chunk, recv_buf_pool.data(), recv_bytes);
+            } else if (!unified_metal_collective_path(recv_chunk)) {
                 unstage_from_recv(recv_chunk, recv_buf_pool.data(), recv_bytes);
             }
         }
@@ -2015,10 +2095,13 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
                     static_cast<float*>(chunk_view.cpu_ptr),
                     static_cast<const float*>(recv_buf_pool.data()),
                     recv_chunk.numel(), op);
-            } else if (tensor_cpu_accessible(recv_chunk) &&
-                       recv_chunk.scalar_type() == at::kFloat) {
-                reduce_wire_into_chunk_fp32(
-                    recv_chunk, recv_buf_pool.data(), recv_bytes, op);
+            } else if (unified_metal_collective_path(recv_chunk)) {
+                uint64_t v = reduce_wire_metal_unified(
+                    recv_chunk, recv_buf_pool.data(), recv_bytes, op,
+                    &incoming_keep.tensors);
+                if (use_event_fence && v > 0) {
+                    chunk_pending[recv_idx] = v;
+                }
             } else {
                 at::Tensor incoming = torch::empty_like(recv_chunk);
                 unstage_from_recv(incoming, recv_buf_pool.data(), recv_bytes);
@@ -2069,12 +2152,8 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
             if (use_cpu) {
                 MPSBufferView chunk_view = extract_mps_buffer(recv_chunk);
                 memcpy(chunk_view.cpu_ptr, recv_buf_pool.data(), recv_bytes);
-            } else if (tensor_cpu_accessible(recv_chunk) &&
-                       recv_chunk.scalar_type() == at::kFloat) {
-                MPSBufferView chunk_view = extract_mps_buffer(recv_chunk);
-                memcpy(chunk_view.cpu_ptr, recv_buf_pool.data(), recv_bytes);
-                blit_buffer_to_tensor(chunk_view.cpu_ptr, recv_chunk);
-                metal_sync_queue_only();
+            } else if (unified_metal_collective_path(recv_chunk)) {
+                copy_wire_unified(recv_chunk, recv_buf_pool.data(), recv_bytes);
             } else {
                 unstage_from_recv(recv_chunk, recv_buf_pool.data(), recv_bytes);
             }

@@ -213,6 +213,15 @@ at::Tensor stft_backward(
             grad_wav);
     }
 
+    // vDSP/Metal irfft implements the mathematical inverse FFT (÷ n_fft). PyTorch's
+    // rfft backward adjoint scales by n_fft/2 for the one-sided real spectrum.
+    if (!params.normalized && params.n_fft > 0) {
+        const float scale = static_cast<float>(params.n_fft) * 0.5f;
+        for (float& v : grad_wav) {
+            v *= scale;
+        }
+    }
+
     at::Tensor out = at::empty(
         {batch, signal_length},
         at::TensorOptions().dtype(at::kFloat).device(grad_spec.device()));
@@ -311,6 +320,17 @@ at::Tensor istft_backward(
             n_frames,
             gspec_re,
             gspec_im);
+    }
+
+    // istft_backward reuses stft_forward; adjoint of OLA+iFFT needs ÷ n_fft vs raw STFT.
+    if (!params.normalized && params.n_fft > 0) {
+        const float scale = 1.f / static_cast<float>(params.n_fft);
+        for (float& v : gspec_re) {
+            v *= scale;
+        }
+        for (float& v : gspec_im) {
+            v *= scale;
+        }
     }
 
     const int64_t n_freq = params.n_fft / 2 + 1;

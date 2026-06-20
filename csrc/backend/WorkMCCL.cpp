@@ -28,6 +28,7 @@ bool WorkMCCL::wait(std::chrono::milliseconds timeout) {
 
     if (completed_) {
         if (exception_) std::rethrow_exception(exception_);
+        lock.unlock();
         wait_consumer_release();
         return success_;
     }
@@ -45,6 +46,7 @@ bool WorkMCCL::wait(std::chrono::milliseconds timeout) {
     }
 
     if (exception_) std::rethrow_exception(exception_);
+    lock.unlock();
     wait_consumer_release();
     return success_;
 }
@@ -124,26 +126,45 @@ void WorkMCCL::set_release_token(uint64_t token) {
     release_token_.store(token, std::memory_order_release);
 }
 
+void WorkMCCL::stash_tensors(std::vector<at::Tensor> tensors) {
+    if (tensors.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    stashed_tensors_.insert(stashed_tensors_.end(),
+                            std::make_move_iterator(tensors.begin()),
+                            std::make_move_iterator(tensors.end()));
+}
+
 void WorkMCCL::wait_consumer_release() {
     if (release_waited_.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
     const uint64_t token = release_token_.load(std::memory_order_acquire);
     if (token > 0) {
+        block_mps_on_mccl(token);
         wait_for_mccl(token);
         note_active_overlap_release_consumed(token);
+        std::lock_guard<std::mutex> lock(mutex_);
+        stashed_tensors_.clear();
         return;
     }
     if (event_sync_available()) {
         mccl_queue_drain();
+        std::lock_guard<std::mutex> lock(mutex_);
+        stashed_tensors_.clear();
         return;
     }
     for (const auto& t : outputs_) {
         if (t.defined() && t.is_mps()) {
             torch::mps::synchronize();
+            std::lock_guard<std::mutex> lock(mutex_);
+            stashed_tensors_.clear();
             return;
         }
     }
+    std::lock_guard<std::mutex> lock(mutex_);
+    stashed_tensors_.clear();
 }
 
 } // namespace mccl

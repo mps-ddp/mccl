@@ -22,6 +22,11 @@ void signal_mccl_done(uint64_t value);
 void signal_mccl_done_gpu(uint64_t value);
 void wait_for_mccl(uint64_t value);
 
+/// NCCL ``ncclEndEvent_->block(currentStream)`` analogue: enqueue a wait on the
+/// PyTorch MPS stream so subsequent MPS kernels cannot start until ``mccl_event``
+/// reaches ``value`` (signaled after prior MCCL-queue work completes).
+void block_mps_on_mccl(uint64_t value);
+
 void signal_mccl_fence_gpu(uint64_t value);
 void wait_for_mccl_fence(uint64_t value);
 

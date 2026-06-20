@@ -227,29 +227,25 @@ struct RingGates {
     }
 };
 
-// Keep-alive for `incoming` staging tensors consumed by ASYNC Metal reduce
-// kernels.  metal_reduce_op() only commits; destroying the tensor lets
-// PyTorch's MPS allocator recycle its buffer for the next step's
-// empty_like, whose CPU fill then races the still-running kernel —
-// silently corrupting partial sums (training still converges, just
-// slower).  This was the corruption the old per-step queue drains were
-// masking.  The destructor drains the MCCL queue before releasing the
-// tensors, so even exception paths cannot free a buffer a kernel is
-// reading.  (The normal path drains in the collective tail first, making
-// the destructor's drain a no-op.)
+// Keep-alive for `incoming` staging tensors consumed by async Metal reduce
+// kernels.  Lifetime is transferred to WorkMCCL::stashed_tensors_ at collective
+// tail; Work::wait unstash happens after block_mps_on_mccl + wait_for_mccl.
 struct IncomingKeepAlive {
     std::vector<at::Tensor> tensors;
-    ~IncomingKeepAlive() {
-        if (!tensors.empty()) {
-            try {
-                metal_sync_queue_only();
-            } catch (...) {
-                // Destructor must not throw; a failed drain here means the
-                // device is already in a fatal state.
-            }
-        }
-    }
 };
+
+inline void collective_gpu_tail(ProcessGroupMCCL* pg, bool use_cpu,
+                                const c10::intrusive_ptr<WorkMCCL>& work,
+                                IncomingKeepAlive& keep) {
+    if (work && !keep.tensors.empty()) {
+        work->stash_tensors(std::move(keep.tensors));
+    }
+    if (use_cpu) {
+        mps_stream_sync_after_cpu_mps_buffer_write();
+    } else if (!pg || !pg->use_async_mccl_release()) {
+        metal_sync_queue_only();
+    }
+}
 
 /// Metal reduce with mandatory fence before chunk bytes may be sent or overwritten.
 inline uint64_t reduce_chunk_metal_fenced(at::Tensor& dst, at::Tensor incoming,
@@ -1274,10 +1270,13 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                                 } else {
                                     metal_reduce_op_fenced(tensor_copy, incoming, red_op);
                                 }
+                                if (use_async_mccl_release()) {
+                                    work_ptr->stash_tensors({std::move(incoming)});
+                                } else {
+                                    metal_sync_queue_only();
+                                }
                             }
-            if (!cpu_ok) {
-                                metal_sync_queue_only();
-                            } else {
+                            if (cpu_ok) {
                                 mps_stream_sync_after_cpu_mps_buffer_write();
                             }
                             arm_work_release(work_ptr);
@@ -1349,7 +1348,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                     allreduce_small(tensor_copy, seq, red_op);
                 } else {
                     algo = use_chunked_ring_default() ? "ring_chunked" : "ring";
-                    allreduce_ring_dispatch(tensor_copy, seq, red_op);
+                    allreduce_ring_dispatch(tensor_copy, seq, red_op, work_ptr);
                 }
                 const double exec_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - exec_t0).count();
@@ -1433,7 +1432,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
                 if (nbytes <= transport_->config().small_msg_threshold) {
                     allreduce_small(flat_copy, seq, red_op);
                 } else {
-                    allreduce_ring_dispatch(flat_copy, seq, red_op);
+                    allreduce_ring_dispatch(flat_copy, seq, red_op, work_ptr);
                 }
             } else {
                 allreduce_ring(flat_copy, seq, red_op);
@@ -1711,7 +1710,8 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
 }
 
 void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
-                                               c10d::ReduceOp::RedOpType op) {
+                                               c10d::ReduceOp::RedOpType op,
+                                               const c10::intrusive_ptr<WorkMCCL>& work) {
     rendezvous_collective_enter(seq, "allreduce");
     // Gloo-style ring allreduce with 2P chunks for double buffering.
     // 4*P communication steps but only 2*S bytes on wire (vs P*S for basic ring).
@@ -1954,18 +1954,19 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
         if (op == c10d::ReduceOp::AVG) {
             metal_scale_inplace(tensor, 1.0 / ws);
         }
-        metal_sync_queue_only();
+        collective_gpu_tail(this, false, work, incoming_keep);
     }
 }
 
 void ProcessGroupMCCL::allreduce_ring_dispatch(at::Tensor& tensor, uint32_t seq,
-                                                c10d::ReduceOp::RedOpType op) {
+                                                c10d::ReduceOp::RedOpType op,
+                                                const c10::intrusive_ptr<WorkMCCL>& work) {
     if (!use_chunked_ring_default()) {
-        allreduce_ring(tensor, seq, op);
+        allreduce_ring(tensor, seq, op, work);
         return;
     }
     try {
-        allreduce_ring_chunked(tensor, seq, op);
+        allreduce_ring_chunked(tensor, seq, op, work);
     } catch (...) {
         if (!ring_fallback_basic_enabled(getSize())) {
             throw;
@@ -1973,12 +1974,13 @@ void ProcessGroupMCCL::allreduce_ring_dispatch(at::Tensor& tensor, uint32_t seq,
         MCCL_WARN("allreduce_ring_chunked failed (seq=%u rank=%d ws=%d nbytes=%zu); "
                   "retrying with basic ring (MCCL_RING_FALLBACK_BASIC)",
                   seq, getRank(), getSize(), tensor_nbytes(tensor));
-        allreduce_ring(tensor, seq, op);
+        allreduce_ring(tensor, seq, op, work);
     }
 }
 
 void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
-                                      c10d::ReduceOp::RedOpType op) {
+                                      c10d::ReduceOp::RedOpType op,
+                                      const c10::intrusive_ptr<WorkMCCL>& work) {
     rendezvous_collective_enter(seq, "allreduce");
     int rank = getRank();
     int ws = getSize();
@@ -2175,7 +2177,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
         if (op == c10d::ReduceOp::AVG) {
             metal_scale_inplace(tensor, 1.0 / ws);
         }
-        metal_sync_queue_only();
+        collective_gpu_tail(this, false, work, incoming_keep);
     }
 }
 
@@ -3226,9 +3228,16 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                 memcpy(dst_view.cpu_ptr, src_view.cpu_ptr, nbytes);
                 mps_stream_sync_after_cpu_mps_buffer_write();
             } else {
-                metal_sync_queue_only();
+                if (use_async_mccl_release()) {
+                    uint64_t v = next_fence_event_value();
+                    signal_mccl_fence_gpu(v);
+                    wait_for_mccl_fence(v);
+                } else {
+                    metal_sync_queue_only();
+                }
                 output_copy.copy_(chunks[my_chunk]);
             }
+            collective_gpu_tail(this, use_cpu, work_ptr, incoming_keep);
             arm_work_release(work_ptr);
         },
         [this, work_ptr, seq]() {

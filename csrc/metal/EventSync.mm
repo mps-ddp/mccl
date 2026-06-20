@@ -171,6 +171,21 @@ void wait_for_mccl(uint64_t value) {
     spin_wait_event(s.mccl_event, value);
 }
 
+void block_mps_on_mccl(uint64_t value) {
+    EventState& s = state();
+    MCCL_CHECK(s.initialized, "EventSync not initialized");
+    if (value == 0) {
+        return;
+    }
+    dispatch_sync(
+        (dispatch_queue_t)torch::mps::get_dispatch_queue(), ^{
+            id<MTLCommandBuffer> cmd =
+                (id<MTLCommandBuffer>)torch::mps::get_command_buffer();
+            [cmd encodeWaitForEvent:s.mccl_event value:value];
+            torch::mps::commit();
+        });
+}
+
 void signal_mccl_fence_gpu(uint64_t value) {
     EventState& s = state();
     MCCL_CHECK(s.initialized, "EventSync not initialized");

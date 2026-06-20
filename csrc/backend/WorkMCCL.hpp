@@ -32,6 +32,9 @@ public:
     /// Set by the engine thread before markComplete (overlap consumer release token).
     void set_release_token(uint64_t token);
 
+    /// Hold async-reduce staging tensors until ``wait()`` (NCCL TensorShelf).
+    void stash_tensors(std::vector<at::Tensor> tensors);
+
     uint32_t seq() const { return seq_; }
 
 private:
@@ -46,6 +49,7 @@ private:
     bool success_ = false;
     std::exception_ptr exception_;
     std::vector<at::Tensor> outputs_;
+    std::vector<at::Tensor> stashed_tensors_;
     c10::intrusive_ptr<at::ivalue::Future> future_;
 
     // mutable so that const methods (isSuccess, exception) can acquire the lock

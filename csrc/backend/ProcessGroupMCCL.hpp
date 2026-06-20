@@ -16,6 +16,7 @@
 #include "runtime/Metrics.hpp"
 #include "runtime/MemoryPool.hpp"
 #include "compression/Compression.hpp"
+#include "metal/EventSync.hpp"
 
 #include <memory>
 #include <atomic>
@@ -97,6 +98,10 @@ public:
     /// Producer fence + MPS commit+signal on the calling (autograd) thread.
     uint64_t sync_mps_for_collective();
 
+    bool use_async_mccl_release() const {
+        return overlap_comm_ && event_sync_available();
+    }
+
 private:
     void init_transport();
     void on_watchdog_abort(uint32_t seq, const std::string& msg);
@@ -113,12 +118,15 @@ private:
     void allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
                             c10d::ReduceOp::RedOpType op);
     void allreduce_ring(at::Tensor& tensor, uint32_t seq,
-                        c10d::ReduceOp::RedOpType op);
+                        c10d::ReduceOp::RedOpType op,
+                        const c10::intrusive_ptr<WorkMCCL>& work = nullptr);
     void allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
-                                 c10d::ReduceOp::RedOpType op);
+                                 c10d::ReduceOp::RedOpType op,
+                                 const c10::intrusive_ptr<WorkMCCL>& work = nullptr);
     /// Chunked ring with optional basic-ring fallback (MCCL_RING_FALLBACK_BASIC).
     void allreduce_ring_dispatch(at::Tensor& tensor, uint32_t seq,
-                                   c10d::ReduceOp::RedOpType op);
+                                   c10d::ReduceOp::RedOpType op,
+                                   const c10::intrusive_ptr<WorkMCCL>& work = nullptr);
     void allreduce_small(at::Tensor& tensor, uint32_t seq,
                          c10d::ReduceOp::RedOpType op);
     /// Recursive-doubling allreduce for small messages: 2 + log2(p) serial

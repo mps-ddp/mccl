@@ -9,10 +9,12 @@
 #include "backend/Options.hpp"
 #include "compression/Compression.hpp"
 #include "runtime/Metrics.hpp"
+#include "runtime/MemoryPool.hpp"
 #include "metal/MetalKernels.hpp"
 #include "metal/MPSInterop.hpp"
 #include "metal/EventSync.hpp"
 #include "metal/AccelerateOps.hpp"
+#include "transforms/Stft.hpp"
 #include "common/Logging.hpp"
 #include "common/Version.hpp"
 #include "common/TensorChecks.hpp"
@@ -105,6 +107,16 @@ PYBIND11_MODULE(_C, m) {
         auto* pg = mccl::g_active_pg;
         if (pg) pg->reset_metrics();
     }, "Reset all metric counters",
+       py::call_guard<py::gil_scoped_release>());
+
+    m.def("_trim_staging_pool", []() {
+        mccl::staging_memory_pool().trim();
+    }, "Release pooled host staging buffers (safe after epoch barrier)",
+       py::call_guard<py::gil_scoped_release>());
+
+    m.def("_staging_pool_bytes", []() {
+        return mccl::staging_memory_pool().total_allocated();
+    }, "Bytes retained by the MCCL host staging pool",
        py::call_guard<py::gil_scoped_release>());
 
     m.def("_tensor_cpu_accessible",
@@ -298,6 +310,108 @@ PYBIND11_MODULE(_C, m) {
               return dst;
           },
           "dst = (dst + src) * scale via MCCL Metal kernel; returns dst");
+
+    // ── MCCL transforms (STFT / iSTFT) ────────────────────────────────
+    m.def("_stft_forward",
+          [](const at::Tensor& waveform,
+             const at::Tensor& window,
+             int64_t n_fft,
+             int64_t hop_length,
+             int64_t win_length,
+             bool center,
+             bool normalized,
+             const std::string& backend) {
+              mccl::StftParams params{n_fft, hop_length, win_length, center, normalized};
+              return mccl::stft_forward(
+                  waveform,
+                  window,
+                  params,
+                  mccl::parse_stft_backend(backend));
+          },
+          py::arg("waveform"),
+          py::arg("window"),
+          py::arg("n_fft"),
+          py::arg("hop_length"),
+          py::arg("win_length"),
+          py::arg("center") = true,
+          py::arg("normalized") = false,
+          py::arg("backend") = "vdsp",
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("_stft_backward",
+          [](const at::Tensor& grad_spec,
+             const at::Tensor& window,
+             int64_t n_fft,
+             int64_t hop_length,
+             int64_t win_length,
+             bool center,
+             bool normalized,
+             int64_t signal_length,
+             const std::string& backend) {
+              mccl::StftParams params{n_fft, hop_length, win_length, center, normalized};
+              return mccl::stft_backward(
+                  grad_spec, window, params, signal_length, mccl::parse_stft_backend(backend));
+          },
+          py::arg("grad_spec"),
+          py::arg("window"),
+          py::arg("n_fft"),
+          py::arg("hop_length"),
+          py::arg("win_length"),
+          py::arg("center") = true,
+          py::arg("normalized") = false,
+          py::arg("signal_length"),
+          py::arg("backend") = "vdsp",
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("_istft_forward",
+          [](const at::Tensor& spec,
+             const at::Tensor& window,
+             int64_t n_fft,
+             int64_t hop_length,
+             int64_t win_length,
+             bool center,
+             bool normalized,
+             int64_t length,
+             const std::string& backend) {
+              mccl::StftParams params{n_fft, hop_length, win_length, center, normalized};
+              return mccl::istft_forward(
+                  spec, window, params, length, mccl::parse_stft_backend(backend));
+          },
+          py::arg("spec"),
+          py::arg("window"),
+          py::arg("n_fft"),
+          py::arg("hop_length"),
+          py::arg("win_length"),
+          py::arg("center") = true,
+          py::arg("normalized") = false,
+          py::arg("length"),
+          py::arg("backend") = "vdsp",
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("_istft_backward",
+          [](const at::Tensor& grad_waveform,
+             const at::Tensor& window,
+             int64_t n_fft,
+             int64_t hop_length,
+             int64_t win_length,
+             bool center,
+             bool normalized,
+             int64_t length,
+             const std::string& backend) {
+              mccl::StftParams params{n_fft, hop_length, win_length, center, normalized};
+              return mccl::istft_backward(
+                  grad_waveform, window, params, length, mccl::parse_stft_backend(backend));
+          },
+          py::arg("grad_waveform"),
+          py::arg("window"),
+          py::arg("n_fft"),
+          py::arg("hop_length"),
+          py::arg("win_length"),
+          py::arg("center") = true,
+          py::arg("normalized") = false,
+          py::arg("length"),
+          py::arg("backend") = "vdsp",
+          py::call_guard<py::gil_scoped_release>());
 
     // ── Expose Metrics summary ────────────────────────────────────────
     py::class_<mccl::Metrics::Summary>(m, "MetricsSummary")

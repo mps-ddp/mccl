@@ -505,6 +505,10 @@ void metal_kernels_init() {
     }
 }
 
+void* get_mccl_mtl_library() {
+    metal_kernels_init();
+    return (__bridge void*)cache().library;
+}
 
 void metal_accumulate_chunk(const at::Tensor& dst, const at::Tensor& src) {
     std::lock_guard<std::recursive_mutex> lock(g_metal_kernel_mutex);

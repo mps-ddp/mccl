@@ -703,3 +703,180 @@ kernel void elementwise_product_u8(
     uint base = gid * kElementsPerThread;
     binary_vec_op<kOpMul, uchar, uchar4>(dst, src, base, aligned, count, gid);
 }
+
+// ── STFT transforms (batched radix-2 complex FFT per frame) ───────────────
+
+inline float2 cmul(float2 a, float2 b) {
+    return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+inline uint bit_reverse(uint x, uint bits) {
+    uint y = 0;
+    for (uint i = 0; i < bits; ++i) {
+        y = (y << 1) | (x & 1u);
+        x >>= 1;
+    }
+    return y;
+}
+
+/// In-place radix-2 FFT on ``data[0..n-1]`` (n power of two).
+inline void fft_radix2_device(thread float2* data, uint n, uint log2n) {
+    for (uint i = 0; i < n; ++i) {
+        uint j = bit_reverse(i, log2n);
+        if (j > i) {
+            float2 tmp = data[i];
+            data[i] = data[j];
+            data[j] = tmp;
+        }
+    }
+    for (uint len = 2; len <= n; len <<= 1) {
+        float ang = -2.0f * M_PI_F / float(len);
+        float2 wlen = float2(cos(ang), sin(ang));
+        for (uint i = 0; i < n; i += len) {
+            float2 w = float2(1.0f, 0.0f);
+            for (uint j = 0; j < len / 2; ++j) {
+                float2 u = data[i + j];
+                float2 v = cmul(w, data[i + j + len / 2]);
+                data[i + j] = u + v;
+                data[i + j + len / 2] = u - v;
+                w = cmul(w, wlen);
+            }
+        }
+    }
+}
+
+/// One thread per (batch, frame): windowed real frame -> complex spectrum bins.
+kernel void stft_rfft_frame(
+    device const float* padded_waveform [[buffer(0)]],
+    device const float* window          [[buffer(1)]],
+    device float* spec_real             [[buffer(2)]],
+    device float* spec_imag             [[buffer(3)]],
+    constant uint& batch                [[buffer(4)]],
+    constant uint& signal_length        [[buffer(5)]],
+    constant uint& padded_length        [[buffer(6)]],
+    constant uint& n_fft                [[buffer(7)]],
+    constant uint& hop                  [[buffer(8)]],
+    constant uint& n_frames             [[buffer(9)]],
+    constant uint& n_freq               [[buffer(10)]],
+    constant uint& log2n                [[buffer(11)]],
+    uint3 gid                           [[thread_position_in_grid]]
+) {
+    const uint b = gid.x;
+    const uint f = gid.y;
+    if (b >= batch || f >= n_frames) {
+        return;
+    }
+
+    const uint wave_base = b * padded_length;
+    const uint frame_start = f * hop;
+
+    thread float2 local[4096];
+    for (uint i = 0; i < n_fft; ++i) {
+        const uint idx = frame_start + i;
+        float v = 0.0f;
+        if (idx < padded_length) {
+            v = padded_waveform[wave_base + idx];
+        }
+        local[i] = float2(v * window[i], 0.0f);
+    }
+
+    fft_radix2_device(local, n_fft, log2n);
+
+    for (uint k = 0; k < n_freq; ++k) {
+        const uint out_idx = (b * n_freq + k) * n_frames + f;
+        spec_real[out_idx] = local[k].x;
+        spec_imag[out_idx] = local[k].y;
+    }
+}
+
+/// Inverse FFT per frame + window (iSTFT frame synthesis).
+kernel void stft_irfft_frame(
+    device const float* spec_real       [[buffer(0)]],
+    device const float* spec_imag       [[buffer(1)]],
+    device const float* window          [[buffer(2)]],
+    device float* frames_out            [[buffer(3)]],
+    constant uint& batch                [[buffer(4)]],
+    constant uint& n_fft                [[buffer(5)]],
+    constant uint& n_frames             [[buffer(6)]],
+    constant uint& n_freq               [[buffer(7)]],
+    constant uint& log2n                [[buffer(8)]],
+    uint3 gid                           [[thread_position_in_grid]]
+) {
+    const uint b = gid.x;
+    const uint f = gid.y;
+    if (b >= batch || f >= n_frames) {
+        return;
+    }
+
+    thread float2 local[4096];
+    for (uint k = 0; k < n_freq; ++k) {
+        const uint in_idx = (b * n_freq + k) * n_frames + f;
+        local[k] = float2(spec_real[in_idx], spec_imag[in_idx]);
+    }
+    for (uint k = n_freq; k < n_fft; ++k) {
+        local[k] = float2(0.0f, 0.0f);
+    }
+
+    // Inverse via conjugate-forward-conjugate / n.
+    for (uint i = 0; i < n_fft; ++i) {
+        local[i].y = -local[i].y;
+    }
+    fft_radix2_device(local, n_fft, log2n);
+    const float inv_n = 1.0f / float(n_fft);
+    for (uint i = 0; i < n_fft; ++i) {
+        local[i] *= inv_n;
+        local[i].y = -local[i].y;
+    }
+
+    const uint out_base = (b * n_frames + f) * n_fft;
+    for (uint i = 0; i < n_fft; ++i) {
+        frames_out[out_base + i] = local[i].x * window[i];
+    }
+}
+
+/// Overlap-add windowed frames into padded output (one thread per sample).
+kernel void stft_overlap_add(
+    device const float* frames          [[buffer(0)]],
+    device float* output                [[buffer(1)]],
+    device float* wsum                  [[buffer(2)]],
+    constant uint& batch                [[buffer(3)]],
+    constant uint& padded_length        [[buffer(4)]],
+    constant uint& n_fft                [[buffer(5)]],
+    constant uint& hop                  [[buffer(6)]],
+    constant uint& n_frames             [[buffer(7)]],
+    constant float& eps                 [[buffer(8)]],
+    uint3 gid                           [[thread_position_in_grid]]
+) {
+    const uint b = gid.x;
+    const uint t = gid.y;
+    if (b >= batch || t >= padded_length) {
+        return;
+    }
+
+    float acc = 0.0f;
+    float wacc = 0.0f;
+    const uint frame_base = b * n_frames * n_fft;
+    for (uint f = 0; f < n_frames; ++f) {
+        const int rel = int(t) - int(f * hop);
+        if (rel >= 0 && rel < int(n_fft)) {
+            const float v = frames[frame_base + f * n_fft + uint(rel)];
+            acc += v;
+            wacc += 1.0f;
+        }
+    }
+    const uint out_idx = b * padded_length + t;
+    output[out_idx] = acc;
+    wsum[out_idx] = max(wacc, eps);
+}
+
+kernel void stft_normalize_ola(
+    device float* output [[buffer(0)]],
+    device const float* wsum [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= count) {
+        return;
+    }
+    output[gid] /= wsum[gid];
+}

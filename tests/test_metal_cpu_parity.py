@@ -22,6 +22,7 @@ _OUT_DIR = Path(tempfile.gettempdir()) / "mccl_metal_cpu_parity"
 
 def _allreduce_save_fn(rank, world_size):
     import os
+    from pathlib import Path
 
     import torch
     import torch.distributed as dist
@@ -41,6 +42,7 @@ def _allreduce_save_fn(rank, world_size):
 
 def _compare_metal_cpu_fn(rank, world_size):
     import os
+    from pathlib import Path
 
     import torch
 

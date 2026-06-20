@@ -9,6 +9,9 @@ namespace mccl {
 
 void metal_kernels_init();
 
+/// Borrowed ``MTLLibrary*`` (``__bridge void*``) after ``metal_kernels_init()``.
+void* get_mccl_mtl_library();
+
 /// dst += src element-wise on GPU via Metal compute.
 void metal_accumulate_chunk(const at::Tensor& dst, const at::Tensor& src);
 

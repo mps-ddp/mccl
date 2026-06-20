@@ -337,6 +337,11 @@ MM_SOURCES = [
     "csrc/metal/MetalKernels.mm",
     "csrc/metal/AccelerateOps.mm",
     "csrc/metal/EventSync.mm",
+    "csrc/transforms/StftCommon.mm",
+    "csrc/transforms/StftVdsp.mm",
+    "csrc/transforms/StftMetalKernels.mm",
+    "csrc/transforms/StftMetal.mm",
+    "csrc/transforms/Stft.mm",
 ]
 
 ext = Extension(

@@ -146,6 +146,24 @@ def reset_metrics() -> None:
         pass
 
 
+def trim_staging_pool() -> None:
+    """Release pooled host buffers held by the MCCL staging memory pool."""
+    try:
+        from mccl._C import _trim_staging_pool
+        _trim_staging_pool()
+    except (ImportError, AttributeError, RuntimeError):
+        pass
+
+
+def staging_pool_bytes() -> int:
+    """Bytes retained by the MCCL host staging pool (0 if unavailable)."""
+    try:
+        from mccl._C import _staging_pool_bytes
+        return int(_staging_pool_bytes())
+    except (ImportError, AttributeError, RuntimeError):
+        return 0
+
+
 __all__ = [
     "__version__",
     "COMPATIBILITY_MATRIX",
@@ -155,5 +173,7 @@ __all__ = [
     "get_metrics",
     "log_metrics",
     "reset_metrics",
+    "trim_staging_pool",
+    "staging_pool_bytes",
     "apply_thunderbolt_production_defaults",
 ]

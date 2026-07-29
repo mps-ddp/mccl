@@ -164,7 +164,7 @@ class TestAllreduce:
             assert torch.allclose(tensor, expected, rtol=1e-4, atol=1e-4), \
                 f"Rank {rank}: expected {expected[0].item()}, got {tensor[0].item()}"
 
-        _run_distributed(fn, world_size=2, port=29600)
+        _run_distributed(fn, world_size=2, port=20100)
 
     def test_two_rank_large(self):
         def fn(rank, world_size):

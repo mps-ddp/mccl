@@ -19,9 +19,9 @@ struct MCCLOptions : public c10d::Backend::Options {
     // Transport
     std::string transport = "auto";  // "auto", "tcp", "rdma"
     std::string listen_addr = "0.0.0.0";
-    uint16_t port_base = 29600;
+    uint16_t port_base = 20100;
     std::string ifname;
-    size_t chunk_bytes = 4 * 1024 * 1024;
+    size_t chunk_bytes = 16 * 1024 * 1024;
     size_t small_msg_threshold = 262144;
     bool transport_crc = false;
 

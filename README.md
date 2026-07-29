@@ -134,15 +134,19 @@ Network and staging run on a **background queue** (`ProgressEngine`, `csrc/runti
 |---|---|---|
 | `MCCL_RING_ALGO` | `chunked` | `chunked` = Gloo-style double-buffered ring (2P chunks). `basic` = plain ring. |
 | `MCCL_RING_PIPELINE` | on | Streaming TX/RX ring pipeline (NCCL-style): both link directions + reduce busy concurrently. `0` = lock-step fallback (debug). |
-| `MCCL_PIPELINE_DEPTH` | `2` | Receives posted ahead per ring pipeline (1-8). |
-| `MCCL_COLLECTIVE_CONCURRENCY` | `2` | ws>=3 collectives in flight (1-4); buckets overlap on the wire via the demux transport. |
-| `MCCL_DEMUX_PARK_BYTES` | 512 MB | Per-peer bound on messages buffered before their receive is posted (headroom only — credits bound the steady state). |
+| `MCCL_PIPELINE_DEPTH` | `1` | Receives posted ahead per ring pipeline (1-8). Raise on high-latency links. |
+| `MCCL_COLLECTIVE_CONCURRENCY` | `1` | Collectives in flight (1-8; hard ceiling `MCCL_MAX_COLLECTIVE_CONCURRENCY`, default 8). Raise to overlap DDP buckets on the wire. |
+| `MCCL_DEMUX_PARK_BYTES` | auto (cap 4 GB) | Per-peer bound on messages buffered before their receive is posted. Unset = auto-scale from ws × concurrency × credit window × bucket (cap 4 GiB). |
+| `MCCL_DEMUX_INFLIGHT_BUDGET_BYTES` | 1 GB | Caps effective concurrency as `budget / DDP_bucket`. |
+| `MCCL_UNIFIED_COLLECTIVE` | on | Shared-storage fast path after producer MPS fence. `0` = Metal+blit staging. |
+| `MCCL_FAST_MATH` | on | Metal fast-math. Set `0` for strict math (SAO `mccl_strict_math`). |
+| `MCCL_PORT_BASE` | `20100` | First MCCL listen port (`+ rank`). Keep away from `MASTER_PORT`. |
 | `MCCL_CREDIT_MIN_CHUNK` | 1 MB | Chunks at or above this engage NCCL-style credit flow control: a sender runs at most `depth+2` steps ahead of its consumer, so a slow/late rank is never flooded. `0` disables. |
 | `MCCL_FP32_CPU_REDUCE` | off | fp32 reductions via vDSP directly in unified memory (often higher allreduce busbw). |
 | `MCCL_CPU_WRITE_SYNC` | `none` | `full` restores a full `torch.mps.synchronize()` after CPU-path collectives (debugging only; serializes buckets). |
 | `MCCL_EVENT_SYNC` | on | `0` disables MTLSharedEvent sync (falls back to blocking stream sync; kills overlap). |
-| `MCCL_LINK_PROFILE` | unset | `thunderbolt` = 16 MB transport chunks. |
-| `MCCL_CHUNK_BYTES`, `MCCL_SOCK_BUFSIZE`, `MCCL_TCP_LOWAT` | — | transport sizing (see `Connection.cpp`). |
+| `MCCL_LINK_PROFILE` | unset | `thunderbolt` = ≥16 MB transport chunks when `MCCL_CHUNK_BYTES` unset. |
+| `MCCL_CHUNK_BYTES`, `MCCL_SOCK_BUFSIZE`, `MCCL_TCP_LOWAT` | 16 MB / — | transport sizing (see `Connection.cpp`). |
 | `MCCL_COMPRESSION` / `MCCL_TOPK_RATIO` | none | `fp16` or `topk` gradient compression (size-prefixed exact-payload framing). |
 | `MCCL_WATCHDOG_TIMEOUT_MS` | PG timeout | hang detector; the clock starts when an op begins executing, not when it is queued. |
 

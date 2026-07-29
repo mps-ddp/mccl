@@ -299,7 +299,7 @@ bool stage_for_send_uses_blit(const at::Tensor& tensor) {
 
 bool unified_collective_enabled() {
     auto* v = std::getenv("MCCL_UNIFIED_COLLECTIVE");
-    if (!v) return false;
+    if (!v) return true;
     std::string s(v);
     return s == "1" || s == "true" || s == "on" || s == "yes";
 }

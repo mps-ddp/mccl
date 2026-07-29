@@ -28,7 +28,7 @@ inline int collective_concurrency_max() {
 
 /// Parsed ``MCCL_COLLECTIVE_CONCURRENCY`` before bucket / demux safety cap.
 inline int collective_concurrency_requested() {
-    int requested = 2;
+    int requested = 1;
     if (auto* v = std::getenv("MCCL_COLLECTIVE_CONCURRENCY")) {
         requested = static_cast<int>(std::atol(v));
     }
@@ -37,20 +37,15 @@ inline int collective_concurrency_requested() {
 
 /// Total in-flight collective bytes budget for demux parking (override for lab tuning).
 inline size_t demux_inflight_budget_bytes(int world_size) {
+    (void)world_size;
     if (auto* v = std::getenv("MCCL_DEMUX_INFLIGHT_BUDGET_BYTES")) {
         long long n = std::atoll(v);
         if (n > 0) {
             return static_cast<size_t>(n);
         }
     }
-    // Conservative: ws=8 ENOBUFS at 64MiB×2; allow more concurrent small buckets.
-    if (world_size >= 8) {
-        return 128ULL << 20;
-    }
-    if (world_size >= 5) {
-        return 192ULL << 20;
-    }
-    return 256ULL << 20;
+    // Production default: 1 GiB (multi-node lab profile).
+    return 1ULL << 30;
 }
 
 /// Effective ``MCCL_COLLECTIVE_CONCURRENCY`` after bucket + world-size safety cap.

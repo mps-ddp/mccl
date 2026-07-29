@@ -51,7 +51,7 @@ Use the real `169.254.*` from `ifconfig` for **rank 0** in `MASTER_ADDR`.
 macOS may block incoming connections. Allow at least:
 
 - **`MASTER_PORT`** (e.g. 29500) — PyTorch TCP store / rendezvous  
-- **`MCCL_PORT_BASE` … + world_size − 1`** — MCCL peer sockets (default base often `29600`; must **not** equal `MASTER_PORT`)
+- **`MCCL_PORT_BASE` … + world_size − 1`** — MCCL peer sockets (default base `20100`; must **not** equal `MASTER_PORT`)
 
 **System Settings → Network → Firewall → Options** — allow incoming for **Python** and/or **Terminal** (or add explicit rules if you use a custom tool).
 

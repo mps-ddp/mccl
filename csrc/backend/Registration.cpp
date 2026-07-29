@@ -149,7 +149,7 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("_unified_collective_enabled",
           []() { return mccl::unified_collective_enabled(); },
-          "True when MCCL_UNIFIED_COLLECTIVE=1");
+          "True when unified collective is enabled (default on; set MCCL_UNIFIED_COLLECTIVE=0 to disable)");
 
     m.def("_unstage_from_recv",
           [](const at::Tensor& tensor, const at::Tensor& src, bool cpu_unified_stage) {

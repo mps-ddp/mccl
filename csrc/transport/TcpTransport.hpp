@@ -20,9 +20,9 @@ namespace mccl {
 struct TransportConfig {
     std::string transport = "auto";  // "auto", "tcp", "rdma"
     std::string listen_addr = "0.0.0.0";
-    uint16_t port_base = 29600;
+    uint16_t port_base = 20100;
     std::string ifname;              // MCCL_IFNAME — advisory interface hint
-    size_t chunk_bytes = 16 * 1024 * 1024;  // 16 MB default (increased from 4MB for Gloo parity); >=16 MB if MCCL_LINK_PROFILE=thunderbolt
+    size_t chunk_bytes = 16 * 1024 * 1024;  // 16 MB default; thunderbolt profile also ensures >=16 MB
     // Algorithm selection for world_size >= 3: at or below threshold uses star (rank-0);
     // above uses plain ring by default; MCCL_RING_ALGO=chunked|ring_chunked|fast for chunked ring.
     size_t small_msg_threshold = 262144;

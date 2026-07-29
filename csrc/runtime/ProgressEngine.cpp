@@ -7,9 +7,11 @@
 
 namespace mccl {
 
-ProgressEngine::ProgressEngine(size_t max_queue_depth, Metrics* metrics)
-    : max_depth_(max_queue_depth), metrics_(metrics) {
+ProgressEngine::ProgressEngine(size_t max_queue_depth, Metrics* metrics,
+                               int num_threads)
+    : max_depth_(max_queue_depth), num_threads_(num_threads), metrics_(metrics) {
     MCCL_CHECK(max_depth_ > 0, "max_queue_depth must be > 0");
+    MCCL_CHECK(num_threads_ >= 1, "num_threads must be >= 1");
 }
 
 ProgressEngine::~ProgressEngine() {
@@ -21,13 +23,18 @@ void ProgressEngine::start() {
 
     stop_requested_ = false;
     running_ = true;
-    thread_ = std::thread(&ProgressEngine::worker_loop, this);
-
+    threads_.reserve(num_threads_);
+    for (int i = 0; i < num_threads_; i++) {
+        threads_.emplace_back([this] {
 #if defined(__APPLE__)
-    pthread_setname_np("mccl_engine");
+            pthread_setname_np("mccl_engine");
 #endif
+            worker_loop();
+        });
+    }
 
-    MCCL_INFO("ProgressEngine started (max_depth=%zu)", max_depth_);
+    MCCL_INFO("ProgressEngine started (max_depth=%zu threads=%d)",
+              max_depth_, num_threads_);
 }
 
 uint32_t ProgressEngine::submit(std::function<void()> execute,
@@ -70,13 +77,36 @@ void ProgressEngine::stop() {
         std::lock_guard<std::mutex> lock(mu_);
         stop_requested_ = true;
     }
-    not_empty_.notify_one();
+    not_empty_.notify_all();
     not_full_.notify_all();
 
-    if (thread_.joinable()) {
-        thread_.join();
+    for (auto& t : threads_) {
+        if (t.joinable()) t.join();
     }
+    threads_.clear();
     running_ = false;
+
+    // A submit() that passed the running_ check concurrently with shutdown
+    // may have enqueued after the worker exited.  Fail those ops so their
+    // Work objects complete (with an error) instead of hanging forever.
+    std::deque<EngineOp> orphans;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        orphans.swap(queue_);
+    }
+    if (!orphans.empty()) {
+        MCCL_WARN("ProgressEngine: failing %zu op(s) queued during shutdown",
+                  orphans.size());
+        auto err = std::make_exception_ptr(
+            MCCLError("ProgressEngine stopped before op executed"));
+        for (auto& op : orphans) {
+            try {
+                if (op.on_error) op.on_error(err);
+            } catch (...) {
+                MCCL_ERROR("ProgressEngine: on_error threw during shutdown drain");
+            }
+        }
+    }
 
     MCCL_INFO("ProgressEngine stopped");
 }
@@ -104,6 +134,8 @@ void ProgressEngine::worker_loop() {
 
             if (queue_.empty()) continue;
 
+            // FIFO dequeue: with multiple workers, ops still START in
+            // submission order (collective schedules stay rank-aligned).
             op = std::move(queue_.front());
             queue_.pop_front();
         }
@@ -111,19 +143,22 @@ void ProgressEngine::worker_loop() {
 
         MCCL_TRACE("Executing op seq=%u", op.seq_num);
 
-        // Record when execution actually starts (after queue wait)
-        if (metrics_) {
-            metrics_->op_execute_start(op.seq_num);
-        }
+        // NOTE: execute-start metrics are recorded by the collective's own
+        // execute lambda (ProcessGroupMCCL::begin_execute) — the engine's
+        // internal seq_counter_ is NOT the collective seq, so stamping
+        // metrics here would hit the wrong (or no) inflight entry.
 
         bool exec_ok = false;
         std::exception_ptr exec_ex;
         try {
             op.execute();
             exec_ok = true;
+        } catch (const std::exception& e) {
+            exec_ex = std::current_exception();
+            MCCL_ERROR("Op seq=%u execute() failed: %s", op.seq_num, e.what());
         } catch (...) {
             exec_ex = std::current_exception();
-            MCCL_ERROR("Op seq=%u execute() failed with exception", op.seq_num);
+            MCCL_ERROR("Op seq=%u execute() failed with non-standard exception", op.seq_num);
         }
 
         if (exec_ok) {
@@ -131,9 +166,14 @@ void ProgressEngine::worker_loop() {
             try {
                 if (op.on_complete) op.on_complete();
                 MCCL_TRACE("Op seq=%u completed", op.seq_num);
+            } catch (const std::exception& e) {
+                complete_ex = std::current_exception();
+                MCCL_ERROR("Op seq=%u on_complete() threw: %s — routing to on_error",
+                           op.seq_num, e.what());
             } catch (...) {
                 complete_ex = std::current_exception();
-                MCCL_ERROR("Op seq=%u on_complete() threw — routing to on_error", op.seq_num);
+                MCCL_ERROR("Op seq=%u on_complete() threw non-standard exception — routing to on_error",
+                           op.seq_num);
             }
             if (complete_ex) {
                 try {

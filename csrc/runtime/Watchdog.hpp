@@ -36,6 +36,12 @@ public:
     void watch(uint32_t seq, const std::string& op_name,
                std::chrono::milliseconds timeout);
 
+    /// Arm (or re-arm) the deadline for an op.  Called when execution starts
+    /// on an engine and at phase boundaries (e.g. each broadcast peer send).
+    /// Ops registered via watch() carry no deadline until first touched, so
+    /// healthy queue wait never counts against the timeout.
+    void touch(uint32_t seq);
+
     /// Mark a collective as complete — removes it from the watch list.
     void complete(uint32_t seq);
 
@@ -49,6 +55,7 @@ private:
         uint32_t seq;
         std::string op_name;
         std::chrono::steady_clock::time_point deadline;
+        std::chrono::milliseconds timeout;
     };
 
     std::chrono::milliseconds default_timeout_;

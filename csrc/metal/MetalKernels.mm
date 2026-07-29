@@ -4,11 +4,15 @@
 
 #include <dlfcn.h>
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
+#include <string>
 
 #include "metal/MetalKernels.hpp"
 #include "metal/MPSInterop.hpp"
+#include "runtime/MemoryPool.hpp"
 #include "metal/AccelerateOps.hpp"
+#include "metal/EventSync.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 #include "common/TensorChecks.hpp"
@@ -41,6 +45,19 @@ struct KernelCache {
     id<MTLComputePipelineState> product_f32 = nil;
     id<MTLComputePipelineState> product_f16 = nil;
     id<MTLComputePipelineState> product_bf16 = nil;
+    id<MTLComputePipelineState> accumulate_i32 = nil;
+    id<MTLComputePipelineState> accumulate_i64 = nil;
+    id<MTLComputePipelineState> accumulate_u8 = nil;
+    id<MTLComputePipelineState> min_i32 = nil;
+    id<MTLComputePipelineState> max_i32 = nil;
+    id<MTLComputePipelineState> product_i32 = nil;
+    id<MTLComputePipelineState> min_i64 = nil;
+    id<MTLComputePipelineState> max_i64 = nil;
+    id<MTLComputePipelineState> product_i64 = nil;
+    id<MTLComputePipelineState> min_u8 = nil;
+    id<MTLComputePipelineState> max_u8 = nil;
+    id<MTLComputePipelineState> product_u8 = nil;
+    id<MTLComputePipelineState> scale_i32 = nil;
 
     std::atomic<bool> initialized{false};
 };
@@ -142,6 +159,13 @@ bool is_vector_aligned(const MPSBufferView& view, at::ScalarType dtype) {
         case at::kBFloat16:
             alignment = 8;
             break;
+        case at::kInt:
+        case at::kLong:
+            alignment = 16;
+            break;
+        case at::kBool:
+            alignment = 4;
+            break;
         default:
             break;
     }
@@ -154,6 +178,13 @@ bool binary_vector_aligned(const MPSBufferView& dst_view, const MPSBufferView& s
 }
 
 bool should_use_small_cpu_path(const at::Tensor& tensor) {
+    static bool cpu_reduce = [] {
+        auto* v = std::getenv("MCCL_FP32_CPU_REDUCE");
+        if (!v) return false;
+        std::string s(v);
+        return s == "1" || s == "true" || s == "on" || s == "yes";
+    }();
+    if (!cpu_reduce) return false;
     auto dtype = tensor.scalar_type();
     return (dtype == at::kHalf || dtype == at::kBFloat16) &&
            tensor.numel() <= small_gpu_threshold() &&
@@ -174,6 +205,28 @@ void finish_command_buffer(id<MTLCommandBuffer> cmd) {
     [cmd commit];
 }
 
+/// Unified fp32: seed dst from GPU, reduce with staged src, blit back.
+/// Metal GPU binary ops read stale bytes on Apple Silicon UMA after wire recv.
+bool unified_fp32_binary_reduce(const at::Tensor& dst, const at::Tensor& src,
+                                c10d::ReduceOp::RedOpType op) {
+    if (dst.scalar_type() != at::kFloat) return false;
+    MPSBufferView dst_view = extract_mps_buffer(dst);
+    MPSBufferView src_view = extract_mps_buffer(src);
+    if (!dst_view.cpu_accessible || !dst_view.cpu_ptr ||
+        !src_view.cpu_accessible) {
+        return false;
+    }
+    StagingBuffer dst_staged = stage_for_send(dst);
+    memcpy(dst_view.cpu_ptr, dst_staged.data, dst_view.nbytes);
+    StagingBuffer src_staged = stage_for_send(src);
+    cpu_reduce_op(static_cast<float*>(dst_view.cpu_ptr),
+                  static_cast<const float*>(src_staged.data),
+                  dst.numel(), op);
+    blit_buffer_to_tensor(dst_view.cpu_ptr, dst);
+    mps_stream_sync_after_cpu_mps_buffer_write();
+    return true;
+}
+
 void cpu_small_reduce(const at::Tensor& dst, const at::Tensor& src,
                       c10d::ReduceOp::RedOpType op) {
     MPSBufferView dst_view = extract_mps_buffer(dst);
@@ -182,10 +235,20 @@ void cpu_small_reduce(const at::Tensor& dst, const at::Tensor& src,
                "Small CPU reduce path requires shared MPS storage");
 
     int64_t count = dst.numel();
-    if (dst.scalar_type() == at::kHalf) {
+    auto dtype = dst.scalar_type();
+    if (dtype == at::kFloat) {
+        cpu_reduce_op(static_cast<float*>(dst_view.cpu_ptr),
+                      static_cast<const float*>(src_view.cpu_ptr), count, op);
+    } else if (dtype == at::kHalf) {
         cpu_reduce_op_half(static_cast<c10::Half*>(dst_view.cpu_ptr),
                            static_cast<const c10::Half*>(src_view.cpu_ptr),
                            count, op);
+    } else if (dtype == at::kBFloat16) {
+        cpu_reduce_op_bf16(static_cast<c10::BFloat16*>(dst_view.cpu_ptr),
+                           static_cast<const c10::BFloat16*>(src_view.cpu_ptr),
+                           count, op);
+    } else if (dtype == at::kBool || dtype == at::kInt || dtype == at::kLong) {
+        cpu_reduce_op_integral(dst_view.cpu_ptr, src_view.cpu_ptr, count, dtype, op);
     } else {
         cpu_reduce_op_bf16(static_cast<c10::BFloat16*>(dst_view.cpu_ptr),
                            static_cast<const c10::BFloat16*>(src_view.cpu_ptr),
@@ -237,13 +300,44 @@ id<MTLComputePipelineState> select_accumulate_pipeline(KernelCache& c, at::Scala
     if (dtype == at::kFloat) return c.accumulate_f32;
     if (dtype == at::kHalf) return c.accumulate_f16;
     if (dtype == at::kBFloat16) return c.accumulate_bf16;
+    if (dtype == at::kBool) return c.accumulate_u8;
+    if (dtype == at::kInt) return c.accumulate_i32;
+    if (dtype == at::kLong) return c.accumulate_i64;
     return nil;
+}
+
+id<MTLComputePipelineState> select_integral_binary_pipeline(
+    KernelCache& c, at::ScalarType dtype, c10d::ReduceOp::RedOpType op) {
+    const bool is_u8 = (dtype == at::kBool);
+    const bool is_i64 = (dtype == at::kLong);
+    switch (op) {
+        case c10d::ReduceOp::SUM:
+        case c10d::ReduceOp::AVG:
+            if (is_u8) return c.accumulate_u8;
+            if (is_i64) return c.accumulate_i64;
+            return c.accumulate_i32;
+        case c10d::ReduceOp::MIN:
+            if (is_u8) return c.min_u8;
+            if (is_i64) return c.min_i64;
+            return c.min_i32;
+        case c10d::ReduceOp::MAX:
+            if (is_u8) return c.max_u8;
+            if (is_i64) return c.max_i64;
+            return c.max_i32;
+        case c10d::ReduceOp::PRODUCT:
+            if (is_u8) return c.product_u8;
+            if (is_i64) return c.product_i64;
+            return c.product_i32;
+        default:
+            return nil;
+    }
 }
 
 id<MTLComputePipelineState> select_scale_pipeline(KernelCache& c, at::ScalarType dtype) {
     if (dtype == at::kFloat) return c.scale_f32;
     if (dtype == at::kHalf) return c.scale_f16;
     if (dtype == at::kBFloat16) return c.scale_bf16;
+    if (dtype == at::kInt) return c.scale_i32;
     return nil;
 }
 
@@ -391,6 +485,19 @@ void metal_kernels_init() {
         c.product_f32     = make_pipeline(c.device, c.library, @"elementwise_product_f32");
         c.product_f16     = make_pipeline(c.device, c.library, @"elementwise_product_f16");
         c.product_bf16    = make_pipeline_if_present(c.device, c.library, @"elementwise_product_bf16");
+        c.accumulate_i32  = make_pipeline(c.device, c.library, @"accumulate_chunk_i32");
+        c.accumulate_i64  = make_pipeline(c.device, c.library, @"accumulate_chunk_i64");
+        c.accumulate_u8   = make_pipeline(c.device, c.library, @"accumulate_chunk_u8");
+        c.min_i32         = make_pipeline(c.device, c.library, @"elementwise_min_i32");
+        c.max_i32         = make_pipeline(c.device, c.library, @"elementwise_max_i32");
+        c.product_i32     = make_pipeline(c.device, c.library, @"elementwise_product_i32");
+        c.min_i64         = make_pipeline(c.device, c.library, @"elementwise_min_i64");
+        c.max_i64         = make_pipeline(c.device, c.library, @"elementwise_max_i64");
+        c.product_i64     = make_pipeline(c.device, c.library, @"elementwise_product_i64");
+        c.min_u8          = make_pipeline(c.device, c.library, @"elementwise_min_u8");
+        c.max_u8          = make_pipeline(c.device, c.library, @"elementwise_max_u8");
+        c.product_u8      = make_pipeline(c.device, c.library, @"elementwise_product_u8");
+        c.scale_i32       = make_pipeline(c.device, c.library, @"scale_inplace_i32");
 
         c.initialized.store(true, std::memory_order_release);
         MCCL_INFO("Metal kernel cache initialized (fastMath=%s)",
@@ -398,6 +505,10 @@ void metal_kernels_init() {
     }
 }
 
+void* get_mccl_mtl_library() {
+    metal_kernels_init();
+    return (__bridge void*)cache().library;
+}
 
 void metal_accumulate_chunk(const at::Tensor& dst, const at::Tensor& src) {
     std::lock_guard<std::recursive_mutex> lock(g_metal_kernel_mutex);
@@ -407,6 +518,11 @@ void metal_accumulate_chunk(const at::Tensor& dst, const at::Tensor& src) {
 
     MPSBufferView dst_view = extract_mps_buffer(dst);
     MPSBufferView src_view = extract_mps_buffer(src);
+
+    // Unified MPS memory: GPU binary kernels read stale bytes after recv blit.
+    if (unified_fp32_binary_reduce(dst, src, c10d::ReduceOp::SUM)) {
+        return;
+    }
 
     id<MTLBuffer> dst_buf = (__bridge id<MTLBuffer>)dst_view.mtl_buffer;
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)src_view.mtl_buffer;
@@ -582,13 +698,18 @@ void metal_elementwise_min(const at::Tensor& dst, const at::Tensor& src) {
     KernelCache& c = cache();
     MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
+    if (unified_fp32_binary_reduce(dst, src, c10d::ReduceOp::MIN)) return;
     if (should_use_small_cpu_binary_path(dst, src)) {
         cpu_small_reduce(dst, src, c10d::ReduceOp::MIN);
         return;
     }
-    id<MTLComputePipelineState> pso = dst.scalar_type() == at::kFloat ? c.min_f32 :
-                                      dst.scalar_type() == at::kHalf ? c.min_f16 :
-                                      c.min_bf16;
+    id<MTLComputePipelineState> pso = select_integral_binary_pipeline(
+        c, dst.scalar_type(), c10d::ReduceOp::MIN);
+    if (pso == nil) {
+        pso = dst.scalar_type() == at::kFloat ? c.min_f32 :
+              dst.scalar_type() == at::kHalf ? c.min_f16 :
+              c.min_bf16;
+    }
     MCCL_CHECK(pso != nil,
                "No Metal min pipeline for dtype " +
                std::string(at::toString(dst.scalar_type())));
@@ -600,13 +721,18 @@ void metal_elementwise_max(const at::Tensor& dst, const at::Tensor& src) {
     KernelCache& c = cache();
     MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
+    if (unified_fp32_binary_reduce(dst, src, c10d::ReduceOp::MAX)) return;
     if (should_use_small_cpu_binary_path(dst, src)) {
         cpu_small_reduce(dst, src, c10d::ReduceOp::MAX);
         return;
     }
-    id<MTLComputePipelineState> pso = dst.scalar_type() == at::kFloat ? c.max_f32 :
-                                      dst.scalar_type() == at::kHalf ? c.max_f16 :
-                                      c.max_bf16;
+    id<MTLComputePipelineState> pso = select_integral_binary_pipeline(
+        c, dst.scalar_type(), c10d::ReduceOp::MAX);
+    if (pso == nil) {
+        pso = dst.scalar_type() == at::kFloat ? c.max_f32 :
+              dst.scalar_type() == at::kHalf ? c.max_f16 :
+              c.max_bf16;
+    }
     MCCL_CHECK(pso != nil,
                "No Metal max pipeline for dtype " +
                std::string(at::toString(dst.scalar_type())));
@@ -618,13 +744,18 @@ void metal_elementwise_product(const at::Tensor& dst, const at::Tensor& src) {
     KernelCache& c = cache();
     MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
+    if (unified_fp32_binary_reduce(dst, src, c10d::ReduceOp::PRODUCT)) return;
     if (should_use_small_cpu_binary_path(dst, src)) {
         cpu_small_reduce(dst, src, c10d::ReduceOp::PRODUCT);
         return;
     }
-    id<MTLComputePipelineState> pso = dst.scalar_type() == at::kFloat ? c.product_f32 :
-                                      dst.scalar_type() == at::kHalf ? c.product_f16 :
-                                      c.product_bf16;
+    id<MTLComputePipelineState> pso = select_integral_binary_pipeline(
+        c, dst.scalar_type(), c10d::ReduceOp::PRODUCT);
+    if (pso == nil) {
+        pso = dst.scalar_type() == at::kFloat ? c.product_f32 :
+              dst.scalar_type() == at::kHalf ? c.product_f16 :
+              c.product_bf16;
+    }
     MCCL_CHECK(pso != nil,
                "No Metal product pipeline for dtype " +
                std::string(at::toString(dst.scalar_type())));
@@ -652,6 +783,18 @@ void metal_reduce_op(const at::Tensor& dst, const at::Tensor& src,
             throw MCCLError("Unsupported ReduceOp: " +
                             std::to_string(static_cast<int>(op)));
     }
+}
+
+uint64_t metal_reduce_op_fenced(const at::Tensor& dst, const at::Tensor& src,
+                                c10d::ReduceOp::RedOpType op) {
+    metal_reduce_op(dst, src, op);
+    if (event_sync_available()) {
+        uint64_t v = next_fence_event_value();
+        signal_mccl_fence_gpu(v);
+        return v;
+    }
+    metal_sync_queue_only();
+    return 0;
 }
 
 void metal_sync() {

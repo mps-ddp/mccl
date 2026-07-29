@@ -6,6 +6,9 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * *"  # nightly full matrix + soak
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -36,5 +39,70 @@ jobs:
           pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
           pip install -e . --no-deps --no-build-isolation
 
-      - name: Smoke tests (build + local 2-process DDP)
-        run: pytest -v tests/test_build.py tests/test_ddp.py
+      - name: Smoke tests (build + protocol + local 2-process DDP)
+        run: pytest -v tests/test_build.py tests/test_protocol.py tests/test_ddp.py
+
+      - name: Unit tests (kernels, compression, CPU tensors)
+        run: pytest -v tests/test_local_kernels.py tests/test_compression.py tests/test_cpu_tensors.py
+
+      - name: Edge cases and validation contract
+        run: pytest -v tests/test_edge_cases.py
+
+      - name: Correctness vs reference (algorithm matrix)
+        # The full dtype x op x algo x world_size matrix is long; keep CI to
+        # the highest-signal subset and run the rest nightly/locally.
+        run: |
+          pytest -v tests/test_correctness_vs_reference.py -k "chunked_default or large_odd or schedule or Determinism or Other"
+
+      - name: Process group collectives (local multi-process)
+        run: pytest -v tests/test_process_group_local.py tests/test_v2_collectives.py
+
+      - name: Race and pipeline stress
+        run: pytest -v tests/test_race_stress.py
+
+      - name: Pipelined ring + demux (ws=4)
+        run: pytest -v tests/test_ring_pipeline.py -k "not 6"
+
+      - name: Metrics populated (latency/phase stats nonzero)
+        run: pytest -v tests/test_metrics.py
+
+      - name: Tree collectives (ws=3..5)
+        run: pytest -v tests/test_tree_collectives.py -k "not 6"
+
+      - name: Compression end-to-end
+        run: pytest -v tests/test_compression_e2e.py
+
+      - name: DDP multi-bucket parity
+        run: pytest -v tests/test_ddp_multibucket.py
+
+      - name: Ring algo correctness (basic vs chunked, ws=4)
+        run: pytest -v tests/test_ring_algo_correctness.py -k "world_size==4"
+
+      - name: Failure injection
+        run: pytest -v tests/test_failure_injection.py
+
+  nightly-full-matrix:
+    # Full correctness matrix + soak; runs on a schedule or manual dispatch.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        env:
+          MCCL_REQUIRE_METALLIB: "1"
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy "pytest>=7.0" "pytest-timeout>=2.1" "setuptools>=68.0" "wheel>=0.41"
+          pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
+          pip install -e . --no-deps --no-build-isolation
+      - name: Full correctness matrix
+        run: pytest -v tests/test_correctness_vs_reference.py
+      - name: Pipelined ring + tree at ws=6
+        run: pytest -v tests/test_ring_pipeline.py tests/test_tree_collectives.py
+      - name: Soak
+        run: pytest -v tests/test_soak.py
+      - name: Bus bandwidth report (informational)
+        run: python tests/bench_busbw.py --quick || true

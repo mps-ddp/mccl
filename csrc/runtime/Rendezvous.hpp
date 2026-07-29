@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <mutex>
+#include <unordered_map>
 
 namespace mccl {
 
@@ -24,6 +26,8 @@ public:
     std::vector<std::string> exchange_endpoints(const std::string& my_endpoint);
 
     /// Store-backed barrier — all ranks must call before any can proceed.
+    /// Reusable: each call with the same tag uses a fresh epoch, so repeated
+    /// barriers do not pass instantly on stale keys from a previous call.
     void barrier(const std::string& tag = "mccl_barrier");
 
 private:
@@ -32,8 +36,13 @@ private:
     int world_size_;
     std::chrono::milliseconds timeout_;
 
+    // Per-tag use counter.  All ranks call collectives (and thus barriers)
+    // in the same order, so the local count matches across ranks.
+    std::mutex barrier_mu_;
+    std::unordered_map<std::string, uint64_t> barrier_epochs_;
+
     static std::string endpoint_key(int rank);
-    static std::string barrier_key(const std::string& tag, int rank);
+    static std::string barrier_key(const std::string& tag, uint64_t epoch, int rank);
 };
 
 } // namespace mccl

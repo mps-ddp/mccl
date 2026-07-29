@@ -22,11 +22,15 @@ struct EngineOp {
     std::function<void(std::exception_ptr)> on_error;
 };
 
-/// Bounded single-thread progress engine. Tensor collectives call MPS sync on the
-/// caller thread, then ``submit`` transport work here (e.g. barrier, allreduce I/O).
+/// Bounded progress engine with one or more worker threads.  Tensor
+/// collectives call MPS sync on the caller thread, then ``submit`` transport
+/// work here (e.g. barrier, allreduce I/O).  With num_threads > 1, ops still
+/// START in submission order (FIFO dequeue) but run concurrently — used by
+/// the collective executor pool for bucket-level overlap.
 class ProgressEngine {
 public:
-    explicit ProgressEngine(size_t max_queue_depth = 1024, Metrics* metrics = nullptr);
+    explicit ProgressEngine(size_t max_queue_depth = 1024, Metrics* metrics = nullptr,
+                            int num_threads = 1);
     ~ProgressEngine();
 
     ProgressEngine(const ProgressEngine&) = delete;
@@ -57,6 +61,7 @@ private:
     void worker_loop();
 
     size_t max_depth_;
+    int num_threads_;
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<uint32_t> seq_counter_{0};
@@ -66,7 +71,7 @@ private:
     std::condition_variable not_empty_;
     std::condition_variable not_full_;
 
-    std::thread thread_;
+    std::vector<std::thread> threads_;
     Metrics* metrics_; // Not owned
 };
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "compression/Compression.hpp"
+#include <mutex>
 #include <vector>
 #include <unordered_map>
 
@@ -24,7 +25,8 @@ public:
 
     size_t compress(const void* src, size_t nbytes,
                     void* dst, size_t dst_capacity,
-                    at::ScalarType dtype) override;
+                    at::ScalarType dtype,
+                    uint64_t stable_id = 0) override;
 
     void decompress(const void* src, size_t compressed_size,
                     void* dst, size_t nbytes,
@@ -37,15 +39,24 @@ public:
     /// Reset the error feedback buffer (e.g. between training runs).
     void reset_error_feedback();
 
-    /// Reset error feedback for a specific tensor (identified by data pointer).
-    void reset_error_feedback_for_tensor(const void* tensor_ptr);
+    /// Reset error feedback for a specific tensor (identified by stable id).
+    void reset_error_feedback_for_tensor(uint64_t stable_id);
 
-    /// Get the current error feedback buffers (for diagnostics).
-    const std::unordered_map<uintptr_t, std::vector<float>>& error_feedback_buffers() const { return error_buffers_; }
+    /// Number of live error-feedback buffers (diagnostics).
+    size_t error_feedback_buffer_count() const;
 
 private:
     double k_ratio_;
-    std::unordered_map<uintptr_t, std::vector<float>> error_buffers_;  // Per-tensor error feedback
+
+    // Per-tensor error feedback, keyed by the caller-supplied stable tensor
+    // identity (NEVER a staging-buffer address: that is shared across
+    // tensors and would mix residuals between gradient buckets, silently
+    // breaking the error-feedback convergence guarantee).
+    mutable std::mutex mu_;
+    std::unordered_map<uint64_t, std::vector<float>> error_buffers_;
+
+    // Bound state growth for workloads with unstable ids.
+    static constexpr size_t kMaxErrorBuffers = 1024;
 };
 
 } // namespace mccl

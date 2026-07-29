@@ -19,6 +19,10 @@ struct MPSBufferView {
 /// Returns a view with buffer handle, offset, and CPU-accessibility info.
 MPSBufferView extract_mps_buffer(const at::Tensor& tensor);
 
+/// CPU pointer for contiguous MPS (shared) or CPU tensors — allows complex64 for STFT.
+/// Returns nullptr when MPS uses private storage (caller should fall back to copy_/cpu()).
+void* shared_cpu_data_ptr(const at::Tensor& tensor);
+
 /// Synchronize MPS command queue — blocks until all enqueued MPS work completes.
 /// Must be called before reading MPS tensor data from CPU / network.
 void mps_sync();
@@ -61,14 +65,49 @@ StagingBuffer stage_for_send(const at::Tensor& tensor);
 /// Caller MUST ensure all GPU work on the tensor is already flushed.
 StagingBuffer stage_for_send_nosync(const at::Tensor& tensor);
 
+/// Collective send staging: always blit+wait on MCCL queue (safe under DDP overlap).
+StagingBuffer stage_for_send_collective(const at::Tensor& tensor);
+
 /// Unstage received bytes back into an MPS tensor's buffer.
-/// Handles the CPU→GPU direction (write-back after network receive).
-void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes);
+/// cpu_unified_stage: memcpy into shared cpu_ptr for fp32 vDSP reduce (no GPU
+/// blit); callers that need GPU-visible data (broadcast copy_) leave this false.
+void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes,
+                       bool cpu_unified_stage = false);
+
+/// Copy a (possibly private-storage) tensor's bytes into a caller-owned,
+/// PAGE-ALIGNED host buffer (e.g. a PooledBuffer).  Shared storage: memcpy;
+/// private: blit.  Unlike the StagingPool paths, the destination is owned by
+/// the caller, so concurrent collectives never share staging memory.
+void blit_tensor_to_buffer(const at::Tensor& tensor, void* dst);
+
+/// Inverse: copy a caller-owned, PAGE-ALIGNED host buffer into a tensor.
+void blit_buffer_to_tensor(const void* src, const at::Tensor& tensor);
 
 /// Returns true if the tensor's underlying MTLBuffer uses shared storage,
 /// meaning the CPU can read/write it directly without blit staging.
 /// Performs a lightweight runtime check (no sync, no copy).
 bool tensor_cpu_accessible(const at::Tensor& tensor);
+
+/// Human-readable MTLStorageMode for an MPS tensor ("cpu", "private", "shared",
+/// "managed", "none"). Used by Python tests to document why DDP grads cannot use
+/// the wire cpu_ptr fast path.
+std::string mps_storage_mode_string(const at::Tensor& tensor);
+
+/// True when ``stage_for_send_collective`` blits instead of reading cpu_ptr.
+bool collective_send_uses_blit(const at::Tensor& tensor);
+
+/// True when ``stage_for_send`` blits instead of reading cpu_ptr.
+bool stage_for_send_uses_blit(const at::Tensor& tensor);
+
+/// Opt-in: ``MCCL_UNIFIED_COLLECTIVE=1`` — after producer MPS fence, send from
+/// shared ``cpu_ptr`` and recv/reduce on unified buffer when safe (torch 2.12+).
+bool unified_collective_enabled();
+
+/// Unified send/recv + Metal reduce (not vDSP CPU reduce).
+bool unified_metal_collective_path(const at::Tensor& tensor);
+
+/// When unified, returns ``cpu_ptr`` for direct TCP recv; else nullptr.
+void* tensor_wire_recv_ptr(const at::Tensor& tensor);
 
 /// If the tensor uses private Metal storage, copy it into a new tensor
 /// backed by shared (cpu_accessible) storage and return that. If already

@@ -57,7 +57,10 @@ def _run_distributed(fn, world_size=2, port=29500, extra_mccl_env=None):
         f"os.environ['MASTER_PORT'] = '{port}'\n"
         f"os.environ['MCCL_LISTEN_ADDR'] = '127.0.0.1'\n"
         f"os.environ['MCCL_PORT_BASE'] = '{port + 100}'\n"
-        f"os.environ['MCCL_LOG_LEVEL'] = 'DEBUG'\n"
+        f"os.environ['MCCL_LOG_LEVEL'] = os.environ.get('MCCL_LOG_LEVEL', 'WARN')\n"
+        f"THREE_RANK_PLAIN_RING_NUMEL = {THREE_RANK_PLAIN_RING_NUMEL}\n"
+        f"THREE_RANK_PLAIN_RING_NUMEL_F16 = {THREE_RANK_PLAIN_RING_NUMEL_F16}\n"
+        f"THREE_RANK_PLAIN_RING_NUMEL_BF16 = {THREE_RANK_PLAIN_RING_NUMEL_BF16}\n"
         f"{extra_lines}"
         "rank = int(sys.argv[1])\n"
         "world_size = int(sys.argv[2])\n"
@@ -67,15 +70,15 @@ def _run_distributed(fn, world_size=2, port=29500, extra_mccl_env=None):
             f"{textwrap.indent(src, '    ')}"
             "    fn(rank, world_size)\n"
             "finally:\n"
-            "    dist.destroy_process_group()\n"
-            "    os._exit(0)\n"
+            "    if dist.is_initialized():\n"
+            "        dist.destroy_process_group()\n"
+            "os._exit(0)  # success only — avoids MCCL atexit hang; failures above skip this\n"
     )
     import time
     procs = []
     for r in range(world_size):
         p = subprocess.Popen([sys.executable, "-c", script, str(r), str(world_size)])
         procs.append(p)
-        time.sleep(0.5)
     for p in procs:
         rc = p.wait()
         assert rc == 0, f"Worker exited with code {rc}"
@@ -146,7 +149,6 @@ def _run_three_rank_parity_workers(
     for r in range(3):
         p = subprocess.Popen([sys.executable, "-c", script, str(r), str(3)])
         procs.append(p)
-        time.sleep(0.5)
     for p in procs:
         rc = p.wait()
         assert rc == 0, f"Parity worker exited with code {rc}"
@@ -408,7 +410,7 @@ class TestThreeRankAllreduce:
 
     Float tests use nbytes > default MCCL_SMALL_MSG_THRESHOLD. Most set
     ``MCCL_RING_ALGO=basic`` to pin plain ring; ``test_three_rank_sum_large_unset_ring_algo_env``
-    omits ``MCCL_RING_ALGO`` so the default (plain ring, not ``ring_chunked``) is covered.
+    omits ``MCCL_RING_ALGO`` so the default (chunked ring as of v0.4) is covered.
     """
 
     def test_three_rank_sum(self):
@@ -425,7 +427,7 @@ class TestThreeRankAllreduce:
         )
 
     def test_three_rank_sum_large_unset_ring_algo_env(self):
-        """Large 3-rank SUM with ``MCCL_RING_ALGO`` unset: default must stay plain ring."""
+        """Large 3-rank SUM with ``MCCL_RING_ALGO`` unset (default algo, chunked in v0.4)."""
 
         def fn(rank, world_size):
             n = THREE_RANK_PLAIN_RING_NUMEL

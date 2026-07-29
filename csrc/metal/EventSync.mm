@@ -5,6 +5,7 @@
 
 #include "metal/EventSync.hpp"
 #include "metal/MPSInterop.hpp"
+#include "runtime/MCCLDeviceMutex.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 
@@ -18,9 +19,13 @@ namespace {
 struct EventState {
     id<MTLSharedEvent> mps_event   = nil;
     id<MTLSharedEvent> mccl_event  = nil;
+    id<MTLSharedEvent> fence_event = nil;
     id<MTLDevice>      device      = nil;
     id<MTLCommandQueue> mccl_queue = nil;
-    std::atomic<uint64_t> counter{0};
+    std::atomic<uint64_t> mps_counter{0};
+    std::atomic<uint64_t> fence_counter{0};
+    std::atomic<uint64_t> mccl_counter{0};
+    std::atomic<uint64_t> mccl_cpu_done{0};
     std::atomic<bool> initialized{false};
 };
 
@@ -31,19 +36,26 @@ EventState& state() {
 
 void spin_wait_event(id<MTLSharedEvent> event, uint64_t target) {
     constexpr int FAST_SPINS = 200;
-    constexpr int YIELD_SPINS = 2000;
     constexpr auto TIMEOUT = std::chrono::seconds(30);
 
     for (int i = 0; i < FAST_SPINS; ++i) {
         if (event.signaledValue >= target) return;
     }
 
-    for (int i = 0; i < YIELD_SPINS; ++i) {
-        std::this_thread::yield();
-        if (event.signaledValue >= target) return;
+    auto deadline = std::chrono::steady_clock::now() + TIMEOUT;
+
+    if (@available(macOS 12.0, *)) {
+        while (event.signaledValue < target) {
+            [event waitUntilSignaledValue:target timeoutMS:100];
+            MCCL_CHECK(std::chrono::steady_clock::now() < deadline ||
+                           event.signaledValue >= target,
+                       "spin_wait_event timed out after 30s waiting for event value " +
+                       std::to_string(target) + " (current=" +
+                       std::to_string(event.signaledValue) + ")");
+        }
+        return;
     }
 
-    auto deadline = std::chrono::steady_clock::now() + TIMEOUT;
     auto delay = std::chrono::microseconds(10);
     constexpr auto max_delay = std::chrono::microseconds(500);
     while (event.signaledValue < target) {
@@ -87,9 +99,20 @@ void event_sync_init() {
             return;
         }
 
-        s.counter.store(0);
+        s.fence_event = [s.device newSharedEvent];
+        if (!s.fence_event) {
+            MCCL_WARN("EventSync: MTLSharedEvent creation failed (fence_event)");
+            s.mps_event = nil;
+            s.mccl_event = nil;
+            return;
+        }
+
+        s.mps_counter.store(0);
+        s.fence_counter.store(0);
+        s.mccl_counter.store(0);
+        s.mccl_cpu_done.store(0);
         s.initialized.store(true, std::memory_order_release);
-        MCCL_INFO("EventSync initialized (MTLSharedEvent-based sync)");
+        MCCL_INFO("EventSync initialized (per-event MTLSharedEvent counters)");
     }
 }
 
@@ -101,15 +124,6 @@ void commit_mps_and_signal(uint64_t value) {
     EventState& s = state();
     MCCL_CHECK(s.initialized, "EventSync not initialized");
 
-    // Encode a signal on PyTorch's active MPS command buffer then commit it.
-    // dispatch_sync on PyTorch's serial queue guarantees our encoding happens
-    // AFTER all backward/forward work dispatched so far.  commit() submits the
-    // buffer; the MTLSharedEvent fires when the GPU finishes that buffer.
-    //
-    // This replaces the old torch::mps::synchronize() full-stream-drain and is
-    // safe to call mid-backward: dispatch_sync serializes with PyTorch's own
-    // encoding, and commit() just submits -- PyTorch lazily creates a new
-    // command buffer for subsequent ops.
     dispatch_sync(
         (dispatch_queue_t)torch::mps::get_dispatch_queue(), ^{
             id<MTLCommandBuffer> cmd =
@@ -117,7 +131,6 @@ void commit_mps_and_signal(uint64_t value) {
             [cmd encodeSignalEvent:s.mps_event value:value];
             torch::mps::commit();
         });
-    // Non-blocking: caller waits via wait_for_mps() when it needs the data.
 }
 
 void wait_for_mps(uint64_t value) {
@@ -129,18 +142,18 @@ void wait_for_mps(uint64_t value) {
 void signal_mccl_done(uint64_t value) {
     EventState& s = state();
     MCCL_CHECK(s.initialized, "EventSync not initialized");
-
-    // For the CPU reduction path (f32 vDSP), results are written directly
-    // to unified memory -- just update the event counter so anyone polling
-    // knows we're done.  For the Metal shader path we encode the signal on
-    // MCCL's command queue and commit.
-    s.mccl_event.signaledValue = value;
+    uint64_t prev = s.mccl_cpu_done.load(std::memory_order_relaxed);
+    while (value > prev &&
+           !s.mccl_cpu_done.compare_exchange_weak(
+               prev, value, std::memory_order_release, std::memory_order_relaxed)) {
+    }
 }
 
 void signal_mccl_done_gpu(uint64_t value) {
     EventState& s = state();
     MCCL_CHECK(s.initialized, "EventSync not initialized");
 
+    std::lock_guard<std::recursive_mutex> lock(mccl_device_ops_mutex());
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = [s.mccl_queue commandBuffer];
         cmd.label = @"mccl_signal_done";
@@ -152,11 +165,72 @@ void signal_mccl_done_gpu(uint64_t value) {
 void wait_for_mccl(uint64_t value) {
     EventState& s = state();
     MCCL_CHECK(s.initialized, "EventSync not initialized");
+    if (s.mccl_cpu_done.load(std::memory_order_acquire) >= value) {
+        return;
+    }
     spin_wait_event(s.mccl_event, value);
 }
 
+void block_mps_on_mccl(uint64_t value) {
+    EventState& s = state();
+    MCCL_CHECK(s.initialized, "EventSync not initialized");
+    if (value == 0) {
+        return;
+    }
+    dispatch_sync(
+        (dispatch_queue_t)torch::mps::get_dispatch_queue(), ^{
+            id<MTLCommandBuffer> cmd =
+                (id<MTLCommandBuffer>)torch::mps::get_command_buffer();
+            [cmd encodeWaitForEvent:s.mccl_event value:value];
+            torch::mps::commit();
+        });
+}
+
+void signal_mccl_fence_gpu(uint64_t value) {
+    EventState& s = state();
+    MCCL_CHECK(s.initialized, "EventSync not initialized");
+
+    std::lock_guard<std::recursive_mutex> lock(mccl_device_ops_mutex());
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [s.mccl_queue commandBuffer];
+        cmd.label = @"mccl_kernel_fence";
+        [cmd encodeSignalEvent:s.fence_event value:value];
+        [cmd commit];
+    }
+}
+
+void wait_for_mccl_fence(uint64_t value) {
+    EventState& s = state();
+    MCCL_CHECK(s.initialized, "EventSync not initialized");
+    spin_wait_event(s.fence_event, value);
+}
+
+uint64_t next_mps_event_value() {
+    return state().mps_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+uint64_t next_fence_event_value() {
+    return state().fence_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+uint64_t next_mccl_event_value() {
+    return state().mccl_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 uint64_t next_event_value() {
-    return state().counter.fetch_add(1) + 1;
+    return next_mps_event_value();
+}
+
+uint64_t publish_collective_release(bool overlap_comm) {
+    if (!overlap_comm || !event_sync_available()) {
+        return 0;
+    }
+    uint64_t v = next_mccl_event_value();
+  // GPU signal: blits/reduces on MCCL queue are visible before the autograd thread
+  // resumes PyTorch MPS encode (DDP Work::wait consumer fence — NCCL stream semantics).
+    signal_mccl_done_gpu(v);
+    signal_mccl_done(v);
+    return v;
 }
 
 } // namespace mccl

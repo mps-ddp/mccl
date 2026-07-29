@@ -1,10 +1,12 @@
 #include "transport/TcpTransport.hpp"
+#include "common/CollectiveEnv.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 #include "common/Version.hpp"
 
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <thread>
 #include <algorithm>
 #include <sstream>
@@ -14,11 +16,36 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <poll.h>
 
 namespace mccl {
 
 namespace {
+
+inline int demux_pipeline_depth() {
+    auto* v = std::getenv("MCCL_PIPELINE_DEPTH");
+    long n = v ? std::atol(v) : 2;
+    return static_cast<int>(std::min(8L, std::max(1L, n)));
+}
+
+inline int demux_collective_concurrency(int world_size) {
+    return effective_collective_concurrency(world_size);
+}
+
+inline int demux_credit_window() {
+    return demux_pipeline_depth() + 2;
+}
+
+inline std::chrono::milliseconds demux_recv_timeout() {
+    if (auto* v = std::getenv("MCCL_RECV_TIMEOUT_MS")) {
+        long long ms = std::atoll(v);
+        if (ms > 0) return std::chrono::milliseconds(ms);
+    }
+    if (auto* v = std::getenv("MCCL_WATCHDOG_TIMEOUT_MS")) {
+        long long ms = std::atoll(v);
+        if (ms > 0) return std::chrono::milliseconds(ms);
+    }
+    return std::chrono::minutes(5);
+}
 
 /// Scan network interfaces for a Thunderbolt bridge.
 /// Returns the IP address string if found, empty string otherwise.
@@ -217,6 +244,26 @@ TransportConfig TransportConfig::from_env() {
     return cfg;
 }
 
+void warn_if_master_addr_unresolvable() {
+    const char* master = std::getenv("MASTER_ADDR");
+    if (!master || master[0] == '\0') return;
+    if (resolve_ipv4(master) != 0) return;  // resolves fine (numeric or DNS/mDNS)
+
+    // PyTorch's TCPStore resolves MASTER_ADDR before MCCL ever runs; it
+    // probes IPv6 first ("The IPv6 network addresses of (...) cannot be
+    // retrieved (gai error: 8)") and fails hard if IPv4 cannot resolve
+    // either.  On macOS a bare computer name often does not resolve —
+    // mDNS needs the ".local" suffix and the ComputerName/HostName/
+    // LocalHostName values can disagree (scutil --get HostName).
+    MCCL_WARN(
+        "MASTER_ADDR='%s' does not resolve to an IPv4 address on this host. "
+        "PyTorch's store will likely fail with 'gai error: 8 - nodename nor "
+        "servname provided'. Use a NUMERIC IP instead: 127.0.0.1 for "
+        "single-node, the Thunderbolt bridge IP (169.254.x.x) or LAN IP for "
+        "multi-node. Verify with: dscacheutil -q host -a name %s",
+        master, master);
+}
+
 void warn_if_mccl_port_overlaps_master(const TransportConfig& cfg) {
     const char* mp = std::getenv("MASTER_PORT");
     if (!mp) return;
@@ -238,15 +285,44 @@ TcpTransport::TcpTransport(int rank, int world_size, const TransportConfig& conf
     MCCL_CHECK(rank >= 0 && rank < world_size, "Invalid rank");
     MCCL_CHECK(world_size >= 2, "world_size must be >= 2");
 
+    recv_timeout_ = demux_recv_timeout();
+
+    if (auto* v = std::getenv("MCCL_DEMUX_PARK_BYTES")) {
+        park_limit_bytes_ = static_cast<size_t>(std::atoll(v));
+    } else {
+        const int concurrency = demux_collective_concurrency(world_size_);
+        const int cwin = demux_credit_window();
+        const size_t max_coll = demux_max_collective_bytes();
+        // In-flight bound: world_size x concurrent collectives x credit window
+        // x max bucket (+2x margin).  Scales with ws so late ranks at ws=8+
+        // can park ahead-of-schedule buckets from multiple neighbors.
+        size_t scaled = static_cast<size_t>(world_size_) *
+                        static_cast<size_t>(concurrency) *
+                        static_cast<size_t>(cwin) * max_coll * 2;
+        park_limit_bytes_ = std::min<size_t>(scaled, 2ULL << 30);
+        MCCL_INFO("Rank %d: demux park_limit=%zu bytes "
+                  "(world_size=%d concurrency=%d credit_window=%d max_collective=%zu)",
+                  rank_, park_limit_bytes_, world_size_, concurrency, cwin, max_coll);
+    }
+
     if (auto* v = std::getenv("MCCL_TRANSPORT_CRC")) {
         crc_enabled_ = (std::string(v) == "1" || std::string(v) == "true");
     }
 
+    if (static_cast<uint32_t>(config_.port_base) +
+            static_cast<uint32_t>(world_size_) > 65535u) {
+        MCCL_WARN("MCCL_PORT_BASE %u + world_size %d exceeds 65535 — "
+                  "ensure firewall allows MCCL_PORT_BASE .. +world_size-1",
+                  (unsigned)config_.port_base, world_size_);
+    }
+
     send_mu_.resize(world_size);
     recv_mu_.resize(world_size);
+    routers_.resize(world_size);
     for (int i = 0; i < world_size; i++) {
         send_mu_[i] = std::make_unique<std::mutex>();
         recv_mu_[i] = std::make_unique<std::mutex>();
+        if (i != rank) routers_[i] = std::make_unique<PeerRouter>();
     }
 
     uint16_t my_port = config_.port_base + static_cast<uint16_t>(rank);
@@ -339,6 +415,7 @@ void TcpTransport::connect_all(const std::vector<std::string>& endpoints) {
                 hs.rank = rank_;
                 hs.world_size = world_size_;
                 gethostname(hs.hostname, sizeof(hs.hostname));
+                hs.hostname[sizeof(hs.hostname) - 1] = '\0';  // gethostname may truncate without NUL
 
                 uint8_t buf[HandshakePayload::WIRE_SIZE];
                 hs.encode(buf);
@@ -351,6 +428,14 @@ void TcpTransport::connect_all(const std::vector<std::string>& endpoints) {
                 HandshakePayload ack = HandshakePayload::decode(ack_buf);
                 MCCL_CHECK(ack.protocol_version == MCCL_PROTOCOL_VERSION,
                            "Handshake ACK protocol version mismatch");
+                MCCL_CHECK(ack.world_size == world_size_,
+                           "Handshake ACK world_size mismatch: peer reports " +
+                           std::to_string(ack.world_size) + ", expected " +
+                           std::to_string(world_size_) +
+                           " (two jobs sharing MCCL_PORT_BASE?)");
+                MCCL_CHECK(ack.rank == peer,
+                           "Handshake ACK rank mismatch: expected " +
+                           std::to_string(peer) + " got " + std::to_string(ack.rank));
             }
         } catch (...) {
             outbound_error = std::current_exception();
@@ -376,6 +461,11 @@ void TcpTransport::connect_all(const std::vector<std::string>& endpoints) {
         HandshakePayload hs = HandshakePayload::decode(buf);
         MCCL_CHECK(hs.protocol_version == MCCL_PROTOCOL_VERSION,
                    "Protocol version mismatch");
+        MCCL_CHECK(hs.world_size == world_size_,
+                   "Handshake world_size mismatch: peer reports " +
+                   std::to_string(hs.world_size) + ", expected " +
+                   std::to_string(world_size_) +
+                   " (two jobs sharing MCCL_PORT_BASE?)");
         int peer = hs.rank;
         MCCL_CHECK(peer >= 0 && peer < rank_,
                    "Unexpected handshake rank " + std::to_string(peer) +
@@ -391,6 +481,7 @@ void TcpTransport::connect_all(const std::vector<std::string>& endpoints) {
         ack.rank = rank_;
         ack.world_size = world_size_;
         gethostname(ack.hostname, sizeof(ack.hostname));
+        ack.hostname[sizeof(ack.hostname) - 1] = '\0';
 
         uint8_t ack_buf[HandshakePayload::WIRE_SIZE];
         ack.encode(ack_buf);
@@ -403,6 +494,440 @@ void TcpTransport::connect_all(const std::vector<std::string>& endpoints) {
 
     MCCL_INFO("Rank %d: all %d peers connected (bidirectional handshake complete)",
               rank_, world_size_ - 1);
+
+    // Hand socket reads over to the demux readers.  RdmaTransport defers
+    // this until after its QP metadata exchange (which uses recv_msg).
+    if (auto_start_readers_) {
+        start_readers();
+    }
+}
+
+// ── Demultiplexed receive path ───────────────────────────────────────
+
+void TcpTransport::start_readers() {
+    if (readers_started_.exchange(true)) return;
+    int spawned = 0;
+    for (int p = 0; p < world_size_; p++) {
+        if (p == rank_ || !routers_[p]) continue;
+        if (!peers_[p].is_alive()) continue;
+        routers_[p]->reader = std::thread(&TcpTransport::reader_loop, this, p);
+        spawned++;
+    }
+    MCCL_INFO("Rank %d: demux readers started (%d peers, park_limit=%zu bytes)",
+              rank_, spawned, park_limit_bytes_);
+}
+
+/// Account one delivered message against a sink.  Caller holds s.mu (or the
+/// sink is not yet published).  Returns true when the sink is complete.
+/// Sets s.error on protocol violations (short message, bad chunk order).
+bool TcpTransport::sink_account_locked(PostedRecv& s, const MessageHeader& hdr) {
+    if (hdr.chunk_index != s.next_chunk) {
+        s.error = std::make_exception_ptr(ProtocolError(
+            "chunk order violation: expected chunk " + std::to_string(s.next_chunk) +
+            " got " + std::to_string(hdr.chunk_index) +
+            " (seq=" + std::to_string(hdr.seq_num) +
+            " tid=" + std::to_string(hdr.tensor_id) + ")"));
+        s.done = true;
+        return true;
+    }
+    s.next_chunk++;
+    s.received += hdr.payload_bytes;
+
+    const bool last = has_flag(static_cast<MsgFlags>(hdr.flags), MsgFlags::LAST_CHUNK);
+    if (s.received == s.nbytes) {
+        if (!last) {
+            // Sender framed more data than we expected for this op.
+            s.error = std::make_exception_ptr(ProtocolError(
+                "message complete without LAST_CHUNK (seq=" +
+                std::to_string(hdr.seq_num) + " tid=" +
+                std::to_string(hdr.tensor_id) + ")"));
+        }
+        s.done = true;
+        return true;
+    }
+    if (last) {
+        s.error = std::make_exception_ptr(ProtocolError(
+            "short message: got " + std::to_string(s.received) + " of " +
+            std::to_string(s.nbytes) + " bytes (seq=" + std::to_string(hdr.seq_num) +
+            " tid=" + std::to_string(hdr.tensor_id) + ")"));
+        s.done = true;
+        return true;
+    }
+    return false;
+}
+
+void TcpTransport::fail_router(int peer, std::exception_ptr err, bool conn_closed) {
+    PeerRouter& rt = *routers_[peer];
+    std::vector<RecvTicket> victims;
+    {
+        std::lock_guard<std::mutex> lock(rt.mu);
+        if (!rt.failed) rt.failed = err;
+        rt.conn_closed = rt.conn_closed || conn_closed;
+        for (auto& [key, dq] : rt.sinks) {
+            for (auto& s : dq) victims.push_back(s);
+        }
+        for (auto& [key, dq] : rt.p2p_sinks) {
+            for (auto& s : dq) victims.push_back(s);
+        }
+        rt.sinks.clear();
+        rt.p2p_sinks.clear();
+        rt.parked.clear();
+        rt.p2p_parked.clear();
+        rt.parked_bytes = 0;
+    }
+    for (auto& s : victims) {
+        std::lock_guard<std::mutex> slock(s->mu);
+        if (!s->done) {
+            if (conn_closed) {
+                s->conn_closed = true;
+            } else {
+                s->error = err;
+            }
+            s->done = true;
+        }
+        s->cv.notify_all();
+    }
+    if (!victims.empty()) {
+        MCCL_ERROR("Rank %d: demux router for peer %d failed %zu pending recv(s)%s",
+                   rank_, peer, victims.size(), conn_closed ? " (connection closed)" : "");
+    }
+}
+
+bool TcpTransport::route_message(int peer, const MessageHeader& hdr) {
+    PeerRouter& rt = *routers_[peer];
+    Connection& conn = peers_[peer];
+
+    const bool is_p2p = (hdr.op_type == static_cast<uint8_t>(OpType::SEND));
+    const uint64_t key = is_p2p ? static_cast<uint64_t>(hdr.tensor_id)
+                                : collective_key(hdr.seq_num, hdr.tensor_id);
+
+    // Fast path: a receive is already posted — read payload straight into
+    // the caller's buffer (zero copy).
+    RecvTicket sink;
+    size_t dst_offset = 0;
+    bool overflow = false;
+    {
+        std::lock_guard<std::mutex> lock(rt.mu);
+        auto& map = is_p2p ? rt.p2p_sinks : rt.sinks;
+        auto it = map.find(key);
+        if (it != map.end() && !it->second.empty()) {
+            sink = it->second.front();
+            std::lock_guard<std::mutex> slock(sink->mu);
+            if (sink->received + hdr.payload_bytes > sink->nbytes) {
+                overflow = true;  // fail_router below, outside both locks
+            } else {
+                dst_offset = sink->received;
+                sink->reader_busy = true;  // pin caller's buffer during the copy
+            }
+        }
+    }
+    if (overflow) {
+        fail_router(peer, std::make_exception_ptr(ProtocolError(
+            "payload overflows posted recv (seq=" + std::to_string(hdr.seq_num) +
+            " tid=" + std::to_string(hdr.tensor_id) + ")")), false);
+        return false;
+    }
+
+    if (sink) {
+        bool ok = true;
+        if (hdr.payload_bytes > 0) {
+            ok = conn.recv_all(sink->data + dst_offset, hdr.payload_bytes);
+        }
+        bool crc_ok = true;
+        if (ok && crc_enabled_ && hdr.checksum != 0 && hdr.payload_bytes > 0) {
+            crc_ok = (crc32_compute(sink->data + dst_offset, hdr.payload_bytes) ==
+                      hdr.checksum);
+        }
+
+        bool completed = false;
+        {
+            std::lock_guard<std::mutex> slock(sink->mu);
+            sink->reader_busy = false;
+            if (ok && crc_ok) {
+                completed = sink_account_locked(*sink, hdr);
+            }
+            sink->cv.notify_all();
+        }
+        if (!ok) {
+            fail_router(peer, std::make_exception_ptr(MCCLError(
+                "connection to rank " + std::to_string(peer) +
+                " closed mid-message")), true);
+            return false;
+        }
+        if (!crc_ok) {
+            fail_router(peer, std::make_exception_ptr(ProtocolError(
+                "CRC mismatch from rank " + std::to_string(peer))), false);
+            return false;
+        }
+        if (completed) {
+            std::lock_guard<std::mutex> lock(rt.mu);
+            auto& map = is_p2p ? rt.p2p_sinks : rt.sinks;
+            auto it = map.find(key);
+            if (it != map.end() && !it->second.empty() &&
+                it->second.front() == sink) {
+                it->second.pop_front();
+                if (it->second.empty()) map.erase(it);
+            }
+        }
+        return true;
+    }
+
+    // Slow path: no receive posted yet — park a copy (bounded).
+    ParkedMsg pm;
+    pm.hdr = hdr;
+    pm.payload.resize(hdr.payload_bytes);
+    if (hdr.payload_bytes > 0 &&
+        !conn.recv_all(pm.payload.data(), hdr.payload_bytes)) {
+        fail_router(peer, std::make_exception_ptr(MCCLError(
+            "connection to rank " + std::to_string(peer) +
+            " closed mid-message")), true);
+        return false;
+    }
+    if (crc_enabled_ && hdr.checksum != 0 && hdr.payload_bytes > 0 &&
+        crc32_compute(pm.payload.data(), hdr.payload_bytes) != hdr.checksum) {
+        fail_router(peer, std::make_exception_ptr(ProtocolError(
+            "CRC mismatch from rank " + std::to_string(peer))), false);
+        return false;
+    }
+
+    bool park_overflow = false;
+    RecvTicket late_sink;
+    bool late_completed = false;
+    {
+        std::lock_guard<std::mutex> lock(rt.mu);
+        // Re-check the sink map: a post_recv may have registered between our
+        // first lookup and now (it found no parked data then, so it would
+        // wait forever if we parked this message).  Deliver directly under
+        // rt.mu — safe: this thread is the only reader for the connection,
+        // so no concurrent zero-copy fill can be in flight for this sink.
+        auto& map = is_p2p ? rt.p2p_sinks : rt.sinks;
+        auto sit = map.find(key);
+        if (sit != map.end() && !sit->second.empty()) {
+            late_sink = sit->second.front();
+            std::lock_guard<std::mutex> slock(late_sink->mu);
+            if (late_sink->received + hdr.payload_bytes > late_sink->nbytes) {
+                park_overflow = true;  // protocol violation; fail below
+            } else {
+                if (hdr.payload_bytes > 0) {
+                    memcpy(late_sink->data + late_sink->received,
+                           pm.payload.data(), hdr.payload_bytes);
+                }
+                late_completed = sink_account_locked(*late_sink, hdr);
+                late_sink->cv.notify_all();
+            }
+            if (late_completed) {
+                sit->second.pop_front();
+                if (sit->second.empty()) map.erase(sit);
+            }
+        } else {
+            rt.parked_bytes += pm.payload.size();
+            if (rt.parked_bytes > park_limit_bytes_) {
+                park_overflow = true;
+            } else {
+                auto& pk = is_p2p ? rt.p2p_parked : rt.parked;
+                pk[key].push_back(std::move(pm));
+            }
+        }
+    }
+    if (park_overflow) {
+        fail_router(peer, std::make_exception_ptr(MCCLError(
+            "demux park limit exceeded or payload overflow (seq=" +
+            std::to_string(hdr.seq_num) + " tid=" +
+            std::to_string(hdr.tensor_id) + "): receiver desynchronized "
+            "from sender, or concurrent collectives outpacing this rank — "
+            "raise MCCL_DEMUX_PARK_BYTES or lower MCCL_COLLECTIVE_CONCURRENCY")),
+            false);
+        return false;
+    }
+    return true;
+}
+
+void TcpTransport::reader_loop(int peer) {
+    MCCL_DEBUG("Rank %d: reader for peer %d started", rank_, peer);
+    std::vector<uint8_t> scratch;
+
+    while (true) {
+        uint8_t hdr_buf[MessageHeader::WIRE_SIZE];
+        if (!peers_[peer].recv_all(hdr_buf, MessageHeader::WIRE_SIZE)) {
+            // EOF or socket shutdown.  Quiet during intentional shutdown.
+            if (!shut_down_.load()) {
+                MCCL_WARN("Rank %d: connection from rank %d closed", rank_, peer);
+            }
+            fail_router(peer, std::make_exception_ptr(MCCLError(
+                "connection to rank " + std::to_string(peer) + " closed")), true);
+            return;
+        }
+
+        MessageHeader hdr = MessageHeader::decode(hdr_buf);
+
+        if (!hdr.version_ok()) {
+            fail_router(peer, std::make_exception_ptr(ProtocolError(
+                "Received protocol version " + std::to_string(hdr.protocol_version) +
+                ", expected " + std::to_string(MCCL_PROTOCOL_VERSION))), false);
+            return;
+        }
+        if (hdr.op_type == static_cast<uint8_t>(OpType::ABORT)) {
+            fail_router(peer, std::make_exception_ptr(MCCLError(
+                "Received ABORT from rank " + std::to_string(peer))), false);
+            return;
+        }
+        if (hdr.op_type == static_cast<uint8_t>(OpType::HEARTBEAT)) {
+            if (hdr.payload_bytes > 0) {
+                scratch.resize(hdr.payload_bytes);
+                if (!peers_[peer].recv_all(scratch.data(), hdr.payload_bytes)) {
+                    fail_router(peer, std::make_exception_ptr(MCCLError(
+                        "connection to rank " + std::to_string(peer) + " closed")), true);
+                    return;
+                }
+            }
+            continue;
+        }
+
+        if (!route_message(peer, hdr)) {
+            return;  // fatal already recorded by route_message
+        }
+    }
+}
+
+RecvTicket TcpTransport::post_recv(int peer_rank, OpType op, uint32_t seq,
+                                   uint32_t tid, void* data, size_t nbytes) {
+    auto t = std::make_shared<PostedRecv>();
+    t->peer = peer_rank;
+    t->op = op;
+    t->seq = seq;
+    t->tid = tid;
+    t->data = static_cast<uint8_t*>(data);
+    t->nbytes = nbytes;
+    t->kind = 0;
+
+    if (nbytes == 0) {
+        // No empty messages on the wire by protocol invariant.
+        t->done = true;
+        return t;
+    }
+
+    MCCL_CHECK(readers_started_.load(),
+               "post_recv before demux readers started");
+    MCCL_CHECK(peer_rank >= 0 && peer_rank < world_size_ && peer_rank != rank_,
+               "post_recv: invalid peer " + std::to_string(peer_rank));
+
+    PeerRouter& rt = *routers_[peer_rank];
+    const bool is_p2p = (op == OpType::SEND || op == OpType::RECV);
+    const uint64_t key = is_p2p ? static_cast<uint64_t>(tid)
+                                : collective_key(seq, tid);
+
+    std::lock_guard<std::mutex> lock(rt.mu);
+
+    if (rt.failed || rt.conn_closed) {
+        if (rt.conn_closed) {
+            t->conn_closed = true;
+        } else {
+            t->error = rt.failed;
+        }
+        t->done = true;
+        return t;
+    }
+
+    // Drain any messages that arrived before this post (sender raced ahead).
+    // The ticket is not yet published, so no lock on t->mu is needed.
+    auto& pk = is_p2p ? rt.p2p_parked : rt.parked;
+    auto pit = pk.find(key);
+    if (pit != pk.end()) {
+        auto& dq = pit->second;
+        while (!dq.empty() && !t->done) {
+            ParkedMsg& pm = dq.front();
+            if (t->received + pm.hdr.payload_bytes > t->nbytes) {
+                t->error = std::make_exception_ptr(ProtocolError(
+                    "parked payload overflows posted recv (seq=" +
+                    std::to_string(seq) + " tid=" + std::to_string(tid) + ")"));
+                t->done = true;
+                break;
+            }
+            if (pm.hdr.payload_bytes > 0) {
+                memcpy(t->data + t->received, pm.payload.data(),
+                       pm.hdr.payload_bytes);
+            }
+            rt.parked_bytes -= pm.payload.size();
+            sink_account_locked(*t, pm.hdr);  // sets done when complete
+            dq.pop_front();
+        }
+        if (dq.empty()) pk.erase(pit);
+    }
+
+    if (!t->done) {
+        auto& map = is_p2p ? rt.p2p_sinks : rt.sinks;
+        map[key].push_back(t);
+    }
+    return t;
+}
+
+bool TcpTransport::wait_recv(const RecvTicket& ticket) {
+    MCCL_CHECK(ticket != nullptr, "wait_recv: null ticket");
+    const auto deadline = std::chrono::steady_clock::now() + recv_timeout_;
+    std::unique_lock<std::mutex> lk(ticket->mu);
+    while (true) {
+        if ((ticket->done || ticket->conn_closed) && !ticket->reader_busy) {
+            break;
+        }
+        if (ticket->cv.wait_until(lk, deadline, [&] {
+                return (ticket->done || ticket->conn_closed) && !ticket->reader_busy;
+            })) {
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw MCCLError(
+                "wait_recv timed out after " +
+                std::to_string(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        recv_timeout_).count()) +
+                "ms (peer=" + std::to_string(ticket->peer) +
+                " seq=" + std::to_string(ticket->seq) +
+                " tid=" + std::to_string(ticket->tid) +
+                " received=" + std::to_string(ticket->received) + "/" +
+                std::to_string(ticket->nbytes) + ")");
+        }
+    }
+    if (ticket->error) std::rethrow_exception(ticket->error);
+    if (ticket->received < ticket->nbytes) {
+        if (ticket->conn_closed) return false;
+        throw MCCLError(
+            "wait_recv: incomplete message (received " +
+            std::to_string(ticket->received) + "/" +
+            std::to_string(ticket->nbytes) + " bytes, peer=" +
+            std::to_string(ticket->peer) + " seq=" +
+            std::to_string(ticket->seq) + " tid=" +
+            std::to_string(ticket->tid) + ")");
+    }
+    return true;
+}
+
+void TcpTransport::fail_recvs_for_seq(uint32_t seq, const std::string& reason) {
+    auto err = std::make_exception_ptr(MCCLError(
+        "receive cancelled (seq=" + std::to_string(seq) + "): " + reason));
+    for (int p = 0; p < world_size_; p++) {
+        if (p == rank_ || !routers_[p]) continue;
+        PeerRouter& rt = *routers_[p];
+        std::vector<RecvTicket> victims;
+        {
+            std::lock_guard<std::mutex> lock(rt.mu);
+            for (auto it = rt.sinks.begin(); it != rt.sinks.end();) {
+                if (static_cast<uint32_t>(it->first >> 32) == seq) {
+                    for (auto& s : it->second) victims.push_back(s);
+                    it = rt.sinks.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto& s : victims) {
+            std::lock_guard<std::mutex> slock(s->mu);
+            if (!s->done) {
+                s->error = err;
+                s->done = true;
+            }
+            s->cv.notify_all();
+        }
+    }
 }
 
 bool TcpTransport::is_peer_connected(int peer_rank) const {
@@ -490,9 +1015,8 @@ bool TcpTransport::send_chunks(int peer_rank, OpType op, uint32_t seq,
                                uint32_t tensor_id, const void* data, size_t nbytes) {
     std::lock_guard<std::mutex> lock(send_mu_for(peer_rank));
 
-    MCCL_CHECK(nbytes <= static_cast<size_t>(UINT32_MAX),
-               "Payload too large for TCP header (" + std::to_string(nbytes) +
-               " bytes, max " + std::to_string(UINT32_MAX) + ")");
+    // No total-size cap: only the per-chunk payload must fit the u32 header
+    // field, and chunks are bounded by config_.chunk_bytes below.
 
     // Always chunk to config_.chunk_bytes. A single writev with hundreds of MB
     // (default when CRC was off) hits ENOBUFS on macOS TCP during DDP broadcast.
@@ -541,305 +1065,21 @@ bool TcpTransport::send_chunks(int peer_rank, OpType op, uint32_t seq,
 
 bool TcpTransport::recv_chunks(int peer_rank, OpType op, uint32_t seq,
                                uint32_t tensor_id, void* data, size_t nbytes) {
-    std::lock_guard<std::mutex> lock(recv_mu_for(peer_rank));
-
-    // Point-to-point operations (SEND/RECV) match on tensor_id (the user tag)
-    // rather than on seq_num.  The sender's per-rank sequence counter cannot be
-    // predicted by the receiver when workloads are asymmetric between ranks.
-    const bool is_p2p = (op == OpType::SEND || op == OpType::RECV);
-
-    uint8_t* p = static_cast<uint8_t*>(data);
-    size_t received = 0;
-
-    while (received < nbytes) {
-        size_t remaining = nbytes - received;
-        // Match send_chunks: each message is at most chunk_bytes (required when CRC is off).
-        size_t max_chunk = std::min(config_.chunk_bytes, remaining);
-
-        MessageHeader hdr{};
-        if (!recv_msg_locked(peer_rank, hdr, p + received, max_chunk)) {
-            return false;
-        }
-
-        // For p2p: sender always writes OpType::SEND; accept either direction.
-        if (is_p2p) {
-            MCCL_CHECK(hdr.op_type == static_cast<uint8_t>(OpType::SEND),
-                       "Expected SEND optype for p2p recv, got " +
-                       std::to_string(static_cast<int>(hdr.op_type)));
-            MCCL_CHECK(hdr.tensor_id == tensor_id,
-                       "Tag mismatch in p2p recv: expected " +
-                       std::to_string(tensor_id) + " got " +
-                       std::to_string(hdr.tensor_id));
-        } else {
-            MCCL_CHECK(hdr.op_type == static_cast<uint8_t>(op),
-                       "Unexpected op type in recv_chunks");
-            MCCL_CHECK(hdr.seq_num == seq, "Sequence number mismatch: expected " +
-                       std::to_string(seq) + " got " + std::to_string(hdr.seq_num));
-        }
-
-        received += hdr.payload_bytes;
-
-        if (has_flag(static_cast<MsgFlags>(hdr.flags), MsgFlags::LAST_CHUNK)) {
-            break;
-        }
-    }
-
-    MCCL_CHECK(received == nbytes, "Short receive: got " +
-               std::to_string(received) + " expected " + std::to_string(nbytes));
-    return true;
+    // Demultiplexed: register a sink for (op, seq, tid) and block until the
+    // reader thread fills it.  Routing replaces the old in-line matching;
+    // op/seq/tid mismatches now surface as parked-data timeouts or chunk
+    // order errors instead of consuming another op's message.
+    RecvTicket t = post_recv(peer_rank, op, seq, tensor_id, data, nbytes);
+    return wait_recv(t);
 }
 
-// ── Overlapped send+recv via poll() ─────────────────────────────────
-
-bool TcpTransport::send_recv_overlap(
-    int send_peer, OpType send_op, uint32_t send_seq, uint32_t send_tid,
-    const void* send_data, size_t send_nbytes,
-    int recv_peer, OpType recv_op, uint32_t recv_seq, uint32_t recv_tid,
-    void* recv_data, size_t recv_nbytes) {
-
-    MCCL_CHECK(send_nbytes <= static_cast<size_t>(UINT32_MAX),
-               "send_recv_overlap: send payload too large");
-    MCCL_CHECK(recv_nbytes <= static_cast<size_t>(UINT32_MAX),
-               "send_recv_overlap: recv payload too large");
-
-    if (send_nbytes == 0 && recv_nbytes == 0) return true;
-
-    if (send_nbytes == 0) {
-        return recv_chunks(recv_peer, recv_op, recv_seq, recv_tid,
-                           recv_data, recv_nbytes);
-    }
-    if (recv_nbytes == 0) {
-        return send_chunks(send_peer, send_op, send_seq, send_tid,
-                           send_data, send_nbytes);
-    }
-
-    // For very large payloads, fall back to threaded blocking send+recv.
-    // The poll loop can handle multi-GB transfers on macOS but above 8GB we
-    // switch to the proven blocking path with a background send thread.
-    constexpr size_t OVERLAP_THRESHOLD = 1ULL << 33; // 8 GB
-    if (send_nbytes > OVERLAP_THRESHOLD || recv_nbytes > OVERLAP_THRESHOLD) {
-        MCCL_INFO("send_recv_overlap: payload %zu/%zu exceeds 8GB, using threaded blocking fallback",
-                  send_nbytes, recv_nbytes);
-
-        std::atomic<bool> send_ok{false};
-        std::thread send_thread([&]() {
-            send_ok = send_chunks(send_peer, send_op, send_seq, send_tid,
-                                  send_data, send_nbytes);
-        });
-
-        bool recv_ok = recv_chunks(recv_peer, recv_op, recv_seq, recv_tid,
-                                   recv_data, recv_nbytes);
-        send_thread.join();
-
-        return send_ok.load() && recv_ok;
-    }
-
-    // Lock both directions. When send_peer == recv_peer, these are
-    // still different mutexes (send_mu vs recv_mu).
-    std::lock_guard<std::mutex> send_lock(send_mu_for(send_peer));
-    std::lock_guard<std::mutex> recv_lock(recv_mu_for(recv_peer));
-
-    Connection& send_conn = conn_for(send_peer);
-    Connection& recv_conn = conn_for(recv_peer);
-
-    if (!send_conn.is_alive() || !recv_conn.is_alive()) {
-        MCCL_ERROR("send_recv_overlap: dead connection (send_peer=%d recv_peer=%d)",
-                   send_peer, recv_peer);
-        return false;
-    }
-
-    // Build send header
-    MessageHeader send_hdr{};
-    send_hdr.protocol_version = MCCL_PROTOCOL_VERSION;
-    send_hdr.op_type = static_cast<uint8_t>(send_op);
-    send_hdr.flags = static_cast<uint8_t>(MsgFlags::LAST_CHUNK);
-    send_hdr.seq_num = send_seq;
-    send_hdr.tensor_id = send_tid;
-    send_hdr.chunk_index = 0;
-    send_hdr.payload_bytes = static_cast<uint32_t>(send_nbytes);
-    send_hdr.checksum = crc_enabled_ ? crc32_compute(send_data, send_nbytes) : 0;
-
-    uint8_t send_hdr_buf[MessageHeader::WIRE_SIZE];
-    send_hdr.encode(send_hdr_buf);
-
-    // Send-side state: header then payload
-    const uint8_t* send_bufs[2] = {
-        send_hdr_buf,
-        static_cast<const uint8_t*>(send_data)
-    };
-    size_t send_lens[2] = { MessageHeader::WIRE_SIZE, send_nbytes };
-    int send_phase = 0;
-    size_t send_off = 0;
-
-    // Recv-side state: header then payload
-    uint8_t recv_hdr_buf[MessageHeader::WIRE_SIZE];
-    uint8_t* recv_bufs[2] = {
-        recv_hdr_buf,
-        static_cast<uint8_t*>(recv_data)
-    };
-    size_t recv_lens[2] = { MessageHeader::WIRE_SIZE, recv_nbytes };
-    int recv_phase = 0;
-    size_t recv_off = 0;
-
-    bool send_done = false;
-    bool recv_done = false;
-
-    int send_fd = send_conn.fd();
-    int recv_fd = recv_conn.fd();
-
-    send_conn.set_nonblocking();
-    if (recv_fd != send_fd) {
-        recv_conn.set_nonblocking();
-    }
-
-    size_t total_sent = 0, total_recvd = 0;
-    size_t send_total = MessageHeader::WIRE_SIZE + send_nbytes;
-    size_t recv_total = MessageHeader::WIRE_SIZE + recv_nbytes;
-
-    while (!send_done || !recv_done) {
-        struct pollfd pfds[2];
-        int nfds = 0;
-        int send_pfd_idx = -1, recv_pfd_idx = -1;
-
-        if (!send_done) {
-            send_pfd_idx = nfds;
-            pfds[nfds].fd = send_fd;
-            pfds[nfds].events = POLLOUT;
-            pfds[nfds].revents = 0;
-            nfds++;
-        }
-        if (!recv_done) {
-            if (recv_fd == send_fd && send_pfd_idx >= 0) {
-                pfds[send_pfd_idx].events |= POLLIN;
-                recv_pfd_idx = send_pfd_idx;
-            } else {
-                recv_pfd_idx = nfds;
-                pfds[nfds].fd = recv_fd;
-                pfds[nfds].events = POLLIN;
-                pfds[nfds].revents = 0;
-                nfds++;
-            }
-        }
-
-        int ready = ::poll(pfds, nfds, 60000);
-        if (ready < 0) {
-            if (errno == EINTR) continue;
-            MCCL_ERROR("send_recv_overlap: poll() failed: %s", strerror(errno));
-            send_conn.set_blocking();
-            if (recv_fd != send_fd) recv_conn.set_blocking();
-            return false;
-        }
-        if (ready == 0) {
-            MCCL_ERROR("send_recv_overlap: poll() timed out");
-            send_conn.set_blocking();
-            if (recv_fd != send_fd) recv_conn.set_blocking();
-            return false;
-        }
-
-        // Check for errors only on sockets whose direction is still active.
-        // A completed direction may report POLLHUP (remote closed send half)
-        // which is benign -- only flag errors on in-progress transfers.
-        if (!send_done && send_pfd_idx >= 0 &&
-            (pfds[send_pfd_idx].revents & (POLLERR | POLLNVAL))) {
-            MCCL_ERROR("send_recv_overlap: send socket error fd=%d revents=0x%x",
-                       send_fd, pfds[send_pfd_idx].revents);
-            send_conn.set_blocking();
-            if (recv_fd != send_fd) recv_conn.set_blocking();
-            return false;
-        }
-        if (!recv_done && recv_pfd_idx >= 0 &&
-            (pfds[recv_pfd_idx].revents & (POLLERR | POLLNVAL))) {
-            MCCL_ERROR("send_recv_overlap: recv socket error fd=%d revents=0x%x",
-                       recv_fd, pfds[recv_pfd_idx].revents);
-            send_conn.set_blocking();
-            if (recv_fd != send_fd) recv_conn.set_blocking();
-            return false;
-        }
-
-        // Drive send
-        if (!send_done && send_pfd_idx >= 0 &&
-            (pfds[send_pfd_idx].revents & POLLOUT)) {
-            while (send_phase < 2) {
-                size_t remain = send_lens[send_phase] - send_off;
-                ssize_t n = send_conn.try_send(
-                    send_bufs[send_phase] + send_off, remain);
-                if (n < 0) {
-                    MCCL_ERROR("send_recv_overlap: send failed");
-                    send_conn.set_blocking();
-                    if (recv_fd != send_fd) recv_conn.set_blocking();
-                    return false;
-                }
-                if (n == 0) break; // EAGAIN
-                send_off += static_cast<size_t>(n);
-                if (send_off >= send_lens[send_phase]) {
-                    send_phase++;
-                    send_off = 0;
-                }
-            }
-            if (send_phase >= 2) send_done = true;
-        }
-
-        // Drive recv
-        if (!recv_done && recv_pfd_idx >= 0 &&
-            (pfds[recv_pfd_idx].revents & POLLIN)) {
-            while (recv_phase < 2) {
-                size_t remain = recv_lens[recv_phase] - recv_off;
-                ssize_t n = recv_conn.try_recv(
-                    recv_bufs[recv_phase] + recv_off, remain);
-                if (n < 0) {
-                    MCCL_ERROR("send_recv_overlap: recv failed (phase=%d, recvd %zu/%zu bytes total, peer=%d)",
-                               recv_phase, recv_off + (recv_phase > 0 ? recv_lens[0] : 0),
-                               recv_total, recv_peer);
-                    send_conn.set_blocking();
-                    if (recv_fd != send_fd) recv_conn.set_blocking();
-                    return false;
-                }
-                if (n == 0) break; // EAGAIN
-                recv_off += static_cast<size_t>(n);
-                if (recv_off >= recv_lens[recv_phase]) {
-                    recv_phase++;
-                    recv_off = 0;
-                }
-            }
-            if (recv_phase >= 2) recv_done = true;
-        }
-    }
-
-    // Restore blocking mode
-    send_conn.set_blocking();
-    if (recv_fd != send_fd) {
-        recv_conn.set_blocking();
-    }
-
-    MCCL_DEBUG("send_recv_overlap: sent %zu recv %zu bytes (send_peer=%d recv_peer=%d)",
-               send_total, recv_total, send_peer, recv_peer);
-
-    // Validate received header
-    MessageHeader recv_hdr = MessageHeader::decode(recv_hdr_buf);
-
-    if (!recv_hdr.version_ok()) {
-        throw ProtocolError("send_recv_overlap: protocol version mismatch");
-    }
-    if (recv_hdr.op_type == static_cast<uint8_t>(OpType::ABORT)) {
-        throw MCCLError("Received ABORT from rank " + std::to_string(recv_peer));
-    }
-    MCCL_CHECK(recv_hdr.op_type == static_cast<uint8_t>(recv_op),
-               "send_recv_overlap: unexpected op type");
-    MCCL_CHECK(recv_hdr.seq_num == recv_seq,
-               "send_recv_overlap: sequence mismatch: expected " +
-               std::to_string(recv_seq) + " got " + std::to_string(recv_hdr.seq_num));
-    MCCL_CHECK(recv_hdr.payload_bytes == recv_nbytes,
-               "send_recv_overlap: payload size mismatch");
-
-    if (crc_enabled_ && recv_hdr.checksum != 0) {
-        uint32_t crc = crc32_compute(recv_data, recv_nbytes);
-        if (crc != recv_hdr.checksum) {
-            throw ProtocolError("send_recv_overlap: CRC mismatch");
-        }
-    }
-
-    return true;
-}
+// send_recv_overlap: the poll()-based duplex loop (and its threaded
+// fallback) is gone.  The Transport base-class implementation — post_recv,
+// blocking send_chunks, wait_recv — is full duplex by construction: the
+// peer's reader thread always drains incoming traffic regardless of what
+// its application threads are doing, so a blocking send can never deadlock
+// against a pending receive.  All payloads are chunk-framed (<= chunk_bytes
+// per message), which also removes the old 4 GB single-message limit.
 
 void TcpTransport::send_abort(uint32_t seq, const std::string& reason) {
     MCCL_ERROR("Rank %d: sending ABORT (seq=%u reason=%s)",
@@ -869,6 +1109,15 @@ void TcpTransport::send_abort(uint32_t seq, const std::string& reason) {
 void TcpTransport::shutdown() {
     if (shut_down_.exchange(true)) return;
 
+    // Three-step teardown so reader threads never race fd reuse:
+    // 1. shutdown(2) every socket — wakes readers blocked in recv()
+    //    (fds stay valid, so an in-flight recv targets the right socket);
+    // 2. join the readers (they fail their pending sinks and exit);
+    // 3. close the fds.
+    for (auto& c : peers_) c.shutdown_socket();
+    for (auto& rt : routers_) {
+        if (rt && rt->reader.joinable()) rt->reader.join();
+    }
     for (auto& c : peers_) c.close();
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);

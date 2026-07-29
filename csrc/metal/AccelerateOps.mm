@@ -2,6 +2,7 @@
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 
+#include <ATen/ATen.h>
 #include <Accelerate/Accelerate.h>
 #include <dispatch/dispatch.h>
 #include <vector>
@@ -199,6 +200,78 @@ void cpu_reduce_op(float* dst, const float* src, int64_t count,
         default:
             throw MCCLError("Unsupported ReduceOp for CPU path: " +
                             std::to_string(static_cast<int>(op)));
+    }
+}
+
+namespace {
+
+template <typename T>
+void integral_reduce(T* dst, const T* src, int64_t count,
+                     c10d::ReduceOp::RedOpType op) {
+    switch (op) {
+        case c10d::ReduceOp::SUM:
+        case c10d::ReduceOp::AVG:
+            for (int64_t i = 0; i < count; ++i) dst[i] += src[i];
+            break;
+        case c10d::ReduceOp::MIN:
+            for (int64_t i = 0; i < count; ++i) dst[i] = std::min(dst[i], src[i]);
+            break;
+        case c10d::ReduceOp::MAX:
+            for (int64_t i = 0; i < count; ++i) dst[i] = std::max(dst[i], src[i]);
+            break;
+        case c10d::ReduceOp::PRODUCT:
+            for (int64_t i = 0; i < count; ++i) dst[i] *= src[i];
+            break;
+        default:
+            throw MCCLError("Unsupported ReduceOp for integral CPU path");
+    }
+}
+
+template <typename T>
+void integral_scale(T* buf, int64_t count, float scale) {
+    for (int64_t i = 0; i < count; ++i) {
+        buf[i] = static_cast<T>(static_cast<float>(buf[i]) * scale);
+    }
+}
+
+} // namespace
+
+void cpu_reduce_op_integral(void* dst, const void* src, int64_t count,
+                            at::ScalarType dtype, c10d::ReduceOp::RedOpType op) {
+    switch (dtype) {
+        case at::kBool:
+            integral_reduce(static_cast<uint8_t*>(dst),
+                            static_cast<const uint8_t*>(src), count, op);
+            break;
+        case at::kInt:
+            integral_reduce(static_cast<int32_t*>(dst),
+                            static_cast<const int32_t*>(src), count, op);
+            break;
+        case at::kLong:
+            integral_reduce(static_cast<int64_t*>(dst),
+                            static_cast<const int64_t*>(src), count, op);
+            break;
+        default:
+            throw MCCLError("cpu_reduce_op_integral: unsupported dtype " +
+                            std::string(at::toString(dtype)));
+    }
+}
+
+void cpu_scale_inplace_integral(void* buf, int64_t count, at::ScalarType dtype,
+                                float scale) {
+    switch (dtype) {
+        case at::kBool:
+            integral_scale(static_cast<uint8_t*>(buf), count, scale);
+            break;
+        case at::kInt:
+            integral_scale(static_cast<int32_t*>(buf), count, scale);
+            break;
+        case at::kLong:
+            integral_scale(static_cast<int64_t*>(buf), count, scale);
+            break;
+        default:
+            throw MCCLError("cpu_scale_inplace_integral: unsupported dtype " +
+                            std::string(at::toString(dtype)));
     }
 }
 

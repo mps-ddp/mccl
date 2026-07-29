@@ -1,8 +1,14 @@
 #include "backend/WorkMCCL.hpp"
+#include "metal/EventSync.hpp"
+#include "metal/MPSInterop.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 
+#include <torch/mps.h>
+
 namespace mccl {
+
+void note_active_overlap_release_consumed(uint64_t token);
 
 WorkMCCL::WorkMCCL(c10d::OpType opType, uint32_t seq,
                    std::vector<at::Tensor> outputTensors)
@@ -22,6 +28,8 @@ bool WorkMCCL::wait(std::chrono::milliseconds timeout) {
 
     if (completed_) {
         if (exception_) std::rethrow_exception(exception_);
+        lock.unlock();
+        wait_consumer_release();
         return success_;
     }
 
@@ -38,6 +46,8 @@ bool WorkMCCL::wait(std::chrono::milliseconds timeout) {
     }
 
     if (exception_) std::rethrow_exception(exception_);
+    lock.unlock();
+    wait_consumer_release();
     return success_;
 }
 
@@ -82,23 +92,79 @@ void WorkMCCL::markComplete() {
         if (completed_) return;
         completed_ = true;
         success_ = true;
-        finishWorkMCCLFuture();
     }
+    finishWorkMCCLFuture();
     cv_.notify_all();
     MCCL_TRACE("WorkMCCL seq=%u completed successfully", seq_);
 }
 
 void WorkMCCL::markError(std::exception_ptr err) {
+    std::string msg = "unknown exception";
+    if (err) {
+        try {
+            std::rethrow_exception(err);
+        } catch (const std::exception& e) {
+            msg = e.what();
+        } catch (...) {
+            msg = "non-standard exception";
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (completed_) return;
         completed_ = true;
         success_ = false;
         exception_ = std::move(err);
-        finishWorkMCCLFuture();
     }
+    finishWorkMCCLFuture();
     cv_.notify_all();
-    MCCL_ERROR("WorkMCCL seq=%u failed with error", seq_);
+    MCCL_ERROR("WorkMCCL seq=%u failed: %s", seq_, msg.c_str());
+}
+
+void WorkMCCL::set_release_token(uint64_t token) {
+    release_token_.store(token, std::memory_order_release);
+}
+
+void WorkMCCL::stash_tensors(std::vector<at::Tensor> tensors) {
+    if (tensors.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    stashed_tensors_.insert(stashed_tensors_.end(),
+                            std::make_move_iterator(tensors.begin()),
+                            std::make_move_iterator(tensors.end()));
+}
+
+void WorkMCCL::wait_consumer_release() {
+    if (release_waited_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    const uint64_t token = release_token_.load(std::memory_order_acquire);
+    if (token > 0) {
+        block_mps_on_mccl(token);
+        wait_for_mccl(token);
+        note_active_overlap_release_consumed(token);
+        std::lock_guard<std::mutex> lock(mutex_);
+        stashed_tensors_.clear();
+        return;
+    }
+    if (event_sync_available()) {
+        mccl_queue_drain();
+        std::lock_guard<std::mutex> lock(mutex_);
+        stashed_tensors_.clear();
+        return;
+    }
+    for (const auto& t : outputs_) {
+        if (t.defined() && t.is_mps()) {
+            torch::mps::synchronize();
+            std::lock_guard<std::mutex> lock(mutex_);
+            stashed_tensors_.clear();
+            return;
+        }
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    stashed_tensors_.clear();
 }
 
 } // namespace mccl

@@ -34,6 +34,16 @@ class MCCLConfig:
     gpu_threshold: int = 4096
     shader_path: str = ""
     overlap_comm: bool = True
+    ring_algo: str = "auto"          # "auto" (chunked), "chunked", "basic"
+    ring_pipeline: bool = True       # streaming TX/RX ring (off = lock-step debug)
+    pipeline_depth: int = 2          # posted-ahead receives per pipeline (1-8)
+    collective_concurrency: int = 2  # ws>=3 collectives in flight (1-4)
+    demux_park_bytes: int = 512 * 1024 * 1024  # per-peer unmatched-message bound
+    credit_min_chunk: int = 1024 * 1024  # credit flow control floor (0 = off)
+    fp32_cpu_reduce: bool = False    # vDSP fp32 reduce in unified memory
+    cpu_write_sync: str = "auto"     # "auto" (none) or "full" (debug)
+    event_sync: bool = True          # MTLSharedEvent sync path
+    link_profile: str = ""           # "" or "thunderbolt"
 
     # ── Compression ──────────────────────────────────────────────────
     compression: str = "none"
@@ -44,6 +54,9 @@ class MCCLConfig:
     heartbeat_interval_ms: int = 5000
     max_queue_depth: int = 1024
     log_level: str = "WARN"
+
+    # Integration hint (not exported to MCCL C++ env).
+    ddp_bucket_mb: int = 25
 
     # ── env var name ↔ field mapping ─────────────────────────────────
 
@@ -63,6 +76,16 @@ class MCCLConfig:
             "MCCL_GPU_THRESHOLD": "gpu_threshold",
             "MCCL_SHADER_PATH": "shader_path",
             "MCCL_OVERLAP_COMM": "overlap_comm",
+            "MCCL_RING_ALGO": "ring_algo",
+            "MCCL_RING_PIPELINE": "ring_pipeline",
+            "MCCL_PIPELINE_DEPTH": "pipeline_depth",
+            "MCCL_COLLECTIVE_CONCURRENCY": "collective_concurrency",
+            "MCCL_DEMUX_PARK_BYTES": "demux_park_bytes",
+            "MCCL_CREDIT_MIN_CHUNK": "credit_min_chunk",
+            "MCCL_FP32_CPU_REDUCE": "fp32_cpu_reduce",
+            "MCCL_CPU_WRITE_SYNC": "cpu_write_sync",
+            "MCCL_EVENT_SYNC": "event_sync",
+            "MCCL_LINK_PROFILE": "link_profile",
             "MCCL_COMPRESSION": "compression",
             "MCCL_TOPK_RATIO": "topk_ratio",
             "MCCL_WATCHDOG_TIMEOUT_MS": "watchdog_timeout_ms",
@@ -84,6 +107,27 @@ class MCCLConfig:
             raise ValueError(
                 f"compression must be one of {sorted(valid_compressions)}, "
                 f"got {self.compression!r}"
+            )
+        valid_ring_algos = {"auto", "chunked", "basic", "ring", "plain"}
+        if self.ring_algo not in valid_ring_algos:
+            raise ValueError(
+                f"ring_algo must be one of {sorted(valid_ring_algos)}, "
+                f"got {self.ring_algo!r}"
+            )
+        if not (1 <= self.pipeline_depth <= 8):
+            raise ValueError(
+                f"pipeline_depth must be in [1, 8], got {self.pipeline_depth}"
+            )
+        if not (1 <= self.collective_concurrency <= 4):
+            raise ValueError(
+                f"collective_concurrency must be in [1, 4], "
+                f"got {self.collective_concurrency}"
+            )
+        valid_cpu_write_sync = {"auto", "none", "full"}
+        if self.cpu_write_sync not in valid_cpu_write_sync:
+            raise ValueError(
+                f"cpu_write_sync must be one of {sorted(valid_cpu_write_sync)}, "
+                f"got {self.cpu_write_sync!r}"
             )
         valid_log_levels = {"TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL", "OFF"}
         if self.log_level.upper() not in valid_log_levels:
@@ -141,7 +185,12 @@ class MCCLConfig:
     # ── Export ────────────────────────────────────────────────────────
 
     def to_env(self) -> Dict[str, str]:
-        """Write all values into ``os.environ`` and return the mapping."""
+        """Write all values into ``os.environ`` and return the mapping.
+
+        Fields whose value means "use the built-in default" ("auto"/"") are
+        skipped and any user-set env var is left untouched — exporting a
+        default config must not clobber explicit user environment settings.
+        """
         out: Dict[str, str] = {}
         for env_key, field_name in self._ENV_MAP.items():
             val = getattr(self, field_name)
@@ -149,11 +198,9 @@ class MCCLConfig:
                 s = "1" if val else "0"
             else:
                 s = str(val)
-            if s and s != "auto" and s != "":
+            if s and s != "auto":
                 os.environ[env_key] = s
                 out[env_key] = s
-            elif env_key in os.environ:
-                del os.environ[env_key]
         return out
 
     def to_dict(self) -> Dict[str, Any]:
@@ -163,6 +210,41 @@ class MCCLConfig:
             for f in dataclasses.fields(self)
             if f.name != "_ENV_MAP"
         }
+
+    @classmethod
+    def for_world_size(
+        cls,
+        world_size: int,
+        *,
+        mode: str = "lab",
+        link_profile: str = "",
+    ) -> "MCCLConfig":
+        """Return defaults (world-size invariant). Optional perf mode or link profile."""
+        del world_size  # invariant across N
+        cfg = cls()
+        if link_profile:
+            cfg.link_profile = link_profile
+        if mode == "perf":
+            cfg.ring_algo = "chunked"
+            cfg.collective_concurrency = 3
+            cfg.pipeline_depth = 3
+        return cfg
+
+    def apply_to_env(self, only_if_unset: bool = True) -> Dict[str, str]:
+        """Write profile into os.environ; skip keys already set when only_if_unset."""
+        out: Dict[str, str] = {}
+        for env_key, field_name in self._ENV_MAP.items():
+            if only_if_unset and os.environ.get(env_key) is not None:
+                continue
+            val = getattr(self, field_name)
+            if isinstance(val, bool):
+                s = "1" if val else "0"
+            else:
+                s = str(val)
+            if s and s != "auto":
+                os.environ[env_key] = s
+                out[env_key] = s
+        return out
 
     def __str__(self) -> str:
         lines = ["MCCLConfig("]

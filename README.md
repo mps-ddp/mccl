@@ -126,7 +126,29 @@ Bench plots were TCP over a Thunderbolt-style link, not RDMA. Wi‑Fi/Ethernet w
 
 On Apple Silicon, **CPU and GPU use the same physical RAM** (unified memory architecture, **UMA**). Many MPS tensors sit in Metal **`MTLBuffer`** storage marked **shared**: the CPU can take a pointer (`buffer.contents`, see `extract_mps_buffer` in `MPSInterop.mm`) into the **same bytes** the GPU is using. MCCL uses that for send staging, receive `memcpy`, and **Accelerate/vDSP** work in `AccelerateOps.mm` without allocating a second host copy. For **fp32** + shared storage, ring **allreduce** **accumulates in place** into the tensor slice: inbound chunks hit a small recv buffer, then **vDSP** (`AccelerateOps.mm`) folds them into the **same** `cpu_ptr` the GPU uses, not a second full host tensor. **Private** GPU storage uses staging blits (`chunked_blit_*`) and **Metal** for the reduce path instead.
 
-Network and staging run on a **background queue** (`ProgressEngine`, `csrc/runtime/`). **`commit_mps_and_signal`** / **`wait_for_mps`** (`EventSync.mm`) wait on a **Metal shared event** tied to PyTorch’s MPS command buffer so the worker does not read tensor memory while the GPU is still writing. `MCCL_EVENT_SYNC=0` disables that path and uses a stream sync instead. `ProcessGroupMCCL.cpp` wires jobs into the engine. More detail: [docs/DEVELOPING.md](docs/DEVELOPING.md).
+Network and staging run on a **background queue** (`ProgressEngine`, `csrc/runtime/`). **`commit_mps_and_signal`** / **`wait_for_mps`** (`EventSync.mm`) wait on a **Metal shared event** tied to PyTorch’s MPS command buffer so the worker does not read tensor memory while the GPU is still writing. On the Metal reduce path, ring steps are fenced with a dedicated GPU-signaled shared event (`signal_mccl_fence_gpu`) so reduced chunks are never staged onto the wire before their kernel completes. `MCCL_EVENT_SYNC=0` disables the event path and uses a stream sync instead. `ProcessGroupMCCL.cpp` wires jobs into the engine. More detail: [docs/DEVELOPING.md](docs/DEVELOPING.md).
+
+## Tuning knobs (env vars)
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MCCL_RING_ALGO` | `chunked` | `chunked` = Gloo-style double-buffered ring (2P chunks). `basic` = plain ring. |
+| `MCCL_RING_PIPELINE` | on | Streaming TX/RX ring pipeline (NCCL-style): both link directions + reduce busy concurrently. `0` = lock-step fallback (debug). |
+| `MCCL_PIPELINE_DEPTH` | `2` | Receives posted ahead per ring pipeline (1-8). |
+| `MCCL_COLLECTIVE_CONCURRENCY` | `2` | ws>=3 collectives in flight (1-4); buckets overlap on the wire via the demux transport. |
+| `MCCL_DEMUX_PARK_BYTES` | 512 MB | Per-peer bound on messages buffered before their receive is posted (headroom only — credits bound the steady state). |
+| `MCCL_CREDIT_MIN_CHUNK` | 1 MB | Chunks at or above this engage NCCL-style credit flow control: a sender runs at most `depth+2` steps ahead of its consumer, so a slow/late rank is never flooded. `0` disables. |
+| `MCCL_FP32_CPU_REDUCE` | off | fp32 reductions via vDSP directly in unified memory (often higher allreduce busbw). |
+| `MCCL_CPU_WRITE_SYNC` | `none` | `full` restores a full `torch.mps.synchronize()` after CPU-path collectives (debugging only; serializes buckets). |
+| `MCCL_EVENT_SYNC` | on | `0` disables MTLSharedEvent sync (falls back to blocking stream sync; kills overlap). |
+| `MCCL_LINK_PROFILE` | unset | `thunderbolt` = 16 MB transport chunks. |
+| `MCCL_CHUNK_BYTES`, `MCCL_SOCK_BUFSIZE`, `MCCL_TCP_LOWAT` | — | transport sizing (see `Connection.cpp`). |
+| `MCCL_COMPRESSION` / `MCCL_TOPK_RATIO` | none | `fp16` or `topk` gradient compression (size-prefixed exact-payload framing). |
+| `MCCL_WATCHDOG_TIMEOUT_MS` | PG timeout | hang detector; the clock starts when an op begins executing, not when it is queued. |
+
+Removed: `MCCL_SYNC_MODE=coalesced` (corrupted DDP gradients) and `MCCL_ALLREDUCE_ALGO` (dead). Both now warn and are ignored.
+
+Benchmarks: `python tests/bench_busbw.py` reports NCCL-style algbw/busbw per size plus a compute/comm overlap-efficiency figure.
 
 ## License
 

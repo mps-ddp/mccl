@@ -68,6 +68,15 @@ struct __attribute__((packed)) MessageHeader {
 static_assert(sizeof(MessageHeader) == MessageHeader::WIRE_SIZE,
               "MessageHeader must be exactly WIRE_SIZE bytes");
 
+// The wire protocol memcpy's packed host-order structs: it is only valid
+// between little-endian peers (all Apple Silicon / x86 hosts).  Make the
+// assumption explicit so a big-endian port fails at compile time instead of
+// corrupting traffic.
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+              "MCCL wire protocol requires a little-endian host");
+#endif
+
 /// CRC32 (ISO 3309) for payload integrity.
 /// Uses ARM CRC32 hardware instructions when available (Apple Silicon),
 /// with a table-based fallback.

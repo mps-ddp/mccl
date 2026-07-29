@@ -16,8 +16,9 @@ std::string Rendezvous::endpoint_key(int rank) {
     return "mccl/endpoint/" + std::to_string(rank);
 }
 
-std::string Rendezvous::barrier_key(const std::string& tag, int rank) {
-    return "mccl/barrier/" + tag + "/" + std::to_string(rank);
+std::string Rendezvous::barrier_key(const std::string& tag, uint64_t epoch, int rank) {
+    return "mccl/barrier/" + tag + "/" + std::to_string(epoch) + "/" +
+           std::to_string(rank);
 }
 
 std::vector<std::string> Rendezvous::exchange_endpoints(const std::string& my_endpoint) {
@@ -56,13 +57,22 @@ std::vector<std::string> Rendezvous::exchange_endpoints(const std::string& my_en
 }
 
 void Rendezvous::barrier(const std::string& tag) {
-    std::string key = barrier_key(tag, rank_);
+    // Epoch makes the barrier reusable: without it, a second barrier with the
+    // same tag returns immediately for every rank because the keys from the
+    // first barrier still exist in the store.
+    uint64_t epoch;
+    {
+        std::lock_guard<std::mutex> lock(barrier_mu_);
+        epoch = barrier_epochs_[tag]++;
+    }
+
+    std::string key = barrier_key(tag, epoch, rank_);
     std::vector<uint8_t> val = {1};
     store_->set(key, val);
 
     for (int r = 0; r < world_size_; r++) {
         if (r == rank_) continue;
-        std::string peer_key = barrier_key(tag, r);
+        std::string peer_key = barrier_key(tag, epoch, r);
         try {
             store_->wait({peer_key}, timeout_);
             store_->get(peer_key);

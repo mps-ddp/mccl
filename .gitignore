@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+*.egg
+
+# Build / install trees (setuptools, editable installs)
+build/
+dist/
+develop-eggs/
+sdist/
+wheels/
+*.whl
+
+# MCCL extension + Metal build outputs (copied beside mccl/_C*.so)
+mccl/_C*.so
+mccl/mccl_shaders.metallib
+mccl/*.air
+
+# Virtual envs
+.venv/
+venv/
+ENV/
+env/
+
+# Test / lint caches
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

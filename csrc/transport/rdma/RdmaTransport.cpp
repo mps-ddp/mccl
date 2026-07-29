@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <thread>
 
 namespace mccl {
@@ -20,6 +21,10 @@ bool RdmaTransport::is_available() {
 
 RdmaTransport::RdmaTransport(int rank, int world_size, const TransportConfig& config)
     : tcp_(std::make_unique<TcpTransport>(rank, world_size, config)) {
+    // The QP metadata exchange below uses raw tcp_->recv_msg, which is only
+    // valid before the demux readers own the sockets.  Defer reader startup
+    // until the exchange is done.
+    tcp_->set_auto_start_readers(false);
     MCCL_INFO("RdmaTransport: rank=%d world_size=%d", rank, world_size);
 }
 
@@ -30,12 +35,53 @@ RdmaTransport::~RdmaTransport() {
 void RdmaTransport::connect_all(const std::vector<std::string>& endpoints) {
     tcp_->connect_all(endpoints);
     try_init_rdma();
+    tcp_->start_readers();
 
     if (rdma_active_.load(std::memory_order_acquire)) {
         MCCL_INFO("RdmaTransport rank %d: RDMA active on all peers", rank());
     } else {
         MCCL_INFO("RdmaTransport rank %d: falling back to TCP", rank());
     }
+}
+
+// ── Posted receives ──────────────────────────────────────────────────
+//
+// RDMA receives are connection-lockstep (single QP, ordered), so they
+// cannot be demultiplexed like TCP.  post_recv records the parameters and
+// wait_recv executes the transfer lazily under the per-peer RDMA mutex.
+// When RDMA is inactive (or the connection died), posts delegate straight
+// to the TCP demux, which IS fully asynchronous.
+
+RecvTicket RdmaTransport::post_recv(int peer_rank, OpType op, uint32_t seq,
+                                    uint32_t tid, void* data, size_t nbytes) {
+    if (rdma_active_.load(std::memory_order_acquire) &&
+        peer_rank < static_cast<int>(connections_.size()) &&
+        connections_[peer_rank].ok()) {
+        auto t = std::make_shared<PostedRecv>();
+        t->peer = peer_rank;
+        t->op = op;
+        t->seq = seq;
+        t->tid = tid;
+        t->data = static_cast<uint8_t*>(data);
+        t->nbytes = nbytes;
+        t->kind = 1;  // lazy RDMA, executed in wait_recv
+        return t;
+    }
+    return tcp_->post_recv(peer_rank, op, seq, tid, data, nbytes);
+}
+
+bool RdmaTransport::wait_recv(const RecvTicket& ticket) {
+    if (!ticket || ticket->kind != 1) {
+        return tcp_->wait_recv(ticket);
+    }
+    if (ticket->nbytes == 0) return true;
+    // Execute the lazy RDMA receive now (ordered per peer by rdma_mu_).
+    return recv_chunks(ticket->peer, ticket->op, ticket->seq, ticket->tid,
+                       ticket->data, ticket->nbytes);
+}
+
+void RdmaTransport::cancel_recvs(uint32_t seq, const std::string& reason) {
+    tcp_->cancel_recvs(seq, reason);
 }
 
 // ── RDMA initialization via TCP side channel ────────────────────────
@@ -58,6 +104,7 @@ void RdmaTransport::try_init_rdma() {
     connections_.resize(ws);
     peer_bufs_.resize(ws);
     rdma_mu_.resize(ws);
+    completed_wrs_.assign(ws, {});
 
     for (int i = 0; i < ws; i++) {
         rdma_mu_[i] = std::make_unique<std::mutex>();
@@ -78,8 +125,9 @@ void RdmaTransport::try_init_rdma() {
             break;
         }
 
-        peer_bufs_[peer].send_buf = SharedBuffer(kRdmaBufSize);
-        peer_bufs_[peer].recv_buf = SharedBuffer(kRdmaBufSize);
+        // kPipelineDepth slots per direction for overlapped transfers.
+        peer_bufs_[peer].send_buf = SharedBuffer(kPipelineDepth * kRdmaBufSize);
+        peer_bufs_[peer].recv_buf = SharedBuffer(kPipelineDepth * kRdmaBufSize);
 
         if (!peer_bufs_[peer].send_buf.data() || !peer_bufs_[peer].recv_buf.data()) {
             MCCL_WARN("RdmaTransport: buffer allocation failed for peer %d", peer);
@@ -169,9 +217,20 @@ void RdmaTransport::try_init_rdma() {
 
 // ── CQ polling helper ───────────────────────────────────────────────
 
-bool RdmaTransport::poll_completion(RdmaConnection& conn, uint64_t expected_wr_id) {
+bool RdmaTransport::poll_completion(int peer_rank, RdmaConnection& conn,
+                                    uint64_t expected_wr_id) {
+    auto& completed = completed_wrs_[peer_rank];
+
+    // Already observed while polling for a different wr_id?
+    auto it = completed.find(expected_wr_id);
+    if (it != completed.end()) {
+        completed.erase(it);
+        return true;
+    }
+
     ibv_wc wc[kCqPollBatchSize];
     constexpr int kMaxEmptyPolls = 1000000;
+    constexpr int kSpinPolls = 4096;  // hot-spin budget before backing off
     int empty_polls = 0;
 
     while (true) {
@@ -186,10 +245,17 @@ bool RdmaTransport::poll_completion(RdmaConnection& conn, uint64_t expected_wr_i
                            (unsigned long long)expected_wr_id);
                 return false;
             }
-            std::this_thread::yield();
+            // Spin briefly for latency, then yield, then sleep: the engine
+            // threads share performance cores with vDSP reductions.
+            if (empty_polls > kSpinPolls * 8) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            } else if (empty_polls > kSpinPolls) {
+                std::this_thread::yield();
+            }
             continue;
         }
         empty_polls = 0;
+        bool found = false;
         for (int i = 0; i < n; i++) {
             if (wc[i].status != IBV_WC_SUCCESS) {
                 MCCL_ERROR("RdmaTransport: WC error status=%d wr_id=%llu",
@@ -197,62 +263,110 @@ bool RdmaTransport::poll_completion(RdmaConnection& conn, uint64_t expected_wr_i
                 return false;
             }
             if (wc[i].wr_id == expected_wr_id) {
-                return true;
+                found = true;
+            } else {
+                // Send and recv share one CQ: a completion for the other
+                // direction can drain first.  Buffer it — discarding it
+                // (the old behavior) made the later poll for that wr_id
+                // spin out and desynchronize the peers.
+                completed.insert(wc[i].wr_id);
             }
-            MCCL_WARN("RdmaTransport: discarding unexpected completion wr_id=%llu (expected %llu)",
-                       (unsigned long long)wc[i].wr_id, (unsigned long long)expected_wr_id);
         }
+        if (found) return true;
     }
 }
 
 // ── RDMA data path ──────────────────────────────────────────────────
+//
+// Pipelined: up to kPipelineDepth work requests in flight per direction,
+// each on its own buffer slot.  The previous one-WR-at-a-time lockstep
+// (memcpy → post → spin → memcpy) gated throughput on per-chunk round-trip
+// latency instead of link bandwidth.
 
-bool RdmaTransport::rdma_send(int peer_rank, const void* data, size_t nbytes) {
+int RdmaTransport::rdma_send(int peer_rank, const void* data, size_t nbytes) {
     auto& bufs = peer_bufs_[peer_rank];
     auto& conn = connections_[peer_rank];
-    size_t offset = 0;
-    uint64_t seq = 0;
 
-    while (offset < nbytes) {
-        size_t chunk = std::min(nbytes - offset, kRdmaBufSize);
-        std::memcpy(bufs.send_buf.data(),
-                    static_cast<const uint8_t*>(data) + offset,
-                    chunk);
+    const uint64_t nchunks =
+        nbytes == 0 ? 0 : (nbytes + kRdmaBufSize - 1) / kRdmaBufSize;
+    uint64_t next_post = 0;     // next chunk index to post
+    uint64_t next_complete = 0; // oldest in-flight chunk index
 
-        uint64_t wr_id = (seq << 1) | 0;  // bit 0 = 0 for send
-        ibv_sge sge = bufs.send_buf.to_sge(bufs.send_mr, 0,
-                                            static_cast<uint32_t>(chunk));
-        if (!conn.post_send(sge, wr_id)) return false;
-        if (!poll_completion(conn, wr_id)) return false;
+    while (next_complete < nchunks) {
+        // Fill the pipeline.  Slot (idx % depth) is free because its previous
+        // occupant (idx - depth) has completed (we retire oldest-first).
+        while (next_post < nchunks &&
+               next_post - next_complete < static_cast<uint64_t>(kPipelineDepth)) {
+            size_t off = next_post * kRdmaBufSize;
+            size_t chunk = std::min(nbytes - off, kRdmaBufSize);
+            size_t slot_off = (next_post % kPipelineDepth) * kRdmaBufSize;
 
-        offset += chunk;
-        seq++;
+            std::memcpy(static_cast<uint8_t*>(bufs.send_buf.data()) + slot_off,
+                        static_cast<const uint8_t*>(data) + off, chunk);
+
+            uint64_t wr_id = (next_post << 1) | 0;  // bit 0 = 0 for send
+            ibv_sge sge = bufs.send_buf.to_sge(bufs.send_mr, slot_off,
+                                               static_cast<uint32_t>(chunk));
+            if (!conn.post_send(sge, wr_id)) return next_post == 0 ? 0 : -1;
+            next_post++;
+        }
+
+        uint64_t wr_id = (next_complete << 1) | 0;
+        if (!poll_completion(peer_rank, conn, wr_id)) return -1;
+        next_complete++;
     }
-    return true;
+    return 1;
 }
 
-bool RdmaTransport::rdma_recv(int peer_rank, void* data, size_t nbytes) {
+int RdmaTransport::rdma_recv(int peer_rank, void* data, size_t nbytes) {
     auto& bufs = peer_bufs_[peer_rank];
     auto& conn = connections_[peer_rank];
-    size_t offset = 0;
-    uint64_t seq = 0;
 
-    while (offset < nbytes) {
-        size_t chunk = std::min(nbytes - offset, kRdmaBufSize);
+    const uint64_t nchunks =
+        nbytes == 0 ? 0 : (nbytes + kRdmaBufSize - 1) / kRdmaBufSize;
+    uint64_t next_post = 0;
+    uint64_t next_complete = 0;
 
-        uint64_t wr_id = (seq << 1) | 1;  // bit 0 = 1 for recv
-        ibv_sge sge = bufs.recv_buf.to_sge(bufs.recv_mr, 0,
-                                            static_cast<uint32_t>(chunk));
-        if (!conn.post_recv(sge, wr_id)) return false;
-        if (!poll_completion(conn, wr_id)) return false;
+    // Pre-post receives so the sender never hits receiver-not-ready.
+    while (next_post < nchunks &&
+           next_post - next_complete < static_cast<uint64_t>(kPipelineDepth)) {
+        size_t off = next_post * kRdmaBufSize;
+        size_t chunk = std::min(nbytes - off, kRdmaBufSize);
+        size_t slot_off = (next_post % kPipelineDepth) * kRdmaBufSize;
 
-        std::memcpy(static_cast<uint8_t*>(data) + offset,
-                    bufs.recv_buf.data(), chunk);
-
-        offset += chunk;
-        seq++;
+        uint64_t wr_id = (next_post << 1) | 1;  // bit 0 = 1 for recv
+        ibv_sge sge = bufs.recv_buf.to_sge(bufs.recv_mr, slot_off,
+                                           static_cast<uint32_t>(chunk));
+        if (!conn.post_recv(sge, wr_id)) return next_post == 0 ? 0 : -1;
+        next_post++;
     }
-    return true;
+
+    while (next_complete < nchunks) {
+        uint64_t wr_id = (next_complete << 1) | 1;
+        if (!poll_completion(peer_rank, conn, wr_id)) return -1;
+
+        size_t off = next_complete * kRdmaBufSize;
+        size_t chunk = std::min(nbytes - off, kRdmaBufSize);
+        size_t slot_off = (next_complete % kPipelineDepth) * kRdmaBufSize;
+        std::memcpy(static_cast<uint8_t*>(data) + off,
+                    static_cast<uint8_t*>(bufs.recv_buf.data()) + slot_off,
+                    chunk);
+        next_complete++;
+
+        // Refill: the slot just drained is free again.
+        if (next_post < nchunks) {
+            size_t poff = next_post * kRdmaBufSize;
+            size_t pchunk = std::min(nbytes - poff, kRdmaBufSize);
+            size_t pslot_off = (next_post % kPipelineDepth) * kRdmaBufSize;
+
+            uint64_t pwr_id = (next_post << 1) | 1;
+            ibv_sge sge = bufs.recv_buf.to_sge(bufs.recv_mr, pslot_off,
+                                               static_cast<uint32_t>(pchunk));
+            if (!conn.post_recv(sge, pwr_id)) return -1;
+            next_post++;
+        }
+    }
+    return 1;
 }
 
 // ── Transport interface ─────────────────────────────────────────────
@@ -264,10 +378,17 @@ bool RdmaTransport::send_chunks(int peer_rank, OpType op, uint32_t seq,
         peer_rank < static_cast<int>(connections_.size()) &&
         connections_[peer_rank].ok()) {
         std::lock_guard<std::mutex> lock(*rdma_mu_[peer_rank]);
-        if (rdma_send(peer_rank, data, nbytes)) return true;
+        int rc = rdma_send(peer_rank, data, nbytes);
+        if (rc == 1) return true;
         MCCL_WARN("RdmaTransport: RDMA send failed for peer %d, marking connection down",
                    peer_rank);
         connections_[peer_rank].destroy();
+        if (rc == -1) {
+            // Mid-transfer failure: the peer may have consumed some chunks.
+            // Retrying from byte 0 over TCP would desynchronize the stream.
+            MCCL_ERROR("RdmaTransport: send failed mid-transfer — aborting op");
+            return false;
+        }
     }
     return tcp_->send_chunks(peer_rank, op, seq, tensor_id, data, nbytes);
 }
@@ -279,10 +400,15 @@ bool RdmaTransport::recv_chunks(int peer_rank, OpType op, uint32_t seq,
         peer_rank < static_cast<int>(connections_.size()) &&
         connections_[peer_rank].ok()) {
         std::lock_guard<std::mutex> lock(*rdma_mu_[peer_rank]);
-        if (rdma_recv(peer_rank, data, nbytes)) return true;
+        int rc = rdma_recv(peer_rank, data, nbytes);
+        if (rc == 1) return true;
         MCCL_WARN("RdmaTransport: RDMA recv failed for peer %d, marking connection down",
                    peer_rank);
         connections_[peer_rank].destroy();
+        if (rc == -1) {
+            MCCL_ERROR("RdmaTransport: recv failed mid-transfer — aborting op");
+            return false;
+        }
     }
     return tcp_->recv_chunks(peer_rank, op, seq, tensor_id, data, nbytes);
 }
@@ -355,25 +481,36 @@ bool RdmaTransport::send_recv_overlap(
             }
         }
 
+        // Any failure past this point may leave the two ranks at different
+        // protocol offsets (the peer may have consumed chunks already).
+        // Retrying the WHOLE transfer over TCP — the old behavior — would
+        // duplicate data and desynchronize the stream.  Only fall back to
+        // TCP when nothing has been transferred yet; otherwise fail the
+        // collective and let the caller's error path abort cleanly.
+        const bool no_progress = (send_off == 0 && recv_off == 0 &&
+                                  send_seq_id == 0 && recv_seq_id == 0);
+
         if (send_posted) {
-            if (!poll_completion(send_conn, send_wr)) {
+            if (!poll_completion(send_peer, send_conn, send_wr)) {
                 MCCL_WARN("RdmaTransport: overlap send poll failed, marking connection down");
                 send_conn.destroy();
-                return tcp_->send_recv_overlap(
-                    send_peer, send_op, send_seq, send_tid, send_data, send_nbytes,
-                    recv_peer, recv_op, recv_seq, recv_tid, recv_data, recv_nbytes);
+                MCCL_ERROR("RdmaTransport: RDMA overlap failed mid-transfer "
+                           "(send_off=%zu recv_off=%zu) — aborting collective",
+                           send_off, recv_off);
+                return false;
             }
             send_off += send_chunk;
             send_seq_id++;
         }
 
         if (recv_posted) {
-            if (!poll_completion(recv_conn, recv_wr)) {
+            if (!poll_completion(recv_peer, recv_conn, recv_wr)) {
                 MCCL_WARN("RdmaTransport: overlap recv poll failed, marking connection down");
                 recv_conn.destroy();
-                return tcp_->send_recv_overlap(
-                    send_peer, send_op, send_seq, send_tid, send_data, send_nbytes,
-                    recv_peer, recv_op, recv_seq, recv_tid, recv_data, recv_nbytes);
+                MCCL_ERROR("RdmaTransport: RDMA overlap failed mid-transfer "
+                           "(send_off=%zu recv_off=%zu) — aborting collective",
+                           send_off, recv_off);
+                return false;
             }
             std::memcpy(static_cast<uint8_t*>(recv_data) + recv_off,
                         recv_bufs.recv_buf.data(), recv_chunk);
@@ -383,13 +520,20 @@ bool RdmaTransport::send_recv_overlap(
 
         if (!send_posted && !recv_posted) {
             // Both post operations failed without a prior destroy() — the QP
-            // returned an ibv error (e.g. work queue full).  We cannot continue
-            // the RDMA transfer; fall back to TCP to complete the operation.
-            MCCL_WARN("RdmaTransport: both post_send and post_recv failed, "
-                      "falling back to TCP for remainder of transfer");
-            return tcp_->send_recv_overlap(
-                send_peer, send_op, send_seq, send_tid, send_data, send_nbytes,
-                recv_peer, recv_op, recv_seq, recv_tid, recv_data, recv_nbytes);
+            // returned an ibv error (e.g. work queue full).
+            if (no_progress) {
+                MCCL_WARN("RdmaTransport: post_send/post_recv failed before any "
+                          "transfer, falling back to TCP");
+                send_conn.destroy();
+                if (recv_peer != send_peer) recv_conn.destroy();
+                return tcp_->send_recv_overlap(
+                    send_peer, send_op, send_seq, send_tid, send_data, send_nbytes,
+                    recv_peer, recv_op, recv_seq, recv_tid, recv_data, recv_nbytes);
+            }
+            MCCL_ERROR("RdmaTransport: RDMA posts failed mid-transfer — aborting collective");
+            send_conn.destroy();
+            if (recv_peer != send_peer) recv_conn.destroy();
+            return false;
         }
     }
 

@@ -1,0 +1,126 @@
+"""Shared subprocess harness for MCCL distributed tests.
+
+Spawns ``world_size`` python subprocesses, each initializing the MCCL
+process group and executing the source of a given function ``fn(rank,
+world_size)``.  Workers run with hard timeouts so a hang fails the test
+instead of wedging CI.
+"""
+
+import inspect
+import itertools
+import os
+import random
+import subprocess
+import sys
+import textwrap
+import time
+
+# Each call grabs a fresh port window to avoid TIME_WAIT / parallel-pytest collisions.
+# MCCL_PORT_BASE = port + 100; ranks listen on port_base .. port_base+world_size-1.
+_port_counter = itertools.count(0)
+_PORT_LO = 22000
+_PORT_MAX = 65400  # port + 100 + world_size must stay <= 65535
+_PORT_BUCKET = 200  # min gap between sequential tests (master + mccl listeners)
+
+
+def next_port() -> int:
+    n = next(_port_counter)
+    pid_off = (os.getpid() % 64) * 800
+    seq_off = (n % 80) * _PORT_BUCKET
+    jitter = random.randint(0, 19)
+    span = _PORT_MAX - _PORT_LO
+    return _PORT_LO + (pid_off + seq_off + jitter) % span
+
+
+def _submit_job_mccl_env(bucket_mb: int = 25) -> dict[str, str]:
+    return {
+        "MCCL_OVERLAP_COMM": "1",
+        "MCCL_RING_ALGO": "ring_chunked",
+        "MCCL_RING_PIPELINE": "0",
+        "MCCL_COLLECTIVE_CONCURRENCY": "2",
+        "MCCL_MAX_COLLECTIVE_CONCURRENCY": "8",
+        "MCCL_PIPELINE_DEPTH": "2",
+        "MCCL_DEMUX_MAX_COLLECTIVE_BYTES": str(int(bucket_mb) * 1024 * 1024),
+    }
+
+
+def run_workers(
+    fn,
+    world_size: int = 2,
+    *,
+    port: int | None = None,
+    env: dict | None = None,
+    timeout: float = 180.0,
+    expect_failure: bool = False,
+):
+    """Run ``fn(rank, world_size)`` in ``world_size`` subprocesses.
+
+    env: extra environment variables (e.g. {"MCCL_RING_ALGO": "basic"}).
+    expect_failure: assert that at least one worker exits non-zero.
+    """
+    if port is None:
+        port = next_port()
+
+    src = textwrap.dedent(inspect.getsource(fn))
+    fn_name = fn.__name__
+    env_lines = ""
+    for k, v in (env or {}).items():
+        env_lines += f"os.environ[{k!r}] = {v!r}\n"
+
+    script = (
+        "import os, sys, torch, torch.distributed as dist\n"
+        "os.environ['MASTER_ADDR'] = '127.0.0.1'\n"
+        f"os.environ['MASTER_PORT'] = '{port}'\n"
+        "os.environ['MCCL_LISTEN_ADDR'] = '127.0.0.1'\n"
+        f"os.environ['MCCL_PORT_BASE'] = '{port + 100}'\n"
+        "os.environ.setdefault('MCCL_LOG_LEVEL', 'INFO')\n"
+        f"{env_lines}"
+        "rank = int(sys.argv[1])\n"
+        "world_size = int(sys.argv[2])\n"
+        "import mccl\n"
+        "dist.init_process_group(backend='mccl', rank=rank, world_size=world_size, "
+        "device_id=torch.device('mps:0'))\n"
+        "try:\n"
+        f"{textwrap.indent(src, '    ')}"
+        f"    {fn_name}(rank, world_size)\n"
+        "finally:\n"
+        "    if dist.is_initialized():\n"
+        "        dist.destroy_process_group()\n"
+        "os._exit(0)  # success only — avoids MCCL atexit hang; failures above skip this\n"
+    )
+
+    procs = []
+    for r in range(world_size):
+        p = subprocess.Popen(
+            [sys.executable, "-c", script, str(r), str(world_size)],
+            env={**os.environ},
+        )
+        procs.append(p)
+        time.sleep(0.15)
+
+    codes = []
+    deadline = time.monotonic() + timeout
+    try:
+        for p in procs:
+            remaining = max(1.0, deadline - time.monotonic())
+            try:
+                codes.append(p.wait(timeout=remaining))
+            except subprocess.TimeoutExpired:
+                for q in procs:
+                    if q.poll() is None:
+                        q.kill()
+                raise AssertionError(
+                    f"Worker hung past {timeout}s timeout (likely deadlock)"
+                )
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+
+    if expect_failure:
+        assert any(c != 0 for c in codes), (
+            f"Expected at least one worker to fail, all exited 0: {codes}"
+        )
+    else:
+        assert all(c == 0 for c in codes), f"Worker exit codes: {codes}"
+    return codes

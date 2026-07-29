@@ -13,9 +13,9 @@ export BATCH_SIZE="${BATCH_SIZE:-128}"
 # Override explicitly for multi-node (e.g. BASELINE_BATCH_SIZE=$((BATCH_SIZE*2))).
 export BASELINE_BATCH_SIZE="${BASELINE_BATCH_SIZE:-$((BATCH_SIZE * 2))}"
 
-# DDP: many allreduce buckets per backward — each needs a GPU barrier. FULL is required.
-# Explicit default so a stale shell MCCL_SYNC_MODE=coalesced cannot break multi-bucket runs.
-export MCCL_SYNC_MODE="${MCCL_SYNC_MODE:-full}"
+# MCCL_SYNC_MODE was removed in v0.4 (always per-collective sync now); drop any
+# stale value from the shell so the warn-and-ignore path stays quiet.
+unset MCCL_SYNC_MODE 2>/dev/null || true
 
 # Model dims: ddp_dummy_train.py defaults to a small MLP (no env needed).
 # For ~1B-param stress: MCCL_STRESS_MODEL=1 bash examples/compare_single_vs_ddp.sh

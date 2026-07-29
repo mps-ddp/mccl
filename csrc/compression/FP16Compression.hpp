@@ -18,7 +18,8 @@ public:
 
     size_t compress(const void* src, size_t nbytes,
                     void* dst, size_t dst_capacity,
-                    at::ScalarType dtype) override;
+                    at::ScalarType dtype,
+                    uint64_t stable_id = 0) override;
 
     void decompress(const void* src, size_t compressed_size,
                     void* dst, size_t nbytes,

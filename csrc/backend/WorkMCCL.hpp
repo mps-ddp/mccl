@@ -7,6 +7,7 @@
 
 #include <condition_variable>
 #include <exception>
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -28,16 +29,27 @@ public:
     void markComplete();
     void markError(std::exception_ptr err);
 
+    /// Set by the engine thread before markComplete (overlap consumer release token).
+    void set_release_token(uint64_t token);
+
+    /// Hold async-reduce staging tensors until ``wait()`` (NCCL TensorShelf).
+    void stash_tensors(std::vector<at::Tensor> tensors);
+
     uint32_t seq() const { return seq_; }
 
 private:
     void finishWorkMCCLFuture();
+    /// Autograd / DDP thread: wait until collective output is visible on MPS.
+    void wait_consumer_release();
 
     uint32_t seq_;
+    std::atomic<uint64_t> release_token_{0};
+    std::atomic<bool> release_waited_{false};
     bool completed_ = false;
     bool success_ = false;
     std::exception_ptr exception_;
     std::vector<at::Tensor> outputs_;
+    std::vector<at::Tensor> stashed_tensors_;
     c10::intrusive_ptr<at::ivalue::Future> future_;
 
     // mutable so that const methods (isSuccess, exception) can acquire the lock

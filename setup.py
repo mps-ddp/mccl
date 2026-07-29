@@ -75,7 +75,7 @@ class MCCLBuildExt(build_ext):
             ext.extra_link_args = ext.extra_link_args or []
 
             cpp_flags = [
-                "-std=c++17",
+                "-std=c++20",
                 "-O3",
                 "-flto=thin",
                 "-Wall",

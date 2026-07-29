@@ -39,10 +39,10 @@ at::Tensor read_float_mps(const at::Tensor& tensor, std::vector<float>& buf) {
     at::Tensor cpu = tensor;
     if (tensor.is_mps()) {
         mps_stream_sync();
-        if (tensor_cpu_accessible(tensor)) {
-            auto view = extract_mps_buffer(tensor);
-            buf.resize(view.nbytes / sizeof(float));
-            std::memcpy(buf.data(), view.cpu_ptr, view.nbytes);
+        if (void* ptr = shared_cpu_data_ptr(tensor)) {
+            const size_t nbytes = static_cast<size_t>(tensor.numel()) * sizeof(float);
+            buf.resize(nbytes / sizeof(float));
+            std::memcpy(buf.data(), ptr, nbytes);
             return tensor;
         }
         cpu = tensor.detach().cpu().contiguous();
@@ -56,10 +56,12 @@ at::Tensor read_float_mps(const at::Tensor& tensor, std::vector<float>& buf) {
 
 void write_float_mps(const std::vector<float>& buf, at::Tensor& out) {
     if (out.is_mps()) {
-        if (tensor_cpu_accessible(out)) {
-            auto view = extract_mps_buffer(out);
-            MCCL_CHECK(view.nbytes == buf.size() * sizeof(float), "stft: nbytes mismatch");
-            std::memcpy(view.cpu_ptr, buf.data(), view.nbytes);
+        if (void* ptr = shared_cpu_data_ptr(out)) {
+            const size_t nbytes = buf.size() * sizeof(float);
+            MCCL_CHECK(
+                nbytes == static_cast<size_t>(out.numel()) * sizeof(float),
+                "stft: nbytes mismatch");
+            std::memcpy(ptr, buf.data(), nbytes);
             mps_stream_sync_after_cpu_mps_buffer_write();
             return;
         }
@@ -77,8 +79,39 @@ const float* waveform_ptr(const at::Tensor& tensor, std::vector<float>& owned) {
     if (tensor.is_cpu() && tensor.is_contiguous()) {
         return tensor.data_ptr<float>();
     }
+    if (tensor.is_mps()) {
+        mps_stream_sync();
+        if (void* ptr = shared_cpu_data_ptr(tensor)) {
+            return static_cast<const float*>(ptr);
+        }
+    }
     read_float_mps(tensor, owned);
     return owned.data();
+}
+
+const float* window_ptr(const at::Tensor& window, std::vector<float>& owned) {
+    if (window.is_cpu() && window.is_contiguous()) {
+        return window.data_ptr<float>();
+    }
+    if (window.is_mps()) {
+        mps_stream_sync();
+        if (void* ptr = shared_cpu_data_ptr(window)) {
+            return static_cast<const float*>(ptr);
+        }
+    }
+    read_float_mps(window, owned);
+    return owned.data();
+}
+
+void fill_complex_spec(
+    c10::complex<float>* out,
+    const std::vector<float>& re,
+    const std::vector<float>& im,
+    int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        out[static_cast<size_t>(i)] =
+            c10::complex<float>(re[static_cast<size_t>(i)], im[static_cast<size_t>(i)]);
+    }
 }
 
 at::Tensor make_complex_spec(
@@ -97,18 +130,32 @@ at::Tensor make_complex_spec(
     at::Tensor spec = at::empty({batch, n_freq, n_frames}, options);
 
     if (device.is_cpu()) {
-        auto* out = reinterpret_cast<c10::complex<float>*>(spec.data_ptr());
-        for (int64_t i = 0; i < n; ++i) {
-            out[static_cast<size_t>(i)] = c10::complex<float>(re[static_cast<size_t>(i)], im[static_cast<size_t>(i)]);
-        }
+        fill_complex_spec(
+            reinterpret_cast<c10::complex<float>*>(spec.data_ptr()),
+            re,
+            im,
+            n);
+        return spec;
+    }
+
+    if (tensor_cpu_accessible(spec)) {
+        void* ptr = shared_cpu_data_ptr(spec);
+        MCCL_CHECK(ptr != nullptr, "stft: unified spec buffer missing cpu_ptr");
+        fill_complex_spec(
+            reinterpret_cast<c10::complex<float>*>(ptr),
+            re,
+            im,
+            n);
+        mps_stream_sync_after_cpu_mps_buffer_write();
         return spec;
     }
 
     at::Tensor cpu_spec = at::empty({batch, n_freq, n_frames}, at::TensorOptions().dtype(at::kComplexFloat));
-    auto* out = reinterpret_cast<c10::complex<float>*>(cpu_spec.data_ptr());
-    for (int64_t i = 0; i < n; ++i) {
-        out[static_cast<size_t>(i)] = c10::complex<float>(re[static_cast<size_t>(i)], im[static_cast<size_t>(i)]);
-    }
+    fill_complex_spec(
+        reinterpret_cast<c10::complex<float>*>(cpu_spec.data_ptr()),
+        re,
+        im,
+        n);
     spec.copy_(cpu_spec.to(device));
     return spec;
 }
@@ -117,16 +164,48 @@ void read_complex_spec(
     const at::Tensor& spec,
     std::vector<float>& re,
     std::vector<float>& im) {
-    at::Tensor cpu = spec.is_mps() ? spec.detach().cpu() : spec.contiguous();
-    MCCL_CHECK(cpu.scalar_type() == at::kComplexFloat, "stft: spec must be complex64");
-    const int64_t n = cpu.numel();
+    MCCL_CHECK(spec.scalar_type() == at::kComplexFloat, "stft: spec must be complex64");
+    const int64_t n = spec.numel();
     re.resize(static_cast<size_t>(n));
     im.resize(static_cast<size_t>(n));
-    auto* ptr = reinterpret_cast<c10::complex<float>*>(cpu.data_ptr());
+
+    const c10::complex<float>* ptr = nullptr;
+    at::Tensor cpu;
+    if (spec.is_mps()) {
+        mps_stream_sync();
+        if (void* raw = shared_cpu_data_ptr(spec)) {
+            ptr = reinterpret_cast<const c10::complex<float>*>(raw);
+        }
+    }
+    if (ptr == nullptr) {
+        cpu = spec.is_mps() ? spec.detach().cpu() : spec.contiguous();
+        ptr = reinterpret_cast<const c10::complex<float>*>(cpu.data_ptr());
+    }
     for (int64_t i = 0; i < n; ++i) {
         re[static_cast<size_t>(i)] = ptr[static_cast<size_t>(i)].real();
         im[static_cast<size_t>(i)] = ptr[static_cast<size_t>(i)].imag();
     }
+}
+
+/// ``*out`` points at complex64 row-major ``[batch, freq, frames]`` (no re/im split).
+void complex_spec_ptr(
+    const at::Tensor& spec,
+    at::Tensor& keepalive,
+    const c10::complex<float>** out) {
+    MCCL_CHECK(spec.scalar_type() == at::kComplexFloat, "stft: spec must be complex64");
+    if (spec.is_cpu() && spec.is_contiguous()) {
+        *out = reinterpret_cast<const c10::complex<float>*>(spec.data_ptr());
+        return;
+    }
+    if (spec.is_mps()) {
+        mps_stream_sync();
+        if (void* raw = shared_cpu_data_ptr(spec)) {
+            *out = reinterpret_cast<const c10::complex<float>*>(raw);
+            return;
+        }
+    }
+    keepalive = spec.is_mps() ? spec.detach().cpu() : spec.contiguous();
+    *out = reinterpret_cast<const c10::complex<float>*>(keepalive.data_ptr());
 }
 
 } // namespace
@@ -147,7 +226,8 @@ at::Tensor stft_forward(
     std::vector<float> wav_buf;
     const float* wave_ptr = waveform_ptr(w2d, wav_buf);
 
-    at::Tensor win_cpu = window.is_mps() ? window.detach().cpu() : window.contiguous();
+    std::vector<float> win_buf;
+    const float* win_ptr = window_ptr(window, win_buf);
 
     std::vector<float> spec_re, spec_im;
     if (resolved == StftBackend::Metal) {
@@ -155,8 +235,8 @@ at::Tensor stft_forward(
             wave_ptr,
             batch,
             signal_length,
-            win_cpu.data_ptr<float>(),
-            win_cpu.size(0),
+            win_ptr,
+            window.size(0),
             params,
             spec_re,
             spec_im);
@@ -165,8 +245,8 @@ at::Tensor stft_forward(
             wave_ptr,
             batch,
             signal_length,
-            win_cpu.data_ptr<float>(),
-            win_cpu.size(0),
+            win_ptr,
+            window.size(0),
             params,
             spec_re,
             spec_im);
@@ -185,30 +265,32 @@ at::Tensor stft_backward(
     const StftBackend resolved = resolve_stft_backend(backend);
 
     const int64_t batch = grad_spec.size(0);
-    std::vector<float> gre, gim;
-    read_complex_spec(grad_spec, gre, gim);
-
-    at::Tensor win_cpu = window.is_mps() ? window.detach().cpu() : window.contiguous();
-
+    std::vector<float> win_buf;
+    const float* win_ptr = window_ptr(window, win_buf);
     std::vector<float> grad_wav;
+
     if (resolved == StftBackend::Metal) {
+        std::vector<float> gre, gim;
+        read_complex_spec(grad_spec, gre, gim);
         stft_backward_metal(
             gre.data(),
             gim.data(),
             batch,
             signal_length,
-            win_cpu.data_ptr<float>(),
-            win_cpu.size(0),
+            win_ptr,
+            window.size(0),
             params,
             grad_wav);
     } else {
-        stft_backward_vdsp(
-            gre.data(),
-            gim.data(),
+        at::Tensor spec_keepalive;
+        const c10::complex<float>* spec_cplx = nullptr;
+        complex_spec_ptr(grad_spec, spec_keepalive, &spec_cplx);
+        stft_backward_vdsp_cplx(
+            reinterpret_cast<const std::complex<float>*>(spec_cplx),
             batch,
             signal_length,
-            win_cpu.data_ptr<float>(),
-            win_cpu.size(0),
+            win_ptr,
+            window.size(0),
             params,
             grad_wav);
     }
@@ -241,31 +323,33 @@ at::Tensor istft_forward(
     const int64_t batch = spec.size(0);
     const int64_t n_frames = spec.size(2);
 
-    std::vector<float> sre, sim;
-    read_complex_spec(spec, sre, sim);
-
-    at::Tensor win_cpu = window.is_mps() ? window.detach().cpu() : window.contiguous();
-
+    std::vector<float> win_buf;
+    const float* win_ptr = window_ptr(window, win_buf);
     std::vector<float> wav;
+
     if (resolved == StftBackend::Metal) {
+        std::vector<float> sre, sim;
+        read_complex_spec(spec, sre, sim);
         istft_forward_metal(
             sre.data(),
             sim.data(),
             batch,
             n_frames,
-            win_cpu.data_ptr<float>(),
-            win_cpu.size(0),
+            win_ptr,
+            window.size(0),
             params,
             length,
             wav);
     } else {
-        istft_forward_vdsp(
-            sre.data(),
-            sim.data(),
+        at::Tensor spec_keepalive;
+        const c10::complex<float>* spec_cplx = nullptr;
+        complex_spec_ptr(spec, spec_keepalive, &spec_cplx);
+        istft_forward_vdsp_cplx(
+            reinterpret_cast<const std::complex<float>*>(spec_cplx),
             batch,
             n_frames,
-            win_cpu.data_ptr<float>(),
-            win_cpu.size(0),
+            win_ptr,
+            window.size(0),
             params,
             length,
             wav);
@@ -295,7 +379,8 @@ at::Tensor istft_backward(
     std::vector<float> gw;
     const float* gw_ptr = waveform_ptr(w2d, gw);
 
-    at::Tensor win_cpu = window.is_mps() ? window.detach().cpu() : window.contiguous();
+    std::vector<float> win_buf;
+    const float* win_ptr = window_ptr(window, win_buf);
 
     std::vector<float> gspec_re, gspec_im;
     if (resolved == StftBackend::Metal) {
@@ -303,8 +388,8 @@ at::Tensor istft_backward(
             gw_ptr,
             batch,
             signal_length,
-            win_cpu.data_ptr<float>(),
-            win_cpu.size(0),
+            win_ptr,
+            window.size(0),
             params,
             n_frames,
             gspec_re,
@@ -314,8 +399,8 @@ at::Tensor istft_backward(
             gw_ptr,
             batch,
             signal_length,
-            win_cpu.data_ptr<float>(),
-            win_cpu.size(0),
+            win_ptr,
+            window.size(0),
             params,
             n_frames,
             gspec_re,

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace mccl {
@@ -68,74 +69,33 @@ thread_local FftSetupCache g_fft;
 
 struct VdspWorkspace {
     std::vector<float> padded;
-    std::vector<float> frames;
-    std::vector<float> fft_re;
-    std::vector<float> fft_im;
     std::vector<float> acc;
     std::vector<float> wsum;
-
-    void ensure_frames(int64_t n_frames, int64_t n_fft) {
-        frames.resize(static_cast<size_t>(n_frames * n_fft));
-        if (fft_re.size() < static_cast<size_t>(n_fft)) {
-            fft_re.resize(static_cast<size_t>(n_fft));
-            fft_im.resize(static_cast<size_t>(n_fft));
-        }
-    }
+    std::vector<float> win_sq;
 };
 
 thread_local VdspWorkspace g_ws;
 
-/// Unfold ``[padded_len]`` into contiguous ``[n_frames, n_fft]`` (``memcpy`` rows).
-void extract_frames(
-    const float* padded,
-    int64_t padded_len,
-    int64_t n_frames,
+size_t irfft_ola_worker_count(int64_t n_frames) {
+    const size_t hw = std::max(1u, std::thread::hardware_concurrency());
+    return static_cast<size_t>(std::max<int64_t>(1, std::min<int64_t>(n_frames, static_cast<int64_t>(hw))));
+}
+
+/// Hermitian mirror + forward FFT + scale → real time frame in ``row``.
+void irfft_frame_to_row(
+    FFTSetup setup,
+    vDSP_Length log2n,
     int64_t n_fft,
-    int64_t hop,
-    float* frames) {
-    for (int64_t f = 0; f < n_frames; ++f) {
-        const int64_t start = f * hop;
-        float* row = frames + f * n_fft;
-        if (start >= 0 && start + n_fft <= padded_len) {
-            std::memcpy(row, padded + start, static_cast<size_t>(n_fft) * sizeof(float));
-        } else {
-            for (int64_t i = 0; i < n_fft; ++i) {
-                const int64_t idx = start + i;
-                row[static_cast<size_t>(i)] =
-                    (idx >= 0 && idx < padded_len) ? padded[static_cast<size_t>(idx)] : 0.f;
-            }
-        }
+    int64_t n_freq,
+    const float* in_re,
+    const float* in_im,
+    float* row) {
+    thread_local std::vector<float> re;
+    thread_local std::vector<float> im;
+    if (re.size() < static_cast<size_t>(n_fft)) {
+        re.resize(static_cast<size_t>(n_fft));
+        im.resize(static_cast<size_t>(n_fft));
     }
-}
-
-void window_frames(float* frames, int64_t n_frames, int64_t n_fft, const float* win) {
-    const vDSP_Length len = static_cast<vDSP_Length>(n_fft);
-    for (int64_t f = 0; f < n_frames; ++f) {
-        vDSP_vmul(frames + f * n_fft, 1, win, 1, frames + f * n_fft, 1, len);
-    }
-}
-
-void rfft_row(const float* row, int64_t n_fft, float* out_re, float* out_im) {
-    g_fft.ensure(n_fft);
-    const int64_t n_freq = kFreqBins(n_fft);
-    float* re = g_ws.fft_re.data();
-    float* im = g_ws.fft_im.data();
-    std::memcpy(re, row, static_cast<size_t>(n_fft) * sizeof(float));
-    std::memset(im, 0, static_cast<size_t>(n_fft) * sizeof(float));
-    DSPSplitComplex split{re, im};
-    vDSP_fft_zip(
-        g_fft.setup, &split, 1, static_cast<vDSP_Length>(g_fft.log2n), FFT_FORWARD);
-    for (int64_t k = 0; k < n_freq; ++k) {
-        out_re[k] = re[static_cast<size_t>(k)];
-        out_im[k] = im[static_cast<size_t>(k)];
-    }
-}
-
-void irfft_row(const float* in_re, const float* in_im, int64_t n_fft, float* row) {
-    g_fft.ensure(n_fft);
-    const int64_t n_freq = kFreqBins(n_fft);
-    float* re = g_ws.fft_re.data();
-    float* im = g_ws.fft_im.data();
     for (int64_t k = 0; k < n_freq; ++k) {
         re[static_cast<size_t>(k)] = in_re[k];
         im[static_cast<size_t>(k)] = in_im[k];
@@ -145,93 +105,216 @@ void irfft_row(const float* in_re, const float* in_im, int64_t n_fft, float* row
         re[static_cast<size_t>(k)] = re[static_cast<size_t>(m)];
         im[static_cast<size_t>(k)] = -im[static_cast<size_t>(m)];
     }
-    vDSP_vneg(im, 1, im, 1, static_cast<vDSP_Length>(n_fft));
-    DSPSplitComplex split{re, im};
-    vDSP_fft_zip(
-        g_fft.setup, &split, 1, static_cast<vDSP_Length>(g_fft.log2n), FFT_FORWARD);
+    vDSP_vneg(im.data(), 1, im.data(), 1, static_cast<vDSP_Length>(n_fft));
+    DSPSplitComplex split{re.data(), im.data()};
+    vDSP_fft_zip(setup, &split, 1, log2n, FFT_FORWARD);
     const float inv_n = 1.f / static_cast<float>(n_fft);
-    vDSP_vsmul(re, 1, &inv_n, re, 1, static_cast<vDSP_Length>(n_fft));
-    vDSP_vsmul(im, 1, &inv_n, im, 1, static_cast<vDSP_Length>(n_fft));
-    vDSP_vneg(im, 1, im, 1, static_cast<vDSP_Length>(n_fft));
-    std::memcpy(row, re, static_cast<size_t>(n_fft) * sizeof(float));
+    vDSP_vsmul(re.data(), 1, &inv_n, re.data(), 1, static_cast<vDSP_Length>(n_fft));
+    vDSP_vsmul(im.data(), 1, &inv_n, im.data(), 1, static_cast<vDSP_Length>(n_fft));
+    vDSP_vneg(im.data(), 1, im.data(), 1, static_cast<vDSP_Length>(n_fft));
+    std::memcpy(row, re.data(), static_cast<size_t>(n_fft) * sizeof(float));
 }
 
-struct FftParallelCtx {
+void overlap_add_frame(
+    float* acc,
+    int64_t acc_len,
+    const float* frame,
+    int64_t frame_start,
+    int64_t n_fft);
+
+void overlap_add_weight(
+    float* wsum,
+    int64_t acc_len,
+    const float* win_sq,
+    int64_t win_length,
+    int64_t frame_start);
+
+struct IrfftOlaChunkCtx {
     FFTSetup setup = nullptr;
     vDSP_Length log2n = 0;
     int64_t n_fft = 0;
     int64_t n_freq = 0;
     int64_t n_frames = 0;
+    int64_t hop = 0;
+    int64_t acc_len = 0;
     int64_t batch = 0;
-    int64_t n_freq_total = 0;
-    const float* frames = nullptr;
+    int64_t frame_begin = 0;
+    int64_t frame_end = 0;
+    const float* spec_re = nullptr;
+    const float* spec_im = nullptr;
+    const std::complex<float>* spec_cplx = nullptr;
+    const float* win = nullptr;
+    const float* win_sq = nullptr;
+    float* partial_acc = nullptr;
+    float* partial_wsum = nullptr;
+};
+
+void irfft_ola_chunk(IrfftOlaChunkCtx ctx) {
+    thread_local std::vector<float> frame_re;
+    thread_local std::vector<float> frame_im;
+    thread_local std::vector<float> row;
+    if (frame_re.size() < static_cast<size_t>(ctx.n_freq)) {
+        frame_re.resize(static_cast<size_t>(ctx.n_freq));
+        frame_im.resize(static_cast<size_t>(ctx.n_freq));
+    }
+    if (row.size() < static_cast<size_t>(ctx.n_fft)) {
+        row.resize(static_cast<size_t>(ctx.n_fft));
+    }
+    const vDSP_Length n_fft_len = static_cast<vDSP_Length>(ctx.n_fft);
+    for (int64_t f = ctx.frame_begin; f < ctx.frame_end; ++f) {
+        if (ctx.spec_cplx != nullptr) {
+            for (int64_t k = 0; k < ctx.n_freq; ++k) {
+                const size_t idx = spec_index(
+                    ctx.batch, k, f, ctx.n_freq, ctx.n_frames);
+                frame_re[static_cast<size_t>(k)] = ctx.spec_cplx[idx].real();
+                frame_im[static_cast<size_t>(k)] = ctx.spec_cplx[idx].imag();
+            }
+        } else {
+            for (int64_t k = 0; k < ctx.n_freq; ++k) {
+                const size_t idx = spec_index(
+                    ctx.batch, k, f, ctx.n_freq, ctx.n_frames);
+                frame_re[static_cast<size_t>(k)] = ctx.spec_re[idx];
+                frame_im[static_cast<size_t>(k)] = ctx.spec_im[idx];
+            }
+        }
+        irfft_frame_to_row(
+            ctx.setup,
+            ctx.log2n,
+            ctx.n_fft,
+            ctx.n_freq,
+            frame_re.data(),
+            frame_im.data(),
+            row.data());
+        vDSP_vmul(row.data(), 1, ctx.win, 1, row.data(), 1, n_fft_len);
+        overlap_add_frame(ctx.partial_acc, ctx.acc_len, row.data(), f * ctx.hop, ctx.n_fft);
+        if (ctx.partial_wsum != nullptr && ctx.win_sq != nullptr) {
+            overlap_add_weight(
+                ctx.partial_wsum, ctx.acc_len, ctx.win_sq, ctx.n_fft, f * ctx.hop);
+        }
+    }
+}
+
+void merge_partial_buffers(
+    float* acc,
+    int64_t acc_len,
+    const std::vector<std::vector<float>>& parts) {
+    if (parts.empty()) {
+        return;
+    }
+    std::memcpy(acc, parts[0].data(), static_cast<size_t>(acc_len) * sizeof(float));
+    const vDSP_Length len = static_cast<vDSP_Length>(acc_len);
+    for (size_t w = 1; w < parts.size(); ++w) {
+        vDSP_vadd(acc, 1, parts[w].data(), 1, acc, 1, len);
+    }
+}
+
+void irfft_ola_parallel(IrfftOlaChunkCtx base) {
+    const size_t n_workers = irfft_ola_worker_count(base.n_frames);
+    std::vector<std::vector<float>> ola_parts(
+        n_workers, std::vector<float>(static_cast<size_t>(base.acc_len), 0.f));
+    std::vector<float*> ola_ptrs(n_workers);
+    for (size_t w = 0; w < n_workers; ++w) {
+        ola_ptrs[w] = ola_parts[w].data();
+    }
+
+    std::vector<std::vector<float>> wsum_parts;
+    std::vector<float*> wsum_ptrs;
+    if (base.partial_wsum != nullptr) {
+        wsum_parts.assign(
+            n_workers, std::vector<float>(static_cast<size_t>(base.acc_len), 0.f));
+        wsum_ptrs.resize(n_workers);
+        for (size_t w = 0; w < n_workers; ++w) {
+            wsum_ptrs[w] = wsum_parts[w].data();
+        }
+    }
+
+    float** ola_ptrs_raw = ola_ptrs.data();
+    float** wsum_ptrs_raw = wsum_ptrs.empty() ? nullptr : wsum_ptrs.data();
+
+    dispatch_apply(n_workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t worker) {
+        const int64_t f0 = static_cast<int64_t>(worker) * base.n_frames / static_cast<int64_t>(n_workers);
+        const int64_t f1 = static_cast<int64_t>(worker + 1) * base.n_frames / static_cast<int64_t>(n_workers);
+        IrfftOlaChunkCtx ctx = base;
+        ctx.frame_begin = f0;
+        ctx.frame_end = f1;
+        ctx.partial_acc = ola_ptrs_raw[worker];
+        ctx.partial_wsum = wsum_ptrs_raw != nullptr ? wsum_ptrs_raw[worker] : nullptr;
+        irfft_ola_chunk(ctx);
+    });
+
+    merge_partial_buffers(base.partial_acc, base.acc_len, ola_parts);
+    if (base.partial_wsum != nullptr) {
+        merge_partial_buffers(base.partial_wsum, base.acc_len, wsum_parts);
+    }
+}
+
+/// Copy one STFT frame from padded audio, zero-fill at edges when needed.
+void load_frame(
+    const float* padded,
+    int64_t padded_len,
+    int64_t start,
+    int64_t n_fft,
+    float* row) {
+    if (start >= 0 && start + n_fft <= padded_len) {
+        std::memcpy(row, padded + start, static_cast<size_t>(n_fft) * sizeof(float));
+        return;
+    }
+    for (int64_t i = 0; i < n_fft; ++i) {
+        const int64_t idx = start + i;
+        row[static_cast<size_t>(i)] =
+            (idx >= 0 && idx < padded_len) ? padded[static_cast<size_t>(idx)] : 0.f;
+    }
+}
+
+struct StftForwardFusedCtx {
+    FFTSetup setup = nullptr;
+    vDSP_Length log2n = 0;
+    int64_t n_fft = 0;
+    int64_t n_freq = 0;
+    int64_t n_frames = 0;
+    int64_t hop = 0;
+    int64_t padded_len = 0;
+    int64_t batch = 0;
+    const float* padded = nullptr;
+    const float* win = nullptr;
     float* spec_re = nullptr;
     float* spec_im = nullptr;
 };
 
-void fft_frames_forward_parallel(FftParallelCtx ctx) {
-    dispatch_apply(static_cast<size_t>(ctx.n_frames), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t f) {
-        thread_local std::vector<float> re;
-        thread_local std::vector<float> im;
-        if (re.size() < static_cast<size_t>(ctx.n_fft)) {
-            re.resize(static_cast<size_t>(ctx.n_fft));
-            im.resize(static_cast<size_t>(ctx.n_fft));
-        }
-        const float* row = ctx.frames + static_cast<int64_t>(f) * ctx.n_fft;
-        std::memcpy(re.data(), row, static_cast<size_t>(ctx.n_fft) * sizeof(float));
-        std::memset(im.data(), 0, static_cast<size_t>(ctx.n_fft) * sizeof(float));
-        DSPSplitComplex split{re.data(), im.data()};
-        vDSP_fft_zip(ctx.setup, &split, 1, ctx.log2n, FFT_FORWARD);
-        for (int64_t k = 0; k < ctx.n_freq; ++k) {
-            const size_t idx = spec_index(ctx.batch, k, static_cast<int64_t>(f), ctx.n_freq, ctx.n_frames);
-            ctx.spec_re[idx] = re[static_cast<size_t>(k)];
-            ctx.spec_im[idx] = im[static_cast<size_t>(k)];
-        }
-    });
-}
+/// Fused extract + Hann window + rFFT per frame (avoids full ``[n_frames, n_fft]`` staging).
+void stft_forward_fft_fused(StftForwardFusedCtx ctx) {
+    const vDSP_Length n_fft_len = static_cast<vDSP_Length>(ctx.n_fft);
+    dispatch_apply(
+        static_cast<size_t>(ctx.n_frames),
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+        ^(size_t f) {
+            thread_local std::vector<float> row;
+            thread_local std::vector<float> re;
+            thread_local std::vector<float> im;
+            if (row.size() < static_cast<size_t>(ctx.n_fft)) {
+                row.resize(static_cast<size_t>(ctx.n_fft));
+                re.resize(static_cast<size_t>(ctx.n_fft));
+                im.resize(static_cast<size_t>(ctx.n_fft));
+            }
 
-struct IrfftParallelCtx {
-    FFTSetup setup = nullptr;
-    vDSP_Length log2n = 0;
-    int64_t n_fft = 0;
-    int64_t n_freq = 0;
-    int64_t n_frames = 0;
-    int64_t batch = 0;
-    const float* spec_re = nullptr;
-    const float* spec_im = nullptr;
-    float* frames = nullptr;
-};
-
-void irfft_frames_parallel(IrfftParallelCtx ctx) {
-    const float inv_n = 1.f / static_cast<float>(ctx.n_fft);
-    dispatch_apply(static_cast<size_t>(ctx.n_frames), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t f) {
-        thread_local std::vector<float> re;
-        thread_local std::vector<float> im;
-        if (re.size() < static_cast<size_t>(ctx.n_fft)) {
-            re.resize(static_cast<size_t>(ctx.n_fft));
-            im.resize(static_cast<size_t>(ctx.n_fft));
-        }
-        for (int64_t k = 0; k < ctx.n_freq; ++k) {
-            const size_t idx = spec_index(ctx.batch, k, static_cast<int64_t>(f), ctx.n_freq, ctx.n_frames);
-            re[static_cast<size_t>(k)] = ctx.spec_re[idx];
-            im[static_cast<size_t>(k)] = ctx.spec_im[idx];
-        }
-        for (int64_t k = ctx.n_freq; k < ctx.n_fft; ++k) {
-            const int64_t m = ctx.n_fft - k;
-            re[static_cast<size_t>(k)] = re[static_cast<size_t>(m)];
-            im[static_cast<size_t>(k)] = -im[static_cast<size_t>(m)];
-        }
-        vDSP_vneg(im.data(), 1, im.data(), 1, static_cast<vDSP_Length>(ctx.n_fft));
-        DSPSplitComplex split{re.data(), im.data()};
-        vDSP_fft_zip(ctx.setup, &split, 1, ctx.log2n, FFT_FORWARD);
-        vDSP_vsmul(re.data(), 1, &inv_n, re.data(), 1, static_cast<vDSP_Length>(ctx.n_fft));
-        vDSP_vsmul(im.data(), 1, &inv_n, im.data(), 1, static_cast<vDSP_Length>(ctx.n_fft));
-        vDSP_vneg(im.data(), 1, im.data(), 1, static_cast<vDSP_Length>(ctx.n_fft));
-        std::memcpy(
-            ctx.frames + static_cast<int64_t>(f) * ctx.n_fft,
-            re.data(),
-            static_cast<size_t>(ctx.n_fft) * sizeof(float));
-    });
+            load_frame(
+                ctx.padded,
+                ctx.padded_len,
+                static_cast<int64_t>(f) * ctx.hop,
+                ctx.n_fft,
+                row.data());
+            vDSP_vmul(row.data(), 1, ctx.win, 1, row.data(), 1, n_fft_len);
+            std::memcpy(re.data(), row.data(), static_cast<size_t>(ctx.n_fft) * sizeof(float));
+            std::memset(im.data(), 0, static_cast<size_t>(ctx.n_fft) * sizeof(float));
+            DSPSplitComplex split{re.data(), im.data()};
+            vDSP_fft_zip(ctx.setup, &split, 1, ctx.log2n, FFT_FORWARD);
+            for (int64_t k = 0; k < ctx.n_freq; ++k) {
+                const size_t idx = spec_index(
+                    ctx.batch, k, static_cast<int64_t>(f), ctx.n_freq, ctx.n_frames);
+                ctx.spec_re[idx] = re[static_cast<size_t>(k)];
+                ctx.spec_im[idx] = im[static_cast<size_t>(k)];
+            }
+        });
 }
 
 void overlap_add_frame(
@@ -257,14 +340,102 @@ void overlap_add_frame(
 void overlap_add_weight(
     float* wsum,
     int64_t acc_len,
-    const float* window,
+    const float* win_sq,
     int64_t win_length,
     int64_t frame_start) {
     const int64_t i0 = std::max<int64_t>(0, -frame_start);
     const int64_t i1 = std::min<int64_t>(win_length, acc_len - frame_start);
-    for (int64_t i = i0; i < i1; ++i) {
-        const float w = window[static_cast<size_t>(i)];
-        wsum[static_cast<size_t>(frame_start + i)] += w * w;
+    if (i0 < i1) {
+        vDSP_vadd(
+            wsum + frame_start + i0,
+            1,
+            win_sq + i0,
+            1,
+            wsum + frame_start + i0,
+            1,
+            static_cast<vDSP_Length>(i1 - i0));
+    }
+}
+
+void prepare_win_sq(const std::vector<float>& win, int64_t n_fft) {
+    g_ws.win_sq.resize(static_cast<size_t>(n_fft));
+    vDSP_vsq(win.data(), 1, g_ws.win_sq.data(), 1, static_cast<vDSP_Length>(n_fft));
+}
+
+void vdsp_waveform_from_spec_planes(
+    const float* spec_re,
+    const float* spec_im,
+    const std::complex<float>* spec_cplx,
+    int64_t batch,
+    int64_t n_frames,
+    int64_t signal_length,
+    int64_t length,
+    const StftParams& params,
+    const std::vector<float>& win,
+    bool normalize_ola,
+    std::vector<float>& waveform) {
+    const int64_t n_fft = params.n_fft;
+    const int64_t hop = params.hop_length;
+    const int64_t n_freq = kFreqBins(n_fft);
+    const int64_t pad = params.center ? n_fft / 2 : 0;
+    const int64_t acc_len = normalize_ola
+        ? (params.center ? length + n_fft : hop * (n_frames - 1) + n_fft)
+        : (params.center ? signal_length + n_fft : signal_length);
+    const int64_t out_len = normalize_ola ? length : signal_length;
+
+    g_fft.ensure(n_fft);
+    g_ws.acc.assign(static_cast<size_t>(acc_len), 0.f);
+    if (normalize_ola) {
+        prepare_win_sq(win, n_fft);
+        g_ws.wsum.assign(static_cast<size_t>(acc_len), 0.f);
+    }
+
+    for (int64_t b = 0; b < batch; ++b) {
+        std::fill(g_ws.acc.begin(), g_ws.acc.end(), 0.f);
+        if (normalize_ola) {
+            std::fill(g_ws.wsum.begin(), g_ws.wsum.end(), 0.f);
+        }
+
+        IrfftOlaChunkCtx base{
+            g_fft.setup,
+            static_cast<vDSP_Length>(g_fft.log2n),
+            n_fft,
+            n_freq,
+            n_frames,
+            hop,
+            acc_len,
+            b,
+            0,
+            0,
+            spec_re,
+            spec_im,
+            spec_cplx,
+            win.data(),
+            normalize_ola ? g_ws.win_sq.data() : nullptr,
+            g_ws.acc.data(),
+            normalize_ola ? g_ws.wsum.data() : nullptr,
+        };
+        irfft_ola_parallel(base);
+
+        if (normalize_ola) {
+            for (int64_t i = 0; i < acc_len; ++i) {
+                const float denom = std::max(g_ws.wsum[static_cast<size_t>(i)], 1e-8f);
+                g_ws.acc[static_cast<size_t>(i)] /= denom;
+            }
+        }
+
+        float* out = waveform.data() + b * out_len;
+        if (params.center) {
+            std::memcpy(
+                out,
+                g_ws.acc.data() + pad,
+                static_cast<size_t>(out_len) * sizeof(float));
+        } else if (normalize_ola) {
+            const int64_t n = std::min(out_len, acc_len);
+            std::memcpy(out, g_ws.acc.data(), static_cast<size_t>(n) * sizeof(float));
+        } else {
+            std::memcpy(out, g_ws.acc.data(), static_cast<size_t>(out_len) * sizeof(float));
+        }
     }
 }
 
@@ -293,7 +464,6 @@ void stft_forward_vdsp(
     spec_imag.assign(spec_elems, 0.f);
 
     g_fft.ensure(n_fft);
-    g_ws.ensure_frames(n_frames, n_fft);
 
     for (int64_t b = 0; b < batch; ++b) {
         const float* x = waveform + b * signal_length;
@@ -304,28 +474,21 @@ void stft_forward_vdsp(
         }
         const int64_t padded_len = static_cast<int64_t>(g_ws.padded.size());
 
-        extract_frames(
-            g_ws.padded.data(),
-            padded_len,
-            n_frames,
-            n_fft,
-            hop,
-            g_ws.frames.data());
-        window_frames(g_ws.frames.data(), n_frames, n_fft, win.data());
-
-        FftParallelCtx ctx{
+        StftForwardFusedCtx ctx{
             g_fft.setup,
             static_cast<vDSP_Length>(g_fft.log2n),
             n_fft,
             n_freq,
             n_frames,
+            hop,
+            padded_len,
             b,
-            n_freq,
-            g_ws.frames.data(),
+            g_ws.padded.data(),
+            win.data(),
             spec_real.data(),
             spec_imag.data(),
         };
-        fft_frames_forward_parallel(ctx);
+        stft_forward_fft_fused(ctx);
     }
 }
 
@@ -339,55 +502,53 @@ void stft_backward_vdsp(
     const StftParams& params,
     std::vector<float>& grad_waveform) {
     const int64_t n_fft = params.n_fft;
-    const int64_t hop = params.hop_length;
-    const int64_t n_freq = kFreqBins(n_fft);
     const int64_t n_frames = stft_num_frames(signal_length, params);
-    const int64_t pad = params.center ? n_fft / 2 : 0;
 
     std::vector<float> win(static_cast<size_t>(n_fft), 0.f);
     prepare_window(window, win_length, n_fft, win);
-
     grad_waveform.assign(static_cast<size_t>(batch * signal_length), 0.f);
-    const int64_t padded_len = params.center ? signal_length + n_fft : signal_length;
 
-    g_fft.ensure(n_fft);
-    g_ws.ensure_frames(n_frames, n_fft);
-    g_ws.acc.assign(static_cast<size_t>(padded_len), 0.f);
+    vdsp_waveform_from_spec_planes(
+        grad_spec_real,
+        grad_spec_imag,
+        nullptr,
+        batch,
+        n_frames,
+        signal_length,
+        signal_length,
+        params,
+        win,
+        false,
+        grad_waveform);
+}
 
-    const vDSP_Length win_len = static_cast<vDSP_Length>(n_fft);
+void stft_backward_vdsp_cplx(
+    const std::complex<float>* grad_spec,
+    int64_t batch,
+    int64_t signal_length,
+    const float* window,
+    int64_t win_length,
+    const StftParams& params,
+    std::vector<float>& grad_waveform) {
+    const int64_t n_fft = params.n_fft;
+    const int64_t n_frames = stft_num_frames(signal_length, params);
 
-    for (int64_t b = 0; b < batch; ++b) {
-        std::fill(g_ws.acc.begin(), g_ws.acc.end(), 0.f);
+    std::vector<float> win(static_cast<size_t>(n_fft), 0.f);
+    prepare_window(window, win_length, n_fft, win);
+    grad_waveform.assign(static_cast<size_t>(batch * signal_length), 0.f);
 
-        IrfftParallelCtx ctx{
-            g_fft.setup,
-            static_cast<vDSP_Length>(g_fft.log2n),
-            n_fft,
-            n_freq,
-            n_frames,
-            b,
-            grad_spec_real,
-            grad_spec_imag,
-            g_ws.frames.data(),
-        };
-        irfft_frames_parallel(ctx);
-
-        for (int64_t f = 0; f < n_frames; ++f) {
-            float* row = g_ws.frames.data() + f * n_fft;
-            vDSP_vmul(row, 1, win.data(), 1, row, 1, win_len);
-            overlap_add_frame(g_ws.acc.data(), padded_len, row, f * hop, n_fft);
-        }
-
-        float* out = grad_waveform.data() + b * signal_length;
-        if (params.center) {
-            std::memcpy(
-                out,
-                g_ws.acc.data() + pad,
-                static_cast<size_t>(signal_length) * sizeof(float));
-        } else {
-            std::memcpy(out, g_ws.acc.data(), static_cast<size_t>(signal_length) * sizeof(float));
-        }
-    }
+    vdsp_waveform_from_spec_planes(
+        nullptr,
+        nullptr,
+        grad_spec,
+        batch,
+        n_frames,
+        signal_length,
+        signal_length,
+        params,
+        win,
+        false,
+        grad_waveform);
 }
 
 void istft_forward_vdsp(
@@ -401,63 +562,52 @@ void istft_forward_vdsp(
     int64_t length,
     std::vector<float>& waveform) {
     const int64_t n_fft = params.n_fft;
-    const int64_t hop = params.hop_length;
-    const int64_t n_freq = kFreqBins(n_fft);
-    const int64_t pad = params.center ? n_fft / 2 : 0;
 
     std::vector<float> win(static_cast<size_t>(n_fft), 0.f);
     prepare_window(window, win_length, n_fft, win);
-
-    const int64_t out_len = params.center ? length + n_fft : hop * (n_frames - 1) + n_fft;
     waveform.assign(static_cast<size_t>(batch * length), 0.f);
 
-    g_fft.ensure(n_fft);
-    g_ws.ensure_frames(n_frames, n_fft);
-    g_ws.acc.assign(static_cast<size_t>(out_len), 0.f);
-    g_ws.wsum.assign(static_cast<size_t>(out_len), 0.f);
+    vdsp_waveform_from_spec_planes(
+        spec_real,
+        spec_imag,
+        nullptr,
+        batch,
+        n_frames,
+        length,
+        length,
+        params,
+        win,
+        true,
+        waveform);
+}
 
-    const vDSP_Length win_len = static_cast<vDSP_Length>(n_fft);
+void istft_forward_vdsp_cplx(
+    const std::complex<float>* spec,
+    int64_t batch,
+    int64_t n_frames,
+    const float* window,
+    int64_t win_length,
+    const StftParams& params,
+    int64_t length,
+    std::vector<float>& waveform) {
+    const int64_t n_fft = params.n_fft;
 
-    for (int64_t b = 0; b < batch; ++b) {
-        std::fill(g_ws.acc.begin(), g_ws.acc.end(), 0.f);
-        std::fill(g_ws.wsum.begin(), g_ws.wsum.end(), 0.f);
+    std::vector<float> win(static_cast<size_t>(n_fft), 0.f);
+    prepare_window(window, win_length, n_fft, win);
+    waveform.assign(static_cast<size_t>(batch * length), 0.f);
 
-        IrfftParallelCtx ctx{
-            g_fft.setup,
-            static_cast<vDSP_Length>(g_fft.log2n),
-            n_fft,
-            n_freq,
-            n_frames,
-            b,
-            spec_real,
-            spec_imag,
-            g_ws.frames.data(),
-        };
-        irfft_frames_parallel(ctx);
-
-        for (int64_t f = 0; f < n_frames; ++f) {
-            float* row = g_ws.frames.data() + f * n_fft;
-            vDSP_vmul(row, 1, win.data(), 1, row, 1, win_len);
-            overlap_add_frame(g_ws.acc.data(), out_len, row, f * hop, n_fft);
-            overlap_add_weight(g_ws.wsum.data(), out_len, win.data(), n_fft, f * hop);
-        }
-
-        for (int64_t i = 0; i < out_len; ++i) {
-            const float denom = std::max(g_ws.wsum[static_cast<size_t>(i)], 1e-8f);
-            g_ws.acc[static_cast<size_t>(i)] /= denom;
-        }
-
-        float* out = waveform.data() + b * length;
-        if (params.center) {
-            std::memcpy(
-                out,
-                g_ws.acc.data() + pad,
-                static_cast<size_t>(length) * sizeof(float));
-        } else {
-            const int64_t n = std::min(length, out_len);
-            std::memcpy(out, g_ws.acc.data(), static_cast<size_t>(n) * sizeof(float));
-        }
-    }
+    vdsp_waveform_from_spec_planes(
+        nullptr,
+        nullptr,
+        spec,
+        batch,
+        n_frames,
+        length,
+        length,
+        params,
+        win,
+        true,
+        waveform);
 }
 
 void istft_backward_vdsp(

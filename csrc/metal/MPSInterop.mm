@@ -240,6 +240,21 @@ bool tensor_cpu_accessible(const at::Tensor& tensor) {
     return buffer != nil && buffer.storageMode == MTLStorageModeShared;
 }
 
+void* shared_cpu_data_ptr(const at::Tensor& tensor) {
+    MCCL_CHECK(tensor.is_contiguous(), "shared_cpu_data_ptr: tensor must be contiguous");
+    if (tensor.is_cpu()) {
+        return tensor.data_ptr();
+    }
+    MCCL_CHECK(tensor.is_mps(), "shared_cpu_data_ptr: tensor must be MPS or CPU");
+    id<MTLBuffer> buffer = at::mps::getMTLBufferStorage(tensor);
+    if (buffer == nil || buffer.storageMode != MTLStorageModeShared) {
+        return nullptr;
+    }
+    const size_t offset =
+        static_cast<size_t>(tensor.storage_offset()) * static_cast<size_t>(tensor.element_size());
+    return static_cast<uint8_t*>(buffer.contents) + offset;
+}
+
 std::string mps_storage_mode_string(const at::Tensor& tensor) {
     if (tensor.is_cpu()) {
         return "cpu";

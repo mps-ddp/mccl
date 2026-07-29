@@ -19,6 +19,10 @@ struct MPSBufferView {
 /// Returns a view with buffer handle, offset, and CPU-accessibility info.
 MPSBufferView extract_mps_buffer(const at::Tensor& tensor);
 
+/// CPU pointer for contiguous MPS (shared) or CPU tensors — allows complex64 for STFT.
+/// Returns nullptr when MPS uses private storage (caller should fall back to copy_/cpu()).
+void* shared_cpu_data_ptr(const at::Tensor& tensor);
+
 /// Synchronize MPS command queue — blocks until all enqueued MPS work completes.
 /// Must be called before reading MPS tensor data from CPU / network.
 void mps_sync();

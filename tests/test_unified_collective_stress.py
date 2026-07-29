@@ -1,8 +1,9 @@
 """Stress + parity tests for MCCL_UNIFIED_COLLECTIVE (shared-storage fast path).
 
-Runs the same race/DDP workloads as the default Metal+blit path and verifies
-bit-exact or rtol parity.  Fails loudly if unified cpu_ptr staging corrupts
-gradients under overlap.
+Unified collective is default-on; this matrix pins ``MCCL_UNIFIED_COLLECTIVE=1``
+and ``=0`` explicitly.  Runs the same race/DDP workloads as the Metal+blit path
+and verifies bit-exact or rtol parity.  Fails loudly if unified cpu_ptr staging
+corrupts gradients under overlap.
 """
 
 from __future__ import annotations

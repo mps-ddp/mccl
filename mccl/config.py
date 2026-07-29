@@ -22,9 +22,9 @@ class MCCLConfig:
     # ── Transport ────────────────────────────────────────────────────
     transport: str = "auto"  # "auto", "tcp", "rdma"
     listen_addr: str = "auto"
-    port_base: int = 29600
+    port_base: int = 20100
     ifname: str = ""
-    chunk_bytes: int = 4 * 1024 * 1024
+    chunk_bytes: int = 16 * 1024 * 1024
     small_msg_threshold: int = 262144
     connect_timeout_ms: int = 30000
     transport_crc: bool = False
@@ -36,14 +36,17 @@ class MCCLConfig:
     overlap_comm: bool = True
     ring_algo: str = "auto"          # "auto" (chunked), "chunked", "basic"
     ring_pipeline: bool = True       # streaming TX/RX ring (off = lock-step debug)
-    pipeline_depth: int = 2          # posted-ahead receives per pipeline (1-8)
-    collective_concurrency: int = 2  # ws>=3 collectives in flight (1-4)
-    demux_park_bytes: int = 512 * 1024 * 1024  # per-peer unmatched-message bound
+    pipeline_depth: int = 1          # posted-ahead receives per pipeline (1-8)
+    collective_concurrency: int = 1  # ws>=3 collectives in flight (1-8)
+    max_collective_concurrency: int = 8  # hard ceiling on collective_concurrency
+    demux_park_bytes: int = 512 * 1024 * 1024  # hint; C++ auto-scales when unset
+    demux_inflight_budget_bytes: int = 1 * 1024 * 1024 * 1024  # 1 GiB
     credit_min_chunk: int = 1024 * 1024  # credit flow control floor (0 = off)
     fp32_cpu_reduce: bool = False    # vDSP fp32 reduce in unified memory
     cpu_write_sync: str = "auto"     # "auto" (none) or "full" (debug)
     event_sync: bool = True          # MTLSharedEvent sync path
     link_profile: str = ""           # "" or "thunderbolt"
+    unified_collective: bool = True  # shared-storage fast path (default on)
 
     # ── Compression ──────────────────────────────────────────────────
     compression: str = "none"
@@ -80,12 +83,15 @@ class MCCLConfig:
             "MCCL_RING_PIPELINE": "ring_pipeline",
             "MCCL_PIPELINE_DEPTH": "pipeline_depth",
             "MCCL_COLLECTIVE_CONCURRENCY": "collective_concurrency",
+            "MCCL_MAX_COLLECTIVE_CONCURRENCY": "max_collective_concurrency",
             "MCCL_DEMUX_PARK_BYTES": "demux_park_bytes",
+            "MCCL_DEMUX_INFLIGHT_BUDGET_BYTES": "demux_inflight_budget_bytes",
             "MCCL_CREDIT_MIN_CHUNK": "credit_min_chunk",
             "MCCL_FP32_CPU_REDUCE": "fp32_cpu_reduce",
             "MCCL_CPU_WRITE_SYNC": "cpu_write_sync",
             "MCCL_EVENT_SYNC": "event_sync",
             "MCCL_LINK_PROFILE": "link_profile",
+            "MCCL_UNIFIED_COLLECTIVE": "unified_collective",
             "MCCL_COMPRESSION": "compression",
             "MCCL_TOPK_RATIO": "topk_ratio",
             "MCCL_WATCHDOG_TIMEOUT_MS": "watchdog_timeout_ms",
@@ -118,10 +124,15 @@ class MCCLConfig:
             raise ValueError(
                 f"pipeline_depth must be in [1, 8], got {self.pipeline_depth}"
             )
-        if not (1 <= self.collective_concurrency <= 4):
+        if not (1 <= self.collective_concurrency <= 8):
             raise ValueError(
-                f"collective_concurrency must be in [1, 4], "
+                f"collective_concurrency must be in [1, 8], "
                 f"got {self.collective_concurrency}"
+            )
+        if not (1 <= self.max_collective_concurrency <= 16):
+            raise ValueError(
+                f"max_collective_concurrency must be in [1, 16], "
+                f"got {self.max_collective_concurrency}"
             )
         valid_cpu_write_sync = {"auto", "none", "full"}
         if self.cpu_write_sync not in valid_cpu_write_sync:

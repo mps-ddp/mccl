@@ -23,7 +23,7 @@ namespace {
 
 inline int demux_pipeline_depth() {
     auto* v = std::getenv("MCCL_PIPELINE_DEPTH");
-    long n = v ? std::atol(v) : 2;
+    long n = v ? std::atol(v) : 1;
     return static_cast<int>(std::min(8L, std::max(1L, n)));
 }
 
@@ -299,7 +299,7 @@ TcpTransport::TcpTransport(int rank, int world_size, const TransportConfig& conf
         size_t scaled = static_cast<size_t>(world_size_) *
                         static_cast<size_t>(concurrency) *
                         static_cast<size_t>(cwin) * max_coll * 2;
-        park_limit_bytes_ = std::min<size_t>(scaled, 2ULL << 30);
+        park_limit_bytes_ = std::min<size_t>(scaled, 4ULL << 30);
         MCCL_INFO("Rank %d: demux park_limit=%zu bytes "
                   "(world_size=%d concurrency=%d credit_window=%d max_collective=%zu)",
                   rank_, park_limit_bytes_, world_size_, concurrency, cwin, max_coll);

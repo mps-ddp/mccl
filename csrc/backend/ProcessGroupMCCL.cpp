@@ -99,7 +99,7 @@ inline bool ring_pipeline_for_message(size_t nbytes, size_t small_msg_threshold)
 inline int ring_pipeline_depth() {
     static int depth = [] {
         auto* v = std::getenv("MCCL_PIPELINE_DEPTH");
-        long n = v ? std::atol(v) : 2;
+        long n = v ? std::atol(v) : 1;
         return static_cast<int>(std::min(8L, std::max(1L, n)));
     }();
     return depth;

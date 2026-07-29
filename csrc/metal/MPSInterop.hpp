@@ -99,8 +99,8 @@ bool collective_send_uses_blit(const at::Tensor& tensor);
 /// True when ``stage_for_send`` blits instead of reading cpu_ptr.
 bool stage_for_send_uses_blit(const at::Tensor& tensor);
 
-/// Opt-in: ``MCCL_UNIFIED_COLLECTIVE=1`` — after producer MPS fence, send from
-/// shared ``cpu_ptr`` and recv/reduce on unified buffer when safe (torch 2.12+).
+/// Default on: ``MCCL_UNIFIED_COLLECTIVE=0`` to disable. After producer MPS fence,
+/// send from shared ``cpu_ptr`` and recv/reduce on unified buffer when safe (torch 2.12+).
 bool unified_collective_enabled();
 
 /// Unified send/recv + Metal reduce (not vDSP CPU reduce).

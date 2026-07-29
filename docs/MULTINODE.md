@@ -122,7 +122,7 @@ The dummy train example defaults to a **small** MLP where DDP is typically slowe
 ## TCP / transport (reference)
 
 - **Socket buffers**: [`csrc/transport/Connection.cpp`](../csrc/transport/Connection.cpp) — `MCCL_SOCK_BUFSIZE`, `TCP_NODELAY`, macOS `TCP_NOTSENT_LOWAT` via `MCCL_TCP_LOWAT`.
-- **Demultiplexed receives** (v0.4): one reader thread per peer socket routes messages by `(seq, tid)`. Sends interleave safely; receives are posted asynchronously (`post_recv`/`wait_recv` in [`csrc/transport/TcpTransport.cpp`](../csrc/transport/TcpTransport.cpp)). `MCCL_DEMUX_PARK_BYTES` (default 256 MB) bounds messages buffered before their receive is posted.
+- **Demultiplexed receives** (v0.4): one reader thread per peer socket routes messages by `(seq, tid)`. Sends interleave safely; receives are posted asynchronously (`post_recv`/`wait_recv` in [`csrc/transport/TcpTransport.cpp`](../csrc/transport/TcpTransport.cpp)). `MCCL_DEMUX_PARK_BYTES` (unset = auto-scale, cap 4 GiB) bounds messages buffered before their receive is posted.
 - **RDMA**: Optional; same `Transport` API — use when OS/hardware supports it for your topology.
 
 ## Many-rank cluster runbook (e.g. 24 Macs)
@@ -136,16 +136,16 @@ torchrun --nnodes=24 --node_rank=$i --nproc_per_node=1 \
 ```
 
 2. **Ports**: MCCL binds `MCCL_PORT_BASE + rank` on every host — keep a window
-   of at least `world_size` ports free above `MCCL_PORT_BASE` (default 29600)
+   of at least `world_size` ports free above `MCCL_PORT_BASE` (default 20100)
    and away from `MASTER_PORT`.
 
-3. **Hot-path knobs at scale** (defaults are already correct for ws>=3):
+3. **Hot-path knobs at scale** (defaults are conservative for clean multi-node):
 
 | Knob | Default | At 24 ranks |
 |------|---------|-------------|
 | `MCCL_RING_PIPELINE` | on | Streaming TX/RX ring: both link directions busy through all 2(N-1) steps. Set `0` only to bisect a suspected pipeline bug. |
-| `MCCL_PIPELINE_DEPTH` | 2 | Posted-ahead receives per collective. Raise to 3-4 on high-latency links. |
-| `MCCL_COLLECTIVE_CONCURRENCY` | 2 | DDP buckets in flight. Raise to 3-4 if `avg_network_ms` shows gaps between buckets. |
+| `MCCL_PIPELINE_DEPTH` | 1 | Posted-ahead receives per collective. Raise to 3-4 on high-latency links. |
+| `MCCL_COLLECTIVE_CONCURRENCY` | 1 | DDP buckets in flight. Raise to 2-4 if `avg_network_ms` shows gaps between buckets. |
 | `MCCL_CREDIT_MIN_CHUNK` | 1 MB | Credit flow control: senders stay at most `depth+2` chunks ahead of each consumer, so a slow GPU / late bucket start on one Mac is throttled at the source instead of flooding its receive buffers. Mixed M1/M4 clusters rely on this. |
 | `MCCL_SMALL_MSG_THRESHOLD` | auto | Below: recursive-doubling tree allreduce (~2+log2 N rounds). Above: pipelined ring. Auto-scales with world size (256 KiB at N<=4 up to 2 MiB at N=24+) since the ring pays 2(N-1) latencies; set explicitly to pin. |
 | broadcast | auto | ws>=4 uses binomial tree (small) / pipelined ring (large): root egress is S bytes, not (N-1)S. |

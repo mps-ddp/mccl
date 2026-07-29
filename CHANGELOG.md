@@ -1,5 +1,11 @@
 # Changelog
 
+## v6.5 — Production multi-node defaults
+
+### Changed
+- **Unset-env defaults** aligned with the lab multi-node profile: `MCCL_PIPELINE_DEPTH=1`, `MCCL_COLLECTIVE_CONCURRENCY=1`, `MCCL_CHUNK_BYTES=16MB`, `MCCL_PORT_BASE=20100`, `MCCL_UNIFIED_COLLECTIVE` on, `MCCL_DEMUX_INFLIGHT_BUDGET_BYTES=1GB`. (`MCCL_FAST_MATH` stays on by default; SAO opts into strict math via env.)
+- **Demux park auto-scale** retained when `MCCL_DEMUX_PARK_BYTES` is unset; hard cap raised from 2 GiB to **4 GiB**.
+
 ### Fixed
 - **`stage_for_send_collective`**: drop redundant pre/post ``mccl_queue_drain()`` when EventSync is on — ``chunked_blit_to_staging`` already ``waitUntilCompleted`` on the MCCL queue (orders behind prior reduces). Removes two empty-buffer GPU barriers per DDP bucket.
 

@@ -11,7 +11,12 @@ def test_for_world_size_invariant():
     for ws in (4, 8, 16):
         cfg = MCCLConfig.for_world_size(ws)
         assert cfg.ring_algo == "auto"
-        assert cfg.collective_concurrency == 2
+        assert cfg.collective_concurrency == 1
+        assert cfg.pipeline_depth == 1
+        assert cfg.port_base == 20100
+        assert cfg.fast_math is True
+        assert cfg.unified_collective is True
+        assert cfg.demux_inflight_budget_bytes == 1 * 1024 * 1024 * 1024
         assert cfg.ddp_bucket_mb == 25
 
 

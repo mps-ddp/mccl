@@ -10,7 +10,7 @@ import mccl
 def test_two_rank_allreduce(rank, world_size):
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
-    os.environ['MCCL_PORT_BASE'] = '29600'
+    os.environ['MCCL_PORT_BASE'] = '20100'
     os.environ['MCCL_LOG_LEVEL'] = 'INFO'
     
     try:

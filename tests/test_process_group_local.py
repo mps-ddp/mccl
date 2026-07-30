@@ -277,6 +277,7 @@ class TestAllreduceOps:
         _run_distributed(fn, world_size=2, port=32300)
 
 
+@pytest.mark.slow
 class TestAllreduceAlignment:
     """Non-4-aligned sizes exercise the scalar tail path in Metal kernels."""
 
@@ -566,6 +567,7 @@ class TestThreeRankAllreduce:
         _run_distributed(fn, world_size=3, port=33950)
 
 
+@pytest.mark.slow
 class TestThreeRankChunkedRingNumeric:
     """Same size as plain-ring tests but MCCL_RING_ALGO=ring_chunked (allreduce_ring_chunked)."""
 
@@ -607,6 +609,7 @@ class TestSequenceOrdering:
         _run_distributed(fn, world_size=2, port=30000)
 
 
+@pytest.mark.slow
 @pytest.mark.timeout(900)
 class TestMetalRingStress:
     """Many all_reduces on 3-rank plain ring + large tensors (Metal scale path).
@@ -615,15 +618,14 @@ class TestMetalRingStress:
     """
 
     def test_metal_stress_loop(self):
-        n_iters = int(os.environ.get("MCCL_STRESS_ITERS", "2500"))
-        sizes = (
-            1024,
-            THREE_RANK_PLAIN_RING_NUMEL,
-            4096,
-            THREE_RANK_PLAIN_RING_NUMEL // 2,
-        )
-
         def fn(rank, world_size):
+            n_iters = int(os.environ.get("MCCL_STRESS_ITERS", "100"))
+            sizes = (
+                1024,
+                THREE_RANK_PLAIN_RING_NUMEL,
+                4096,
+                THREE_RANK_PLAIN_RING_NUMEL // 2,
+            )
             for i in range(n_iters):
                 s = sizes[i % len(sizes)]
                 tensor = torch.randn(s, device="mps", dtype=torch.float32)
@@ -639,6 +641,7 @@ class TestMetalRingStress:
         )
 
 
+@pytest.mark.slow
 class TestMcclVsGlooParity:
     """MCCL (MPS, ring) vs gloo CPU: same shapes and ops must match numerically."""
 

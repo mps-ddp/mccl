@@ -85,13 +85,14 @@ def _bad_dtype_rejected_fn(rank, world_size):
     import torch
     import torch.distributed as dist
 
-    t = torch.ones(128, dtype=torch.int64, device="mps")
+    # int64 is supported (DDP metadata all_gather); int8 is not in the allowlist.
+    t = torch.ones(128, dtype=torch.int8, device="mps")
     try:
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
     except Exception:
         pass  # expected: rejected at validation, not deep in an engine thread
     else:
-        raise AssertionError("int64 allreduce should be rejected at the call site")
+        raise AssertionError("int8 allreduce should be rejected at the call site")
 
     # Group must still be usable afterwards.
     f = torch.full((128,), float(rank + 1), device="mps")

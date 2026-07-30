@@ -309,7 +309,9 @@ id<MTLComputePipelineState> select_accumulate_pipeline(KernelCache& c, at::Scala
 id<MTLComputePipelineState> select_integral_binary_pipeline(
     KernelCache& c, at::ScalarType dtype, c10d::ReduceOp::RedOpType op) {
     const bool is_u8 = (dtype == at::kBool);
+    const bool is_i32 = (dtype == at::kInt);
     const bool is_i64 = (dtype == at::kLong);
+    if (!is_u8 && !is_i32 && !is_i64) return nil;
     switch (op) {
         case c10d::ReduceOp::SUM:
         case c10d::ReduceOp::AVG:

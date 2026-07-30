@@ -2726,8 +2726,6 @@ void ProcessGroupMCCL::allgather_star_small(std::vector<at::Tensor>& outputs,
     const int rank = getRank();
     const int ws = getSize();
 
-    outputs[rank].copy_(input);
-
     const auto ag_t0 = std::chrono::steady_clock::now();
 
     rendezvous_collective_enter(seq, "allgather");
@@ -2747,10 +2745,10 @@ void ProcessGroupMCCL::allgather_star_small(std::vector<at::Tensor>& outputs,
                 metrics_->record_transport_bytes(nbytes, true);
             }
         } else {
-            at::Tensor recv_tensor = torch::empty_like(input);
+            // Recv directly into the output slot: unstage_from_recv writes
+            // cpu_ptr on unified MPS; copy_ would blit stale GPU bytes instead.
             compressed_recv(src, kWireCollectiveOp(), seq,
-                            static_cast<uint32_t>(src), recv_tensor);
-            outputs[src].copy_(recv_tensor);
+                            static_cast<uint32_t>(src), outputs[src]);
             compressed_send(src, kWireCollectiveOp(), seq,
                             static_cast<uint32_t>(src), ack);
             metrics_->record_transport_bytes(nbytes, false);
@@ -2760,6 +2758,64 @@ void ProcessGroupMCCL::allgather_star_small(std::vector<at::Tensor>& outputs,
     metrics_->record_phase(seq, 0,
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - ag_t0).count(), 0);
+}
+
+
+void ProcessGroupMCCL::reduce_scatter_star_small(std::vector<at::Tensor>& inputs,
+                                                 at::Tensor& output,
+                                                 uint32_t seq, size_t nbytes,
+                                                 c10d::ReduceOp::RedOpType op) {
+    const int rank = getRank();
+    const int ws = getSize();
+
+    rendezvous_collective_enter(seq, "reduce_scatter");
+
+    PooledBuffer wire_buf(staging_memory_pool(), nbytes);
+    blit_tensor_to_buffer(inputs[rank], wire_buf.data());
+    mccl_queue_drain();
+
+    const bool unified_fp32 = (output.scalar_type() == at::kFloat) &&
+                              unified_metal_collective_path(output);
+    MPSBufferView out_view = extract_mps_buffer(output);
+    if (unified_fp32) {
+        memcpy(out_view.cpu_ptr, wire_buf.data(), nbytes);
+    } else {
+        output.copy_(inputs[rank]);
+    }
+
+    const int64_t count = output.numel();
+    float* out_fp32 = unified_fp32 ? static_cast<float*>(out_view.cpu_ptr) : nullptr;
+
+    at::Tensor ack = torch::zeros(1, output.options());
+    for (int dest = 0; dest < ws; dest++) {
+        watchdog_->touch(seq);
+        const uint32_t tid = static_cast<uint32_t>(dest);
+        if (rank == dest) {
+            for (int src = 0; src < ws; src++) {
+                if (src == dest) {
+                    continue;
+                }
+                wire_recv(transport_.get(), src, seq, tid, wire_buf.data(), nbytes);
+                if (out_fp32) {
+                    cpu_reduce_op(out_fp32,
+                                  static_cast<const float*>(wire_buf.data()),
+                                  count, op);
+                } else {
+                    at::Tensor recv_tensor = torch::empty_like(output);
+                    unstage_from_recv(recv_tensor, wire_buf.data(), nbytes);
+                    metal_reduce_op(output, recv_tensor, op);
+                }
+                compressed_send(src, kWireCollectiveOp(), seq, tid, ack);
+                metrics_->record_transport_bytes(nbytes, false);
+            }
+        } else {
+            blit_tensor_to_buffer(inputs[dest], wire_buf.data());
+            mccl_queue_drain();
+            wire_send(transport_.get(), dest, seq, tid, wire_buf.data(), nbytes);
+            compressed_recv(dest, kWireCollectiveOp(), seq, tid, ack);
+            metrics_->record_transport_bytes(nbytes, true);
+        }
+    }
 }
 
 
@@ -2985,6 +3041,12 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                 MPSBufferView in_view = extract_mps_buffer(input_copy);
                 MPSBufferView out_view = extract_mps_buffer(outputs_copy[rank]);
                 memcpy(out_view.cpu_ptr, in_view.cpu_ptr, nbytes);
+            } else if (unified_metal_collective_path(input_copy)) {
+                // copy_ only updates the GPU view; stage_for_send_collective reads
+                // cpu_ptr on the unified path, so seed via memcpy from input.
+                MPSBufferView in_view = extract_mps_buffer(input_copy);
+                MPSBufferView out_view = extract_mps_buffer(outputs_copy[rank]);
+                memcpy(out_view.cpu_ptr, in_view.cpu_ptr, nbytes);
             } else {
                 outputs_copy[rank].copy_(input_copy);
             }
@@ -3012,7 +3074,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                 }
                 RingPipelineCtx ctx{transport_.get(), watchdog_.get(),
                                     metrics_.get(), seq, left, right,
-                                    OpType::ALLGATHER,
+                                    kWireCollectiveOp(),
                                     c10d::ReduceOp::SUM, use_cpu};
                 run_ring_pipeline(ctx, outputs_copy, plan, /*lookahead=*/1);
             } else {
@@ -3033,9 +3095,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                 void* recv_dst = recv_buf_fallback.data();
 
                 MCCL_CHECK(transport_->send_recv_overlap(
-                    right, OpType::ALLGATHER, seq, step_tid,
+                    right, kWireCollectiveOp(), seq, step_tid,
                     staged.data, nbytes,
-                    left, OpType::ALLGATHER, seq, recv_tid,
+                    left, kWireCollectiveOp(), seq, recv_tid,
                     recv_dst, nbytes),
                     "allgather step " + std::to_string(step) + " failed");
 
@@ -3139,6 +3201,12 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
             IncomingKeepAlive incoming_keep;
 
             const size_t small_thresh_rs = transport_->config().small_msg_threshold;
+            if (ws >= 3) {
+                // Ring RS leaves reduced chunks rotated; star mesh matches
+                // allgather_star_small reliability on multi-rank TCP.
+                reduce_scatter_star_small(chunks, output_copy, seq, nbytes, rs_op);
+                mps_stream_sync_after_cpu_mps_buffer_write();
+            } else {
             if (ring_pipeline_for_message(nbytes, small_thresh_rs)) {
                 // Streaming pipeline: send(s) = (rank+1-s) = recv(s-1), so
                 // lookahead 1; every received chunk is reduced into place
@@ -3237,6 +3305,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                 }
                 output_copy.copy_(chunks[my_chunk]);
             }
+            }  // ws == 2 ring paths
             collective_gpu_tail(this, use_cpu, work_ptr, incoming_keep);
             arm_work_release(work_ptr);
         },

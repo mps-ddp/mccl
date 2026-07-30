@@ -159,6 +159,13 @@ private:
                               const at::Tensor& input,
                               uint32_t seq, size_t nbytes);
 
+    /// Rank-ordered star reduce_scatter for small payloads (ws >= 3): each
+    /// dest rank recv-reduces inputs[dest] from every src over the full mesh.
+    void reduce_scatter_star_small(std::vector<at::Tensor>& inputs,
+                                   at::Tensor& output,
+                                   uint32_t seq, size_t nbytes,
+                                   c10d::ReduceOp::RedOpType op);
+
     // Compressed send/recv helpers
     void compressed_send(int peer, OpType op, uint32_t seq, uint32_t tid,
                          const at::Tensor& tensor);

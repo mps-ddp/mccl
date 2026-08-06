@@ -48,6 +48,8 @@ def test_vdsp_mps_parity(n_fft: int, hop: int, win: int) -> None:
         window=w,
         backend="vdsp",
     )
+    assert torch.isfinite(ref).all(), "CPU STFT reference produced non-finite values"
+    assert torch.isfinite(got).all(), "MCCL float32 STFT produced non-finite values"
     assert float((ref - got.detach().cpu()).abs().max()) < 1e-4
 
     xi = x.detach().clone().requires_grad_(True)
@@ -69,6 +71,12 @@ def test_vdsp_mps_parity(n_fft: int, hop: int, win: int) -> None:
         center=True,
         return_complex=True,
     ).abs().sum().backward()
+    assert torch.isfinite(xref_g.grad).all(), (
+        "CPU STFT reference produced non-finite input gradients"
+    )
+    assert torch.isfinite(xi.grad).all(), (
+        "MCCL float32 STFT produced non-finite input gradients"
+    )
     assert _grad_cosine(xref_g.grad, xi.grad.cpu()) > 0.75
 
     spec = stft(

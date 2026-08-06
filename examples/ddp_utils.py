@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import statistics
 import torch
 import torch.nn as nn
+from typing import Any
 
 
 # ── Synthetic dataset ────────────────────────────────────────────────
@@ -157,19 +159,28 @@ def build_model(input_dim: int, num_classes: int, hidden: int, depth: int) -> nn
 
 def write_training_stats(path: str, mode: str, step_times: list[float],
                          losses: list[float], batch_size: int,
-                         world_size: int, total_params: int) -> None:
+                         world_size: int, total_params: int,
+                         extra: dict[str, Any] | None = None) -> None:
     avg_time = sum(step_times) / len(step_times) if step_times else 0.0
+    median_time = statistics.median(step_times) if step_times else 0.0
+    sorted_times = sorted(step_times)
+    p99_index = max(0, int(0.99 * len(sorted_times)) - 1)
+    p99_time = sorted_times[p99_index] if sorted_times else 0.0
     throughput = (batch_size * world_size) / avg_time if avg_time > 0 else 0.0
     payload = {
         "mode": mode,
         "step_times": step_times,
         "losses": losses,
         "avg_step_time_s": avg_time,
+        "median_step_time_s": median_time,
+        "p99_step_time_s": p99_time,
         "throughput_samples_per_sec": throughput,
         "batch_size_per_rank": batch_size,
         "world_size": world_size,
         "global_batch_size": batch_size * world_size,
         "total_params": total_params,
     }
+    if extra:
+        payload.update(extra)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)

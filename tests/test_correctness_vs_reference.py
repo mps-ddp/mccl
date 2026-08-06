@@ -49,6 +49,7 @@ def _allreduce_check_fn(rank, world_size):
         base = torch.arange(n, dtype=torch.float64) % 13 - 6.0
         mine = (base + float(rank + 1)).to(dtype)
         t = mine.to("mps")
+        assert torch.isfinite(t).all(), f"non-finite allreduce input at rank={rank} n={n}"
 
         contribs = [
             ((base + float(r + 1)).to(dtype).to(torch.float64))
@@ -66,6 +67,10 @@ def _allreduce_check_fn(rank, world_size):
             raise AssertionError(f"unhandled op {op_name}")
 
         dist.all_reduce(t, op=op)
+        assert torch.isfinite(t).all(), (
+            f"non-finite allreduce output at rank={rank} n={n} "
+            f"dtype={dtype} op={op_name}"
+        )
         got = t.cpu().to(torch.float64)
 
         # Values are small integers (exact in all dtypes); ring reduction
@@ -151,58 +156,169 @@ class TestDeterminism:
 
 
 def _allgather_check_fn(rank, world_size):
+    import os
     import torch
     import torch.distributed as dist
 
-    for n in (5, 4097, 70_001):
-        mine = (torch.arange(n, dtype=torch.float32) + 1000.0 * (rank + 1)).to("mps")
-        outs = [torch.zeros(n, dtype=torch.float32, device="mps") for _ in range(world_size)]
+    dtype = getattr(torch, os.environ.get("MCCL_TEST_DTYPE", "float32"))
+    for n in (5, 4097, 70_001, 262_147):
+        base = torch.arange(n, dtype=torch.float32)
+        if dtype == torch.bfloat16:
+            base = base % 97
+        mine = (base + 1000.0 * (rank + 1)).to(dtype).to("mps")
+        # Force a PyTorch MPS producer immediately before the collective.
+        # The authoritative bytes may not yet be reflected in shared cpu_ptr.
+        mine = mine + torch.zeros((), dtype=dtype, device="mps")
+        outs = [torch.zeros(n, dtype=dtype, device="mps") for _ in range(world_size)]
+        assert torch.isfinite(mine).all()
         dist.all_gather(outs, mine)
         for r in range(world_size):
-            expected = torch.arange(n, dtype=torch.float32) + 1000.0 * (r + 1)
-            assert torch.equal(outs[r].cpu(), expected), f"allgather n={n} rank slot {r}"
+            assert torch.isfinite(outs[r]).all(), (
+                f"non-finite allgather output n={n} rank slot {r}"
+            )
+            base = torch.arange(n, dtype=torch.float32)
+            if dtype == torch.bfloat16:
+                base = base % 97
+            expected = (base + 1000.0 * (r + 1)).to(dtype)
+            got = outs[r].cpu()
+            assert torch.equal(got, expected), (
+                f"allgather n={n} rank slot {r}: "
+                f"max_err={(got.float() - expected.float()).abs().max().item()}"
+            )
 
 
 def _reduce_scatter_check_fn(rank, world_size):
+    import os
     import torch
     import torch.distributed as dist
 
+    dtype = getattr(torch, os.environ.get("MCCL_TEST_DTYPE", "float32"))
     n = 4096
     ins = [
-        (torch.full((n,), float(rank + 1) * (i + 1), dtype=torch.float32)).to("mps")
+        torch.full(
+            (n,), float(rank + 1) * (i + 1), dtype=dtype, device="mps"
+        )
         for i in range(world_size)
     ]
-    out = torch.zeros(n, dtype=torch.float32, device="mps")
+    out = torch.zeros(n, dtype=dtype, device="mps")
+    assert all(torch.isfinite(t).all() for t in ins)
     dist.reduce_scatter(out, ins, op=dist.ReduceOp.SUM)
+    assert torch.isfinite(out).all(), f"non-finite reduce_scatter output rank={rank}"
     expected = sum(float(r + 1) * (rank + 1) for r in range(world_size))
-    assert torch.allclose(
-        out.cpu(), torch.full((n,), expected)
-    ), f"reduce_scatter rank {rank}"
+    got = out.cpu()
+    want = torch.full((n,), expected, dtype=dtype)
+    assert torch.allclose(got, want, rtol=0.0, atol=0.0), (
+        f"reduce_scatter rank {rank}: expected={expected}, "
+        f"first={got[0].item()}, max_err={(got.float() - want.float()).abs().max().item()}"
+    )
 
 
 def _broadcast_check_fn(rank, world_size):
+    import os
     import torch
     import torch.distributed as dist
 
+    dtype = getattr(torch, os.environ.get("MCCL_TEST_DTYPE", "float32"))
     for n in (7, 70_001):
         t = (
-            torch.arange(n, dtype=torch.float32).to("mps")
+            (torch.arange(n, dtype=torch.float32) % 97).to(dtype).to("mps")
             if rank == 0
-            else torch.zeros(n, dtype=torch.float32, device="mps")
+            else torch.zeros(n, dtype=dtype, device="mps")
         )
         dist.broadcast(t, src=0)
-        assert torch.equal(t.cpu(), torch.arange(n, dtype=torch.float32))
+        assert torch.isfinite(t).all(), f"non-finite broadcast output rank={rank} n={n}"
+        expected = (torch.arange(n, dtype=torch.float32) % 97).to(dtype)
+        assert torch.equal(t.cpu(), expected)
 
 
 class TestOtherCollectivesVsReference:
+    @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
     @pytest.mark.parametrize("world_size", [2, 3])
-    def test_allgather(self, world_size):
-        run_workers(_allgather_check_fn, world_size=world_size)
+    def test_allgather(self, dtype, world_size):
+        run_workers(
+            _allgather_check_fn,
+            world_size=world_size,
+            env={"MCCL_TEST_DTYPE": dtype},
+        )
 
+    @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
     @pytest.mark.parametrize("world_size", [2, 3])
-    def test_reduce_scatter(self, world_size):
-        run_workers(_reduce_scatter_check_fn, world_size=world_size)
+    def test_reduce_scatter(self, dtype, world_size):
+        run_workers(
+            _reduce_scatter_check_fn,
+            world_size=world_size,
+            env={"MCCL_TEST_DTYPE": dtype},
+        )
 
+    @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
     @pytest.mark.parametrize("world_size", [2, 3])
-    def test_broadcast(self, world_size):
-        run_workers(_broadcast_check_fn, world_size=world_size)
+    def test_broadcast(self, dtype, world_size):
+        run_workers(
+            _broadcast_check_fn,
+            world_size=world_size,
+            env={"MCCL_TEST_DTYPE": dtype},
+        )
+
+
+def _bf16_repeated_allreduce_fn(rank, world_size):
+    import torch
+    import torch.distributed as dist
+
+    for i in range(20):
+        n = (3, 4097, 70_001)[i % 3]
+        value = float(rank + 1) + float(i % 4)
+        t = torch.full((n,), value, dtype=torch.bfloat16, device="mps")
+        assert torch.isfinite(t).all(), f"non-finite input at iteration {i}"
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        assert torch.isfinite(t).all(), f"non-finite output at iteration {i}"
+        expected = sum(float(r + 1) + float(i % 4) for r in range(world_size))
+        want = torch.full_like(t, expected)
+        assert torch.equal(t, want), f"incorrect bf16 allreduce at iteration {i}"
+
+
+def _bf16_random_allreduce_fn(rank, world_size):
+    import torch
+    import torch.distributed as dist
+
+    for n in (257, 262_147):
+        contributions = []
+        for r in range(world_size):
+            generator = torch.Generator().manual_seed(7000 + 100 * n + r)
+            contributions.append(
+                torch.randn(n, generator=generator, dtype=torch.float32).to(
+                    torch.bfloat16
+                )
+            )
+
+        for op_name in ("SUM", "AVG", "MAX"):
+            t = contributions[rank].clone().to("mps")
+            assert torch.isfinite(t).all(), (
+                f"non-finite random BF16 input n={n} op={op_name}"
+            )
+            dist.all_reduce(t, op=getattr(dist.ReduceOp, op_name))
+            assert torch.isfinite(t).all(), (
+                f"non-finite random BF16 output n={n} op={op_name}"
+            )
+
+            if op_name == "MAX":
+                expected = contributions[0]
+                for contribution in contributions[1:]:
+                    expected = torch.maximum(expected, contribution)
+                assert torch.equal(t.cpu(), expected), (
+                    f"random BF16 MAX mismatch n={n}"
+                )
+            else:
+                expected = sum(c.float() for c in contributions)
+                if op_name == "AVG":
+                    expected /= world_size
+                torch.testing.assert_close(
+                    t.float().cpu(), expected, rtol=2e-2, atol=1.25e-1
+                )
+
+
+class TestBF16Diagnostics:
+    def test_random_allreduce_small_and_ring(self):
+        run_workers(_bf16_random_allreduce_fn, world_size=3, timeout=300)
+
+    def test_repeated_allreduce_finite(self):
+        run_workers(_bf16_repeated_allreduce_fn, world_size=3, timeout=300)

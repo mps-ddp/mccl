@@ -257,6 +257,21 @@ class MCCLConfig:
                 out[env_key] = s
         return out
 
+    def apply_ddp_bucket_env(self, only_if_unset: bool = True) -> Dict[str, str]:
+        """Keep PyTorch's DDP bucket cap and MCCL's demux reservation aligned."""
+        bucket_bytes = int(self.ddp_bucket_mb) * 1024 * 1024
+        values = {
+            "DDP_BUCKET_MB": str(int(self.ddp_bucket_mb)),
+            "MCCL_DEMUX_MAX_COLLECTIVE_BYTES": str(bucket_bytes),
+        }
+        out: Dict[str, str] = {}
+        for key, value in values.items():
+            if only_if_unset and key in os.environ:
+                continue
+            os.environ[key] = value
+            out[key] = value
+        return out
+
     def __str__(self) -> str:
         lines = ["MCCLConfig("]
         for k, v in self.to_dict().items():

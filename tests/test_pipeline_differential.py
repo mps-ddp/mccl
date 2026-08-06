@@ -70,6 +70,29 @@ def _compare_saved_fn(rank, world_size):
             )
 
 
+def _allgather_save_fn(rank, world_size):
+    import os
+    from pathlib import Path
+
+    import torch
+    import torch.distributed as dist
+
+    tag = os.environ["MCCL_TEST_TAG"]
+    out_dir = Path(os.environ["MCCL_TEST_OUT_DIR"])
+    n = int(os.environ["MCCL_TEST_N"])
+    dtype = getattr(torch, os.environ["MCCL_TEST_DTYPE"])
+    base = torch.arange(n, dtype=torch.float32) % 97
+    mine = (base + 1000.0 * (rank + 1)).to(dtype).to("mps")
+    mine = mine + torch.zeros((), dtype=dtype, device="mps")
+    outputs = [torch.empty_like(mine) for _ in range(world_size)]
+    dist.all_gather(outputs, mine)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        torch.stack([tensor.cpu() for tensor in outputs]),
+        out_dir / f"allgather_{tag}_{dtype}_ws{world_size}_r{rank}.pt",
+    )
+
+
 @pytest.mark.parametrize("world_size", WORLD_SIZES)
 @pytest.mark.parametrize("concurrency", CONCURRENCIES)
 def test_chunked_pipeline_matches_lockstep(world_size, concurrency):
@@ -98,3 +121,36 @@ def test_chunked_pipeline_matches_lockstep(world_size, concurrency):
         env=base,
         timeout=120,
     )
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_large_allgather_pipeline_matches_lockstep(dtype):
+    world_size = 3
+    base = {
+        "MCCL_RING_ALGO": "chunked",
+        "MCCL_TEST_N": "262147",
+        "MCCL_TEST_DTYPE": dtype,
+        "MCCL_TEST_OUT_DIR": str(_OUT_DIR),
+    }
+    for tag, pipeline in (("oracle", "0"), ("pipeline", "1")):
+        run_workers(
+            _allgather_save_fn,
+            world_size=world_size,
+            env={
+                **base,
+                "MCCL_TEST_TAG": tag,
+                "MCCL_RING_PIPELINE": pipeline,
+            },
+            timeout=300,
+        )
+    for rank in range(world_size):
+        suffix = f"torch.{dtype}_ws{world_size}_r{rank}.pt"
+        oracle = torch.load(
+            _OUT_DIR / f"allgather_oracle_{suffix}", weights_only=True
+        )
+        pipeline = torch.load(
+            _OUT_DIR / f"allgather_pipeline_{suffix}", weights_only=True
+        )
+        assert torch.equal(oracle, pipeline), (
+            f"large {dtype} allgather pipeline mismatch at rank {rank}"
+        )

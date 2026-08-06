@@ -288,7 +288,9 @@ struct RingPipelineCtx {
 void run_ring_pipeline(const RingPipelineCtx& ctx,
                        std::vector<at::Tensor>& chunks,
                        const std::vector<RingStep>& plan,
-                       int lookahead) {
+                       int lookahead,
+                       int initial_send_idx = -1,
+                       const void* initial_send_data = nullptr) {
     const size_t nsteps = plan.size();
     if (nsteps == 0) return;
 
@@ -309,12 +311,20 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
     std::vector<std::unique_ptr<PooledBuffer>> send_staging(chunks.size());
     std::vector<size_t> send_staging_nbytes(chunks.size(), 0);
     std::vector<const void*> send_direct(chunks.size(), nullptr);
+    bool initial_send_claimed = false;
     auto stage_chunk_for_tx = [&](int idx) {
         if (idx < 0) return;
         size_t nbytes = chunk_bytes(idx);
         if (nbytes == 0) return;
-        StagingBuffer staged = stage_for_send_collective(chunks[idx]);
+        if (!initial_send_claimed && idx == initial_send_idx &&
+            initial_send_data != nullptr) {
+            send_direct[idx] = initial_send_data;
+            send_staging_nbytes[idx] = nbytes;
+            initial_send_claimed = true;
+            return;
+        }
         if (unified_metal_collective_path(chunks[idx])) {
+            StagingBuffer staged = stage_for_send_collective(chunks[idx]);
             send_direct[idx] = staged.data;
             send_staging_nbytes[idx] = nbytes;
             return;
@@ -324,7 +334,9 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
                 staging_memory_pool(), nbytes);
             send_staging_nbytes[idx] = nbytes;
         }
-        memcpy(send_staging[idx]->data(), staged.data, nbytes);
+        // Use this chunk's caller-owned buffer as the blit destination instead
+        // of serializing through the global staging buffer and memcpying again.
+        blit_tensor_to_buffer(chunks[idx], send_staging[idx]->data());
         send_direct[idx] = send_staging[idx]->data();
     };
 
@@ -1151,10 +1163,18 @@ void ProcessGroupMCCL::compressed_recv(int peer, OpType op, uint32_t seq,
         unstage_from_recv(tensor, decomp_buf.data(), nbytes, cpu_unified_stage);
         metrics_->record_transport_bytes(sizeof(wire_size) + wire_size, false);
     } else {
-        PooledBuffer recv_buf(staging_memory_pool(), nbytes);
-        MCCL_CHECK(transport_->recv_chunks(peer, op, seq, tid, recv_buf.data(), nbytes),
+        void* recv_dst = tensor_wire_recv_ptr(tensor);
+        std::unique_ptr<PooledBuffer> recv_buf;
+        if (!recv_dst) {
+            recv_buf = std::make_unique<PooledBuffer>(
+                staging_memory_pool(), nbytes);
+            recv_dst = recv_buf->data();
+        }
+        MCCL_CHECK(transport_->recv_chunks(peer, op, seq, tid, recv_dst, nbytes),
                    "compressed_recv recv_chunks (uncompressed) failed");
-        unstage_from_recv(tensor, recv_buf.data(), nbytes);
+        if (recv_buf) {
+            unstage_from_recv(tensor, recv_dst, nbytes);
+        }
         metrics_->record_transport_bytes(nbytes, false);
     }
 }
@@ -2734,12 +2754,14 @@ void ProcessGroupMCCL::allgather_star_small(std::vector<at::Tensor>& outputs,
     for (int src = 0; src < ws; src++) {
         watchdog_->touch(seq);
         if (rank == src) {
+            const at::Tensor& send_tensor =
+                compressor_ ? input : outputs[rank];
             for (int dst = 0; dst < ws; dst++) {
                 if (dst == src) {
                     continue;
                 }
                 compressed_send(dst, kWireCollectiveOp(), seq,
-                                static_cast<uint32_t>(rank), input);
+                                static_cast<uint32_t>(rank), send_tensor);
                 compressed_recv(dst, kWireCollectiveOp(), seq,
                                 static_cast<uint32_t>(rank), ack);
                 metrics_->record_transport_bytes(nbytes, true);
@@ -2780,13 +2802,19 @@ void ProcessGroupMCCL::reduce_scatter_star_small(std::vector<at::Tensor>& inputs
     if (unified_fp32) {
         memcpy(out_view.cpu_ptr, wire_buf.data(), nbytes);
     } else {
-        output.copy_(inputs[rank]);
+        // This runs on a progress thread, outside PyTorch's MPS stream.
+        // copy_ is asynchronous and can execute after the MCCL Metal reductions,
+        // overwriting the reduced result with this rank's local chunk.  Seed the
+        // output with a completed blit before launching reductions.
+        blit_buffer_to_tensor(wire_buf.data(), output);
     }
 
     const int64_t count = output.numel();
     float* out_fp32 = unified_fp32 ? static_cast<float*>(out_view.cpu_ptr) : nullptr;
 
     at::Tensor ack = torch::zeros(1, output.options());
+    std::vector<at::Tensor> incoming_keep;
+    incoming_keep.reserve(static_cast<size_t>(ws - 1));
     for (int dest = 0; dest < ws; dest++) {
         watchdog_->touch(seq);
         const uint32_t tid = static_cast<uint32_t>(dest);
@@ -2803,7 +2831,8 @@ void ProcessGroupMCCL::reduce_scatter_star_small(std::vector<at::Tensor>& inputs
                 } else {
                     at::Tensor recv_tensor = torch::empty_like(output);
                     unstage_from_recv(recv_tensor, wire_buf.data(), nbytes);
-                    metal_reduce_op(output, recv_tensor, op);
+                    metal_reduce_op_fenced(output, recv_tensor, op);
+                    incoming_keep.push_back(std::move(recv_tensor));
                 }
                 compressed_send(src, kWireCollectiveOp(), seq, tid, ack);
                 metrics_->record_transport_bytes(nbytes, false);
@@ -2815,6 +2844,11 @@ void ProcessGroupMCCL::reduce_scatter_star_small(std::vector<at::Tensor>& inputs
             compressed_recv(dest, kWireCollectiveOp(), seq, tid, ack);
             metrics_->record_transport_bytes(nbytes, true);
         }
+    }
+    if (!incoming_keep.empty()) {
+        // Keep every recv tensor alive until its asynchronous Metal consumer is
+        // complete and make the reduced output visible before returning.
+        metal_sync_queue_only();
     }
 }
 
@@ -3037,18 +3071,16 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
             bool use_cpu = (input_copy.scalar_type() == at::kFloat) &&
                            prefer_cpu_unified_buffer_path(input_copy);
 
-            if (use_cpu) {
-                MPSBufferView in_view = extract_mps_buffer(input_copy);
+            // Read the GPU-authoritative input before seeding the local output
+            // slot.  Reading input_copy.cpu_ptr directly can observe stale bytes
+            // after a PyTorch MPS producer, causing the ring to forward zeros.
+            PooledBuffer local_input(staging_memory_pool(), nbytes);
+            blit_tensor_to_buffer(input_copy, local_input.data());
+            if (unified_metal_collective_path(outputs_copy[rank])) {
                 MPSBufferView out_view = extract_mps_buffer(outputs_copy[rank]);
-                memcpy(out_view.cpu_ptr, in_view.cpu_ptr, nbytes);
-            } else if (unified_metal_collective_path(input_copy)) {
-                // copy_ only updates the GPU view; stage_for_send_collective reads
-                // cpu_ptr on the unified path, so seed via memcpy from input.
-                MPSBufferView in_view = extract_mps_buffer(input_copy);
-                MPSBufferView out_view = extract_mps_buffer(outputs_copy[rank]);
-                memcpy(out_view.cpu_ptr, in_view.cpu_ptr, nbytes);
+                memcpy(out_view.cpu_ptr, local_input.data(), nbytes);
             } else {
-                outputs_copy[rank].copy_(input_copy);
+                blit_buffer_to_tensor(local_input.data(), outputs_copy[rank]);
             }
 
             int left = (rank - 1 + ws) % ws;
@@ -3076,7 +3108,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                                     metrics_.get(), seq, left, right,
                                     kWireCollectiveOp(),
                                     c10d::ReduceOp::SUM, use_cpu};
-                run_ring_pipeline(ctx, outputs_copy, plan, /*lookahead=*/1);
+                run_ring_pipeline(ctx, outputs_copy, plan, /*lookahead=*/1,
+                                  rank, local_input.data());
             } else {
             PooledBuffer recv_buf_fallback(staging_memory_pool(), nbytes);
 
@@ -3092,7 +3125,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                 // PyTorch's writes, and unstage blits complete synchronously.
                 StagingBuffer staged = stage_for_send_collective(outputs_copy[send_idx]);
 
-                void* recv_dst = recv_buf_fallback.data();
+                void* recv_dst = tensor_wire_recv_ptr(outputs_copy[recv_idx]);
+                const bool recv_inplace = recv_dst != nullptr;
+                if (!recv_dst) {
+                    recv_dst = recv_buf_fallback.data();
+                }
 
                 MCCL_CHECK(transport_->send_recv_overlap(
                     right, kWireCollectiveOp(), seq, step_tid,
@@ -3101,7 +3138,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
                     recv_dst, nbytes),
                     "allgather step " + std::to_string(step) + " failed");
 
-                unstage_from_recv(outputs_copy[recv_idx], recv_dst, nbytes);
+                if (!recv_inplace) {
+                    unstage_from_recv(outputs_copy[recv_idx], recv_dst, nbytes);
+                }
                 metrics_->record_transport_bytes(nbytes, true);
                 metrics_->record_transport_bytes(nbytes, false);
             }

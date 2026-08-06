@@ -83,6 +83,36 @@ def _async_buckets_fn(rank, world_size):
         assert bad == 0, f"bucket {i}: {bad}/{n} bad"
 
 
+def _async_large_bf16_allgather_fn(rank, world_size):
+    import torch
+    import torch.distributed as dist
+
+    pending = []
+    for i, n in enumerate((262_147, 400_009, 524_287)):
+        base = torch.arange(n, dtype=torch.float32) % 97
+        mine = (base + 1000.0 * (rank + 1) + i).to(
+            torch.bfloat16
+        ).to("mps")
+        mine = mine + torch.zeros(
+            (), dtype=torch.bfloat16, device="mps"
+        )
+        outputs = [torch.empty_like(mine) for _ in range(world_size)]
+        work = dist.all_gather(outputs, mine, async_op=True)
+        pending.append((i, n, mine, outputs, work))
+
+    for i, n, mine, outputs, work in pending:
+        work.wait()
+        assert torch.isfinite(mine).all()
+        for peer, output in enumerate(outputs):
+            base = torch.arange(n, dtype=torch.float32) % 97
+            expected = (
+                base + 1000.0 * (peer + 1) + i
+            ).to(torch.bfloat16)
+            assert torch.equal(output.cpu(), expected), (
+                f"async private BF16 allgather mismatch i={i} peer={peer}"
+            )
+
+
 def _ddp_conv_overlap_fn(rank, world_size):
     import os
 
@@ -153,6 +183,18 @@ class TestUnifiedCollectiveStress:
     @pytest.mark.parametrize("world_size", [2, 3])
     def test_async_bucket_stream(self, world_size):
         run_workers(_async_buckets_fn, world_size=world_size, env=_UNIFIED_ENV, timeout=600)
+
+    def test_private_bf16_allgather_concurrency(self):
+        run_workers(
+            _async_large_bf16_allgather_fn,
+            world_size=3,
+            env={
+                **_BLIT_ENV,
+                "MCCL_RING_PIPELINE": "1",
+                "MCCL_COLLECTIVE_CONCURRENCY": "2",
+            },
+            timeout=600,
+        )
 
     @pytest.mark.parametrize("world_size", [2, 4, 8])
     def test_ddp_conv_overlap_parity(self, world_size):

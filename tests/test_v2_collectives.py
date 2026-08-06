@@ -251,3 +251,31 @@ class TestF16Collectives:
             assert torch.allclose(tensor, expected, rtol=1e-2)
 
         _run_distributed(fn, world_size=2, port=34700)
+
+
+class TestBF16Collectives:
+    """BFloat16 point-to-point coverage; reduction collectives are checked
+    against analytical references in test_correctness_vs_reference.py."""
+
+    def test_send_recv_bf16(self):
+        def fn(rank, world_size):
+            if rank == 0:
+                tensor = torch.tensor(
+                    [1.0, -2.0, 3.5, 128.0],
+                    device="mps",
+                    dtype=torch.bfloat16,
+                )
+                assert torch.isfinite(tensor).all()
+                dist.send(tensor, dst=1)
+            else:
+                tensor = torch.zeros(4, device="mps", dtype=torch.bfloat16)
+                dist.recv(tensor, src=0)
+                assert torch.isfinite(tensor).all()
+                expected = torch.tensor(
+                    [1.0, -2.0, 3.5, 128.0],
+                    device="mps",
+                    dtype=torch.bfloat16,
+                )
+                assert torch.equal(tensor, expected)
+
+        _run_distributed(fn, world_size=2, port=34900)

@@ -34,3 +34,23 @@ def test_perf_mode():
     cfg = MCCLConfig.for_world_size(8, mode="perf")
     assert cfg.ring_algo == "chunked"
     assert cfg.collective_concurrency >= 2
+
+
+def test_ddp_bucket_and_demux_reservation_stay_coupled(monkeypatch):
+    monkeypatch.delenv("DDP_BUCKET_MB", raising=False)
+    monkeypatch.delenv("MCCL_DEMUX_MAX_COLLECTIVE_BYTES", raising=False)
+    cfg = MCCLConfig(ddp_bucket_mb=96)
+    applied = cfg.apply_ddp_bucket_env()
+    assert applied == {
+        "DDP_BUCKET_MB": "96",
+        "MCCL_DEMUX_MAX_COLLECTIVE_BYTES": str(96 * 1024 * 1024),
+    }
+
+
+def test_ddp_bucket_coupling_preserves_explicit_env(monkeypatch):
+    monkeypatch.setenv("DDP_BUCKET_MB", "64")
+    monkeypatch.setenv("MCCL_DEMUX_MAX_COLLECTIVE_BYTES", "123")
+    cfg = MCCLConfig(ddp_bucket_mb=96)
+    assert cfg.apply_ddp_bucket_env(only_if_unset=True) == {}
+    assert os.environ["DDP_BUCKET_MB"] == "64"
+    assert os.environ["MCCL_DEMUX_MAX_COLLECTIVE_BYTES"] == "123"

@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
+import socket
 import sys
 import time
 
@@ -147,7 +149,7 @@ def run_ddp(args) -> None:
     # Backend setup
     if args.backend == "mccl":
         import mccl  # noqa: F401
-        _setup_mccl_env()
+        _setup_mccl_env(args.bucket_mb)
         if not torch.backends.mps.is_available():
             print("MPS not available (required for mccl backend).", file=sys.stderr)
             sys.exit(1)
@@ -205,6 +207,7 @@ def run_ddp(args) -> None:
             print(f"  {tag} {step:4d}  loss={loss.item():.6f}  {dt:.3f}s", flush=True)
 
     # Results
+    metrics_payload = None
     if step_times and rank == 0:
         avg = sum(step_times) / len(step_times)
         gbs = args.batch_size * world_size
@@ -215,6 +218,16 @@ def run_ddp(args) -> None:
                 import mccl as _m
                 metrics = _m.get_metrics()
                 if metrics:
+                    metric_names = (
+                        "total_ops", "total_bytes_sent", "total_bytes_recv",
+                        "total_errors", "avg_latency_ms", "p50_latency_ms",
+                        "p99_latency_ms", "peak_throughput_gbps", "avg_sync_ms",
+                        "avg_network_ms", "avg_reduce_ms", "avg_queue_wait_ms",
+                        "avg_execution_ms",
+                    )
+                    metrics_payload = {
+                        name: getattr(metrics, name) for name in metric_names
+                    }
                     mccl_info = (f"\n  MCCL: {metrics.total_ops} ops, "
                                  f"avg_lat={metrics.avg_latency_ms:.2f}ms")
                     for attr in ("avg_sync_ms", "avg_network_ms", "avg_reduce_ms"):
@@ -231,8 +244,20 @@ def run_ddp(args) -> None:
               f"  Throughput: {gbs/avg:.0f} samples/s{mccl_info}", flush=True)
 
     if args.save_stats and rank == 0 and step_times:
+        config_payload = {
+            key: value for key, value in sorted(os.environ.items())
+            if key.startswith("MCCL_") or key == "DDP_BUCKET_MB"
+        }
         write_training_stats(args.save_stats, f"ddp_{args.backend}", step_times, losses,
-                             args.batch_size, world_size, total_params)
+                             args.batch_size, world_size, total_params,
+                             extra={
+                                 "hostname": socket.gethostname(),
+                                 "platform": platform.platform(),
+                                 "torch_version": torch.__version__,
+                                 "bucket_mb": args.bucket_mb,
+                                 "config": config_payload,
+                                 "mccl_metrics": metrics_payload,
+                             })
         print(f"Wrote stats to {args.save_stats}", flush=True)
 
     # Sanity check: first 8 floats of first param match rank 0 on every rank
@@ -254,13 +279,18 @@ def run_ddp(args) -> None:
     dist.destroy_process_group()
 
 
-def _setup_mccl_env() -> None:
+def _setup_mccl_env(bucket_mb: int) -> None:
     if "MCCL_PORT_BASE" not in os.environ:
         mp = int(os.environ.get("MASTER_PORT", "29500"))
         os.environ["MCCL_PORT_BASE"] = str(mp + 100)
     master = os.environ.get("MASTER_ADDR", "")
     if master in ("127.0.0.1", "localhost", "::1") and "MCCL_LISTEN_ADDR" not in os.environ:
         os.environ["MCCL_LISTEN_ADDR"] = "127.0.0.1"
+    os.environ.setdefault("DDP_BUCKET_MB", str(int(bucket_mb)))
+    os.environ.setdefault(
+        "MCCL_DEMUX_MAX_COLLECTIVE_BYTES",
+        str(int(bucket_mb) * 1024 * 1024),
+    )
 
 
 # ── Entry point ──────────────────────────────────────────────────────

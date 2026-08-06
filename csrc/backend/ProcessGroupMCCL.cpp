@@ -1477,7 +1477,7 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
     size_t nbytes = tensor_nbytes(tensor);
     int64_t count = tensor.numel();
     bool use_fast = (tensor.scalar_type() == at::kFloat) && !compressor_ &&
-                    fp32_cpu_reduce_enabled();
+                    fp32_cpu_reduce_enabled() && cpu_ok;
 
     if (use_fast) {
         StagingBuffer staged = stage_for_send_collective(tensor);

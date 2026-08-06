@@ -118,6 +118,14 @@ class TestAccumulateChunk:
             assert torch.allclose(result, expected, rtol=1e-2, atol=1e-2), \
                 f"f16 size={size}: got {result}"
 
+    def test_i64_non_aligned(self):
+        k = _kernels()
+        for size in (1, 3, 7, 13):
+            a = torch.arange(size, device="mps", dtype=torch.int64)
+            b = torch.full((size,), 3, device="mps", dtype=torch.int64)
+            result = k["accumulate"](a.clone(), b)
+            assert torch.equal(result, a + b), f"i64 size={size}: got {result}"
+
 
 # ── metal_elementwise_min ────────────────────────────────────────────
 
@@ -257,6 +265,21 @@ class TestScaleInplace:
         expected = torch.tensor([1.0, 2.0, 3.0], device="mps", dtype=torch.float16)
         assert torch.allclose(result, expected, rtol=1e-2, atol=1e-2)
 
+    def test_i64_world_size_avg_non_aligned(self):
+        k = _kernels()
+        for size in (1, 3, 7, 13):
+            expected = torch.arange(1, size + 1, device="mps", dtype=torch.int64)
+            values = expected * 3
+            result = k["scale"](values, 1.0 / 3.0)
+            assert torch.equal(result, expected), f"i64 size={size}: got {result}"
+
+    def test_bool_scale_uses_integral_avg_semantics(self):
+        k = _kernels()
+        values = torch.tensor([True, False, True], device="mps")
+        result = k["scale"](values, 0.5)
+        expected = torch.zeros(3, device="mps", dtype=torch.bool)
+        assert torch.equal(result, expected)
+
 
 # ── metal_accumulate_and_scale ───────────────────────────────────────
 
@@ -288,3 +311,27 @@ class TestAccumulateAndScale:
         result = k["acc_scale"](a.clone(), b, 0.5)
         expected = torch.tensor([2.0, 4.0, 6.0], device="mps", dtype=torch.float16)
         assert torch.allclose(result, expected, rtol=1e-2, atol=1e-2)
+
+    def test_i64_avg_two_ranks(self):
+        k = _kernels()
+        a = torch.tensor([1, 3, 5, 7, 9], device="mps", dtype=torch.int64)
+        b = torch.tensor([3, 5, 7, 9, 11], device="mps", dtype=torch.int64)
+        result = k["acc_scale"](a, b, 0.5)
+        expected = torch.tensor([2, 4, 6, 8, 10], device="mps", dtype=torch.int64)
+        assert torch.equal(result, expected)
+
+    def test_i32_avg_two_ranks(self):
+        k = _kernels()
+        a = torch.tensor([1, 3, 5, 7, 9], device="mps", dtype=torch.int32)
+        b = torch.tensor([3, 5, 7, 9, 11], device="mps", dtype=torch.int32)
+        result = k["acc_scale"](a, b, 0.5)
+        expected = torch.tensor([2, 4, 6, 8, 10], device="mps", dtype=torch.int32)
+        assert torch.equal(result, expected)
+
+    def test_bool_avg_two_ranks(self):
+        k = _kernels()
+        a = torch.tensor([True, True, False], device="mps")
+        b = torch.tensor([True, False, True], device="mps")
+        result = k["acc_scale"](a, b, 0.5)
+        expected = torch.tensor([True, False, False], device="mps")
+        assert torch.equal(result, expected)

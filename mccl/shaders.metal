@@ -638,6 +638,32 @@ kernel void scale_inplace_i32(
     }
 }
 
+kernel void scale_inplace_i64(
+    device long* buf          [[buffer(0)]],
+    constant float& scale     [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    for (uint i = base; i < min(base + kElementsPerThread, count); ++i) {
+        buf[i] = long(float(buf[i]) * scale);
+    }
+}
+
+kernel void scale_inplace_u8(
+    device uchar* buf         [[buffer(0)]],
+    constant float& scale     [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant bool& aligned    [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]]
+) {
+    uint base = gid * kElementsPerThread;
+    for (uint i = base; i < min(base + kElementsPerThread, count); ++i) {
+        buf[i] = uchar(float(buf[i]) * scale);
+    }
+}
+
 kernel void elementwise_min_i64(
     device long* dst          [[buffer(0)]],
     device const long* src    [[buffer(1)]],

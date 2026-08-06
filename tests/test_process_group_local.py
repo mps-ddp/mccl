@@ -277,6 +277,67 @@ class TestAllreduceOps:
         _run_distributed(fn, world_size=2, port=32300)
 
 
+class TestIntegralAllreduceAvg:
+    """Integral AVG covers Lightning counters and boolean metric state."""
+
+    def test_i64_two_rank_avg(self):
+        def fn(rank, world_size):
+            tensor = torch.full(
+                (13,), 1 + 2 * rank, device="mps", dtype=torch.int64
+            )
+            dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
+            expected = torch.full((13,), 2, device="mps", dtype=torch.int64)
+            assert torch.equal(tensor, expected)
+
+        _run_distributed(fn, world_size=2, port=32310)
+
+    def test_bool_two_rank_avg(self):
+        def fn(rank, world_size):
+            values = (
+                [True, True, False]
+                if rank == 0
+                else [True, False, True]
+            )
+            tensor = torch.tensor(values, device="mps", dtype=torch.bool)
+            dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
+            expected = torch.tensor(
+                [True, False, False], device="mps", dtype=torch.bool
+            )
+            assert torch.equal(tensor, expected)
+
+        _run_distributed(fn, world_size=2, port=32320)
+
+    def test_i64_three_rank_ring_avg(self):
+        def fn(rank, world_size):
+            # More than the default 256 KiB threshold forces the ring path.
+            tensor = torch.full(
+                (40_001,), rank + 1, device="mps", dtype=torch.int64
+            )
+            dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
+            expected = torch.full(
+                (40_001,), 2, device="mps", dtype=torch.int64
+            )
+            assert torch.equal(tensor, expected)
+
+        _run_distributed(
+            fn, world_size=3, port=32330, extra_mccl_env=THREE_RANK_PLAIN_RING_ENV
+        )
+
+    def test_bool_three_rank_ring_avg(self):
+        def fn(rank, world_size):
+            # Two true contributions divided by three truncate to false.
+            tensor = torch.full(
+                (270_001,), rank < 2, device="mps", dtype=torch.bool
+            )
+            dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
+            expected = torch.zeros(270_001, device="mps", dtype=torch.bool)
+            assert torch.equal(tensor, expected)
+
+        _run_distributed(
+            fn, world_size=3, port=32340, extra_mccl_env=THREE_RANK_PLAIN_RING_ENV
+        )
+
+
 @pytest.mark.slow
 class TestAllreduceAlignment:
     """Non-4-aligned sizes exercise the scalar tail path in Metal kernels."""

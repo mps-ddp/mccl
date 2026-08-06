@@ -58,6 +58,8 @@ struct KernelCache {
     id<MTLComputePipelineState> max_u8 = nil;
     id<MTLComputePipelineState> product_u8 = nil;
     id<MTLComputePipelineState> scale_i32 = nil;
+    id<MTLComputePipelineState> scale_i64 = nil;
+    id<MTLComputePipelineState> scale_u8 = nil;
 
     std::atomic<bool> initialized{false};
 };
@@ -339,7 +341,9 @@ id<MTLComputePipelineState> select_scale_pipeline(KernelCache& c, at::ScalarType
     if (dtype == at::kFloat) return c.scale_f32;
     if (dtype == at::kHalf) return c.scale_f16;
     if (dtype == at::kBFloat16) return c.scale_bf16;
+    if (dtype == at::kBool) return c.scale_u8;
     if (dtype == at::kInt) return c.scale_i32;
+    if (dtype == at::kLong) return c.scale_i64;
     return nil;
 }
 
@@ -500,6 +504,8 @@ void metal_kernels_init() {
         c.max_u8          = make_pipeline(c.device, c.library, @"elementwise_max_u8");
         c.product_u8      = make_pipeline(c.device, c.library, @"elementwise_product_u8");
         c.scale_i32       = make_pipeline(c.device, c.library, @"scale_inplace_i32");
+        c.scale_i64       = make_pipeline(c.device, c.library, @"scale_inplace_i64");
+        c.scale_u8        = make_pipeline(c.device, c.library, @"scale_inplace_u8");
 
         c.initialized.store(true, std::memory_order_release);
         MCCL_INFO("Metal kernel cache initialized (fastMath=%s)",
@@ -621,6 +627,14 @@ void metal_accumulate_and_scale(const at::Tensor& dst, const at::Tensor& src,
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)src_view.mtl_buffer;
 
     uint32_t count = safe_numel(dst);
+    auto dtype = dst.scalar_type();
+    if (dtype == at::kBool || dtype == at::kInt || dtype == at::kLong) {
+        // Integral AVG is uncommon and does not justify three fused kernels.
+        // The recursive kernel lock allows this exact two-command fallback.
+        metal_accumulate_chunk(dst, src);
+        metal_scale_inplace(dst, scale);
+        return;
+    }
     if (should_use_small_cpu_binary_path(dst, src)) {
         cpu_small_accumulate_and_scale(dst, src, static_cast<float>(scale));
         return;

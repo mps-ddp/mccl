@@ -1,8 +1,12 @@
 [build-system]
+# Exact pin: _C links against libtorch, and WorkMCCL derives from c10d::Work, so the vtable
+# picks up whatever virtuals the build-time torch declares. Building in pip's isolated env
+# against a newer torch than the install target yields a wheel that cannot dlopen
+# (Symbol not found: c10d::Work::getTimeout). Keep this equal to the torch you install with.
 requires = [
     "setuptools>=68.0",
     "wheel>=0.41",
-    "torch>=2.5.0",
+    "torch==2.13.0",
 ]
 build-backend = "setuptools.build_meta"
 

@@ -36,23 +36,78 @@ namespace mccl {
 class OrderedTransportLock {
 public:
     uint64_t take_ticket() { return next_ticket_.fetch_add(1); }
-    void enter(uint64_t ticket) {
+
+    /// Exclusive section (small/tree/bcast/ag/rs, or ring without F3): one
+    /// collective owns the wire until leave().
+    void enter_exclusive(uint64_t ticket) {
         std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait(lk, [&] { return serving_ == ticket; });
+        cv_.wait(lk, [&] {
+            return serving_ == ticket && concurrent_rings_ == 0 && !exclusive_active_;
+        });
+        exclusive_active_ = true;
     }
-    void leave() {
+    void leave_exclusive() {
         {
             std::lock_guard<std::mutex> lk(mu_);
+            exclusive_active_ = false;
             ++serving_;
         }
         cv_.notify_all();
     }
+
+    /// F3 shared ring: wait turn in issue order, then advance serving so the
+    /// next ring may start while this one is still on the wire.  Exclusive
+    /// ops wait for concurrent_rings_==0 before entering.
+    void begin_concurrent_ring(uint64_t ticket) {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] {
+            return serving_ == ticket && !exclusive_active_;
+        });
+        ++concurrent_rings_;
+        ++serving_;
+        cv_.notify_all();
+    }
+    void end_concurrent_ring() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            --concurrent_rings_;
+        }
+        cv_.notify_all();
+    }
+
+    // Legacy aliases used by OrderedTransportGuard.
+    void enter(uint64_t ticket) { enter_exclusive(ticket); }
+    void leave() { leave_exclusive(); }
 
 private:
     std::mutex mu_;
     std::condition_variable cv_;
     std::atomic<uint64_t> next_ticket_{0};
     uint64_t serving_{0};
+    int concurrent_rings_{0};
+    bool exclusive_active_{false};
+};
+
+/// RAII for F3 concurrent ring tickets (see begin/end_concurrent_ring).
+class ConcurrentRingTransportGuard {
+public:
+    ConcurrentRingTransportGuard(OrderedTransportLock& lock, uint64_t ticket)
+        : lock_(lock), ticket_(ticket) {
+        lock_.begin_concurrent_ring(ticket_);
+        active_ = true;
+    }
+    ConcurrentRingTransportGuard(const ConcurrentRingTransportGuard&) = delete;
+    ConcurrentRingTransportGuard& operator=(const ConcurrentRingTransportGuard&) = delete;
+    ~ConcurrentRingTransportGuard() {
+        if (active_) {
+            lock_.end_concurrent_ring();
+        }
+    }
+
+private:
+    OrderedTransportLock& lock_;
+    uint64_t ticket_;
+    bool active_ = false;
 };
 
 /// Scoped ticket holder.  ``enter()`` blocks until it is this ticket's turn;
@@ -261,6 +316,7 @@ private:
     /// dequeue in submission order.  transport_collective_lock_ ensures only one
     /// collective uses TCP at a time per rank (ring, tree, broadcast, etc.).
     std::unique_ptr<ProgressEngine> collective_pool_;
+    int collective_pool_threads_ = 1;
     /// Serializes all collective_pool transport I/O on shared links, in
     /// collective issue order (see OrderedTransportLock).
     OrderedTransportLock transport_collective_lock_;

@@ -22,8 +22,9 @@ namespace mccl {
 namespace {
 
 inline int demux_pipeline_depth() {
+    // Default must match ring_pipeline_depth() in ProcessGroupMCCL.cpp.
     auto* v = std::getenv("MCCL_PIPELINE_DEPTH");
-    long n = v ? std::atol(v) : 1;
+    long n = v ? std::atol(v) : 4;
     return static_cast<int>(std::min(8L, std::max(1L, n)));
 }
 
@@ -198,6 +199,54 @@ std::string resolve_best_local_addr(std::string& out_ifname, bool& out_subnet_ma
     return fallback_addr;
 }
 
+/// IPv4 address of a named interface (MCCL_IFNAME), or "" if it has none.
+std::string ipv4_addr_of_interface(const std::string& ifname) {
+    struct ifaddrs* iflist = nullptr;
+    if (getifaddrs(&iflist) != 0) return "";
+    std::string result;
+    for (struct ifaddrs* ifa = iflist; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (ifname != ifa->ifa_name) continue;
+        auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &sin->sin_addr, ip_str, sizeof(ip_str));
+        result = ip_str;
+        break;
+    }
+    freeifaddrs(iflist);
+    return result;
+}
+
+/// Link-layer facts for an interface (MTU, nominal bit rate) from the
+/// AF_LINK ifaddrs entry.  Zero when unavailable.
+void interface_link_info(const std::string& ifname, uint32_t* mtu, uint64_t* baudrate) {
+    if (mtu) *mtu = 0;
+    if (baudrate) *baudrate = 0;
+#if defined(__APPLE__)
+    struct ifaddrs* iflist = nullptr;
+    if (getifaddrs(&iflist) != 0) return;
+    for (struct ifaddrs* ifa = iflist; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_LINK) continue;
+        if (ifname != ifa->ifa_name || !ifa->ifa_data) continue;
+        auto* data = static_cast<struct if_data*>(ifa->ifa_data);
+        if (mtu) *mtu = data->ifi_mtu;
+        if (baudrate) *baudrate = data->ifi_baudrate;
+        break;
+    }
+    freeifaddrs(iflist);
+#endif
+}
+
+void log_interface_facts(int rank, const std::string& ifname, const std::string& addr) {
+    uint32_t mtu = 0;
+    uint64_t baud = 0;
+    interface_link_info(ifname, &mtu, &baud);
+    MCCL_INFO("Rank %d: MCCL endpoint %s on %s (mtu=%u link=%.1f Gbps%s)",
+              rank, addr.c_str(), ifname.c_str(), mtu,
+              static_cast<double>(baud) / 1e9,
+              (mtu > 0 && mtu < 9000) ? "; jumbo frames OFF" : "");
+}
+
 } // anonymous namespace
 
 TransportConfig TransportConfig::from_env() {
@@ -216,6 +265,19 @@ TransportConfig TransportConfig::from_env() {
         cfg.connect_timeout = std::chrono::milliseconds(std::atoll(v));
     if (auto* v = std::getenv("MCCL_HEARTBEAT_INTERVAL_MS"))
         cfg.heartbeat_interval = std::chrono::milliseconds(std::atoll(v));
+
+    // MCCL_IFNAME: bind to and publish this interface's IPv4 address.  Wrong
+    // interface on a multi-homed DAW Mac (Wi-Fi and 10GbE on one subnet) is
+    // a silent 100x slowdown, so a name that has no IPv4 address is an error.
+    if (!cfg.ifname.empty() && cfg.listen_addr == "0.0.0.0") {
+        std::string if_addr = ipv4_addr_of_interface(cfg.ifname);
+        MCCL_CHECK(!if_addr.empty(),
+                   "MCCL_IFNAME=" + cfg.ifname +
+                   " has no IPv4 address (check `ifconfig " + cfg.ifname + "`)");
+        cfg.listen_addr = if_addr;
+        MCCL_INFO("MCCL_IFNAME=%s: binding and publishing %s",
+                  cfg.ifname.c_str(), if_addr.c_str());
+    }
 
     // Auto-detect Thunderbolt bridge if no explicit listen address set
     if (cfg.listen_addr == "0.0.0.0" && cfg.ifname.empty()) {
@@ -355,7 +417,10 @@ std::string TcpTransport::listen_endpoint() const {
             MCCL_INFO("Rank %d: resolved listen address 0.0.0.0 → %s (%s, %s)",
                        rank_, addr.c_str(), ifname.c_str(),
                        subnet_match ? "subnet matches MASTER_ADDR" : "fallback — no subnet match for MASTER_ADDR");
+            log_interface_facts(rank_, ifname, addr);
         }
+    } else if (!config_.ifname.empty()) {
+        log_interface_facts(rank_, config_.ifname, addr);
     }
 
     return addr + ":" + std::to_string(port);

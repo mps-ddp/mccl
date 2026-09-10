@@ -12,7 +12,7 @@ def test_for_world_size_invariant():
         cfg = MCCLConfig.for_world_size(ws)
         assert cfg.ring_algo == "auto"
         assert cfg.collective_concurrency == 1
-        assert cfg.pipeline_depth == 1
+        assert cfg.pipeline_depth == 4
         assert cfg.port_base == 20100
         assert cfg.fast_math is True
         assert cfg.unified_collective is True

@@ -21,7 +21,7 @@ struct TransportConfig {
     std::string transport = "auto";  // "auto", "tcp", "rdma"
     std::string listen_addr = "0.0.0.0";
     uint16_t port_base = 20100;
-    std::string ifname;              // MCCL_IFNAME — advisory interface hint
+    std::string ifname;              // MCCL_IFNAME — bind + publish this interface's IPv4
     size_t chunk_bytes = 16 * 1024 * 1024;  // 16 MB default; thunderbolt profile also ensures >=16 MB
     // Algorithm selection for world_size >= 3: at or below threshold uses star (rank-0);
     // above uses plain ring by default; MCCL_RING_ALGO=chunked|ring_chunked|fast for chunked ring.

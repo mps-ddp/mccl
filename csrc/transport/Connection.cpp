@@ -65,10 +65,24 @@ void Connection::configure_socket() {
                 bufsize = 32 * 1024 * 1024;  // Keep 32MB for Thunderbolt
         }
         if (bufsize > 0) {
-            setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
-            setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+            // macOS rejects (ENOBUFS) rather than clamps when the request
+            // exceeds kern.ipc.maxsockbuf, leaving the socket on the kernel
+            // autotune path.  Log the failure explicitly; the readback below
+            // then shows what the link is actually running with.
+            int snd_rc = setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+            int snd_errno = errno;
+            int rcv_rc = setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+            int rcv_errno = errno;
+            if (snd_rc != 0 || rcv_rc != 0) {
+                MCCL_ERROR("setsockopt(SO_SNDBUF/SO_RCVBUF=%d) failed: snd=%s rcv=%s. "
+                           "Raise with: sudo sysctl -w kern.ipc.maxsockbuf=%d "
+                           "(or set MCCL_SOCK_BUFSIZE=0 to use kernel autotune)",
+                           bufsize,
+                           snd_rc != 0 ? strerror(snd_errno) : "ok",
+                           rcv_rc != 0 ? strerror(rcv_errno) : "ok",
+                           2 * bufsize);
+            }
 
-            // macOS silently clamps to kern.ipc.maxsockbuf (often 8MB).
             // Read back and warn so a silently-degraded link is diagnosable.
             int actual_snd = 0, actual_rcv = 0;
             socklen_t len = sizeof(actual_snd);
@@ -187,6 +201,31 @@ bool Connection::accept_from(int listen_fd, std::chrono::milliseconds timeout) {
     return true;
 }
 
+namespace {
+
+// macOS can fail a blocking TCP send with ENOBUFS (mbuf cluster exhaustion,
+// e.g. many multi-MB writes in flight on loopback or a saturated NIC) instead
+// of blocking.  Nothing was written when -1 is returned, so the write is safe
+// to retry once the kernel has drained.  Wait for POLLOUT (bounded) and let
+// the caller retry; give up after kEnobufsMaxWaitMs so a dead link still fails.
+constexpr int kEnobufsMaxWaitMs = 30000;
+constexpr int kEnobufsPollMs = 5;
+
+bool wait_after_enobufs(int fd, int& waited_ms) {
+    if (waited_ms >= kEnobufsMaxWaitMs) return false;
+    struct pollfd pfd{fd, POLLOUT, 0};
+    (void)::poll(&pfd, 1, kEnobufsPollMs);
+    waited_ms += kEnobufsPollMs;
+    if (waited_ms == kEnobufsPollMs * 200) {  // ~1s in: say so once
+        MCCL_WARN("send returned ENOBUFS; retrying (kernel mbuf pressure; "
+                  "consider raising kern.ipc.nmbclusters or lowering "
+                  "MCCL_PIPELINE_DEPTH / MCCL_PIPELINE_INFLIGHT_BYTES)");
+    }
+    return true;
+}
+
+} // anonymous namespace
+
 bool Connection::send_all(const void* data, size_t len) {
     if (!alive_ || fd_ < 0) return false;
 
@@ -195,11 +234,14 @@ bool Connection::send_all(const void* data, size_t len) {
 
     const uint8_t* p = static_cast<const uint8_t*>(data);
     size_t sent = 0;
+    int enobufs_wait_ms = 0;
     while (sent < len) {
         size_t chunk = std::min(MAX_SEND, len - sent);
         ssize_t n = ::send(fd_, p + sent, chunk, 0);
         if (n <= 0) {
             if (n < 0 && (errno == EINTR)) continue;
+            if (n < 0 && errno == ENOBUFS &&
+                wait_after_enobufs(fd_, enobufs_wait_ms)) continue;
             MCCL_ERROR("send failed after %zu/%zu bytes: %s",
                        sent, len, strerror(errno));
             alive_ = false;
@@ -262,11 +304,14 @@ bool Connection::send_header_payload(const void* header, size_t hdr_len,
 
     size_t sent = 0;
     int iov_idx = 0;
+    int enobufs_wait_ms = 0;
 
     while (sent < total) {
         ssize_t n = ::writev(fd_, &iov[iov_idx], 2 - iov_idx);
         if (n <= 0) {
             if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == ENOBUFS &&
+                wait_after_enobufs(fd_, enobufs_wait_ms)) continue;
             MCCL_ERROR("writev failed after %zu/%zu bytes: %s",
                        sent, total, strerror(errno));
             alive_ = false;

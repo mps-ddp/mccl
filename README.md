@@ -134,15 +134,19 @@ Network and staging run on a **background queue** (`ProgressEngine`, `csrc/runti
 |---|---|---|
 | `MCCL_RING_ALGO` | `chunked` | `chunked` = Gloo-style double-buffered ring (2P chunks). `basic` = plain ring. |
 | `MCCL_RING_PIPELINE` | on | Streaming TX/RX ring pipeline (NCCL-style): both link directions + reduce busy concurrently. `0` = lock-step fallback (debug). |
-| `MCCL_PIPELINE_DEPTH` | `1` | Receives posted ahead per ring pipeline (1-8). Raise on high-latency links. |
+| `MCCL_PIPELINE_DEPTH` | `4` | Receives posted ahead per ring pipeline (1-8). Memory cost is `depth x chunk` per pipeline. |
+| `MCCL_PIPELINE_INFLIGHT_BYTES` | 8 MB | Caps effective depth at `budget / chunk` (min 1) so large ring chunks do not pile up in the kernel (macOS ENOBUFS). 0.5-2 MB chunks (DDP buckets at ws>=8) get the full depth; >=8 MB chunks run at depth 1. |
 | `MCCL_COLLECTIVE_CONCURRENCY` | `1` | Collectives in flight (1-8; hard ceiling `MCCL_MAX_COLLECTIVE_CONCURRENCY`, default 8). Raise to overlap DDP buckets on the wire. |
 | `MCCL_DEMUX_PARK_BYTES` | auto (cap 4 GB) | Per-peer bound on messages buffered before their receive is posted. Unset = auto-scale from ws × concurrency × credit window × bucket (cap 4 GiB). |
 | `MCCL_DEMUX_INFLIGHT_BUDGET_BYTES` | 1 GB | Caps effective concurrency as `budget / DDP_bucket`. |
 | `MCCL_UNIFIED_COLLECTIVE` | on | Shared-storage fast path after producer MPS fence. `0` = Metal+blit staging. |
 | `MCCL_FAST_MATH` | on | Metal fast-math. Set `0` for strict math (SAO `mccl_strict_math`). |
 | `MCCL_PORT_BASE` | `20100` | First MCCL listen port (`+ rank`). Keep away from `MASTER_PORT`. |
+| `MCCL_IFNAME` | unset | Bind to and publish this interface's IPv4 (e.g. `en5` for 10GbE on a multi-homed Mac). Unset = interface on `MASTER_ADDR`'s subnet. Chosen interface, IP, MTU and link speed are logged at INFO. |
 | `MCCL_CREDIT_MIN_CHUNK` | 1 MB | Chunks at or above this engage NCCL-style credit flow control: a sender runs at most `depth+2` steps ahead of its consumer, so a slow/late rank is never flooded. `0` disables. |
-| `MCCL_FP32_CPU_REDUCE` | off | fp32 reductions via vDSP directly in unified memory (often higher allreduce busbw). |
+| `MCCL_UNIFIED_CPU_REDUCE` | on | Ring allreduce reduces shared-storage f32/f16/bf16 chunks with vDSP directly in unified memory (f16/bf16 accumulate in fp32 per hop). `0` = Metal kernels + per-step GPU fences (private storage always uses Metal). |
+| `MCCL_COLLECTIVE_STORE_BARRIER` | off | TCPStore barrier at the start of every collective (`1` = on). Debug aid only: costs `world_size-1` serial store round trips per collective. |
+| `MCCL_FP32_CPU_REDUCE` | off | Legacy opt-in: fp32 CPU reduce on all paths (two-rank, tree, split-large), independent of `MCCL_UNIFIED_CPU_REDUCE`. |
 | `MCCL_CPU_WRITE_SYNC` | `none` | `full` restores a full `torch.mps.synchronize()` after CPU-path collectives (debugging only; serializes buckets). |
 | `MCCL_EVENT_SYNC` | on | `0` disables MTLSharedEvent sync (falls back to blocking stream sync; kills overlap). |
 | `MCCL_LINK_PROFILE` | unset | `thunderbolt` = ≥16 MB transport chunks when `MCCL_CHUNK_BYTES` unset. |

@@ -1,5 +1,33 @@
 # Changelog
 
+## v6.6 — 24-node 10GbE ring path
+
+### Changed
+- **No per-collective TCPStore barrier** (`rendezvous_collective_enter`): off by default. At ws=24 it cost one `set` + 23 serial `wait`/`get` round trips on the rank-0 store per DDP bucket. Transport correctness does not depend on it (seq-keyed demux parking, ring credits, ack'd star/tree paths). `MCCL_COLLECTIVE_STORE_BARRIER=1` restores it for debugging. `dist.barrier()` is unchanged.
+- **Unified CPU reduce for the ring** (`MCCL_UNIFIED_CPU_REDUCE`, default on): shared-storage f32/f16/bf16 chunks are reduced with vDSP directly in unified memory (f16/bf16 widen to fp32 per hop, NCCL-equivalent rounding). Replaces per-step Metal kernel + fence + `unified_fp32_binary_reduce` (2x queue drain, self-memcpy, blit-back). `0` restores the Metal path; `MCCL_FP32_CPU_REDUCE=1` still works as before.
+- **`MCCL_PIPELINE_DEPTH` default 1 → 4**, bounded by **`MCCL_PIPELINE_INFLIGHT_BYTES`** (8 MB): effective depth = `min(depth, budget / chunk)`, so DDP-bucket chunks (0.5-2 MB) get depth 4 while >= 8 MB chunks keep depth 1.
+- **Metal ring path**: the reduce fence now rides the send gate to the TX thread instead of stalling RX (`chunk_pending` covers later COPY steps).
+- **`MCCL_IFNAME`** binds *and* publishes that interface's IPv4 (previously advisory only); interface, IP, MTU and link speed are logged at INFO on every rank.
+- **Transport**: `send`/`writev` retry on `ENOBUFS` (bounded 30 s, POLLOUT-paced) instead of killing the connection; `setsockopt(SO_SNDBUF/SO_RCVBUF)` failures are logged with errno.
+- Build: `pyproject` torch build pin `>=2.13,<2.15` (torch 2.14).
+
+### Fixed
+- **Cross-rank collective ordering deadlock with `MCCL_COLLECTIVE_CONCURRENCY>=2`**: the per-rank transport section was a plain `std::mutex`, so two pool threads could enter buckets k and k+1 in opposite order on different ranks (each then waits forever for the other's wire traffic). Replaced by `OrderedTransportLock`: tickets are taken on the issuing thread and the section is entered strictly in collective issue order. Pre-existing; the store barrier's per-collective delay had masked it.
+- Two-rank `MCCL_FP32_CPU_REDUCE=1` path reduced f16/bf16 tensors as `float*` (wrong results, pre-existing). f16/bf16 now take the Metal two-rank path.
+- **`recv()` did not order pending GPU work on the destination ahead of its write** (send/allreduce do). With torch 2.14 the zero-fill of a fresh `torch.zeros(..., device="mps")` lands after the payload and wipes it (`test_p2p_during_collective`). Now syncs the MPS stream like every other collective.
+- Tests updated for torch 2.14: CPU generator + MPS `randn`, mismatched mse target shape, missing `import mccl` in the ws=8 worker, CPU tensor allreduce on a device-bound process group.
+- Chunked lock-step ring with CPU reduce received into a staging tensor but reduced from the pooled buffer (only reachable with `MCCL_FP32_CPU_REDUCE=1` + `MCCL_RING_PIPELINE=0`).
+
+### Added
+- `tests/test_slow_rank_no_barrier.py`: slow-rank mixed ring/star collectives without the store barrier (ws=6), f16/bf16 ring on CPU and Metal paths (ws=4), fp32 unified-CPU vs legacy-CPU byte identity and vs Metal parity.
+
+### CI
+- PR/push job trimmed to the production-path set (build/protocol/kernels, ring vs reference subset, pipelined ring + concurrency ordering, slow-rank/no-barrier + f16/bf16, DDP parity) on `torch==2.14.0`; everything else moved to the nightly/manual job. Push CI also runs on `perf/**` branches.
+
+### Known issues (pre-existing, nightly-only tests)
+- `test_compression_e2e`: FP16 compressed allreduce at ws=3 (`short message: got 4 of 4096 bytes`) and TopK `test_ddp_converges` (`TopK supports float32 only`) fail on torch 2.14; compression is not used by the training path.
+- `test_metrics::test_stats_nonzero_after_traffic[2]`: `avg_network_ms=0.0` on the two-rank loopback path.
+
 ## v6.5 — Production multi-node defaults
 
 ### Changed

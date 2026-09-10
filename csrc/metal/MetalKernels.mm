@@ -218,9 +218,13 @@ bool unified_fp32_binary_reduce(const at::Tensor& dst, const at::Tensor& src,
         !src_view.cpu_accessible) {
         return false;
     }
+    // One MCCL-queue drain orders behind any kernel still writing dst/src;
+    // stage_for_send(src) would drain again with nothing new committed.
     StagingBuffer dst_staged = stage_for_send(dst);
-    memcpy(dst_view.cpu_ptr, dst_staged.data, dst_view.nbytes);
-    StagingBuffer src_staged = stage_for_send(src);
+    if (dst_staged.data != dst_view.cpu_ptr) {
+        memcpy(dst_view.cpu_ptr, dst_staged.data, dst_view.nbytes);
+    }
+    StagingBuffer src_staged = stage_for_send_nosync(src);
     cpu_reduce_op(static_cast<float*>(dst_view.cpu_ptr),
                   static_cast<const float*>(src_staged.data),
                   dst.numel(), op);

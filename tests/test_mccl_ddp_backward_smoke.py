@@ -37,8 +37,10 @@ def _ddp_backward_finite_fn(rank, world_size):
     ddp = DDP(model, bucket_cap_mb=bucket_mb)
 
     g = torch.Generator().manual_seed(500 + rank)
-    x = torch.randn(32, 512, generator=g, dtype=dtype, device="mps")
-    y = torch.randint(0, 10, (32,), generator=g, device="mps")
+    # CPU generator -> sample on CPU, then move (torch>=2.14 rejects a CPU
+    # generator for an MPS allocation).
+    x = torch.randn(32, 512, generator=g, dtype=dtype).to("mps")
+    y = torch.randint(0, 10, (32,), generator=g).to("mps")
     loss = F.cross_entropy(ddp(x), y)
     loss.backward()
 
@@ -54,7 +56,9 @@ def _ddp_backward_finite_fn(rank, world_size):
         )
 
     # Cross-rank grad parity (same seed layout → identical reduced grads).
-    buf = torch.tensor([max_grad], dtype=torch.float64)
+    # max_grad came from an fp32/bf16 value, so it is exact in fp32; keep the
+    # buffer on MPS (torch>=2.14 does not route CPU tensors to a device-bound PG).
+    buf = torch.tensor([max_grad], dtype=torch.float32, device="mps")
     dist.all_reduce(buf, op=dist.ReduceOp.MAX)
     if rank == 0 and buf.item() != max_grad:
         raise AssertionError(f"grad max mismatch across ranks: local={max_grad} global_max={buf.item()}")

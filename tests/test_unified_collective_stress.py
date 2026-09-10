@@ -102,7 +102,7 @@ def _ddp_conv_overlap_fn(rank, world_size):
             torch.nn.ReLU(),
             torch.nn.Conv2d(ch, ch * 2, 3, padding=1),
             torch.nn.ReLU(),
-            torch.nn.Conv2d(ch * 2, ch, 3, padding=1),
+            torch.nn.Conv2d(ch * 2, 3, 3, padding=1),  # back to 3ch: targets are (bs, 3, sp, sp)
         )
 
     model = make_model().to("mps")

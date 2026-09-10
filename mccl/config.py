@@ -36,13 +36,15 @@ class MCCLConfig:
     overlap_comm: bool = True
     ring_algo: str = "auto"          # "auto" (chunked), "chunked", "basic"
     ring_pipeline: bool = True       # streaming TX/RX ring (off = lock-step debug)
-    pipeline_depth: int = 1          # posted-ahead receives per pipeline (1-8)
+    pipeline_depth: int = 4          # posted-ahead receives per pipeline (1-8)
     collective_concurrency: int = 1  # ws>=3 collectives in flight (1-8)
     max_collective_concurrency: int = 8  # hard ceiling on collective_concurrency
     demux_park_bytes: int = 512 * 1024 * 1024  # hint; C++ auto-scales when unset
     demux_inflight_budget_bytes: int = 1 * 1024 * 1024 * 1024  # 1 GiB
     credit_min_chunk: int = 1024 * 1024  # credit flow control floor (0 = off)
     fp32_cpu_reduce: bool = False    # vDSP fp32 reduce in unified memory
+    unified_cpu_reduce: bool = True  # ring: vDSP reduce for shared f32/f16/bf16 (0 = Metal kernels)
+    collective_store_barrier: bool = False  # TCPStore barrier per collective (debug only)
     cpu_write_sync: str = "auto"     # "auto" (none) or "full" (debug)
     event_sync: bool = True          # MTLSharedEvent sync path
     link_profile: str = ""           # "" or "thunderbolt"
@@ -88,6 +90,8 @@ class MCCLConfig:
             "MCCL_DEMUX_INFLIGHT_BUDGET_BYTES": "demux_inflight_budget_bytes",
             "MCCL_CREDIT_MIN_CHUNK": "credit_min_chunk",
             "MCCL_FP32_CPU_REDUCE": "fp32_cpu_reduce",
+            "MCCL_UNIFIED_CPU_REDUCE": "unified_cpu_reduce",
+            "MCCL_COLLECTIVE_STORE_BARRIER": "collective_store_barrier",
             "MCCL_CPU_WRITE_SYNC": "cpu_write_sync",
             "MCCL_EVENT_SYNC": "event_sync",
             "MCCL_LINK_PROFILE": "link_profile",

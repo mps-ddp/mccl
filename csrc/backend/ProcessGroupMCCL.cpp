@@ -96,10 +96,15 @@ inline bool ring_pipeline_for_message(size_t nbytes, size_t small_msg_threshold)
 }
 
 // In-flight posted-receive depth for the RX side of ring pipelines.
+// Default 4: with ~0.5 MB ring chunks at ws=24 a depth of 1 leaves the link
+// idle for one RTT + reduce every step.  Memory bound is depth x chunk per
+// pipeline (scratch) plus credit_window x chunk parked at a slow receiver.
+// Keep in sync with demux_pipeline_depth() (TcpTransport.cpp) and
+// MCCLConfig.pipeline_depth.
 inline int ring_pipeline_depth() {
     static int depth = [] {
         auto* v = std::getenv("MCCL_PIPELINE_DEPTH");
-        long n = v ? std::atol(v) : 1;
+        long n = v ? std::atol(v) : 4;
         return static_cast<int>(std::min(8L, std::max(1L, n)));
     }();
     return depth;
@@ -131,11 +136,33 @@ inline size_t credit_min_chunk_bytes() {
     return v;
 }
 
+// Bytes the RX side may have posted ahead per ring pipeline (depth x chunk).
+// Bounds in-flight socket data for large chunks: MCCL_PIPELINE_DEPTH=4 with
+// 8 MB chunks would otherwise keep 6 x 8 MB per connection in the kernel and
+// trip ENOBUFS on macOS (and measured slower on loopback).  For chunks >=
+// this budget the depth is 1 (the v6.5 default), so large-message behaviour
+// is unchanged; DDP-bucket-sized chunks (0.5-2 MB) get the full depth.
+inline size_t pipeline_inflight_budget_bytes() {
+    static size_t v = [] {
+        auto* e = std::getenv("MCCL_PIPELINE_INFLIGHT_BYTES");
+        long long n = e ? std::atoll(e) : (8LL << 20);
+        return static_cast<size_t>(std::max(1LL, n));
+    }();
+    return v;
+}
+
+inline int ring_pipeline_depth_for_chunk(size_t chunk_bytes) {
+    const int depth = ring_pipeline_depth();
+    if (chunk_bytes == 0) return depth;
+    const size_t fit = pipeline_inflight_budget_bytes() / chunk_bytes;
+    return static_cast<int>(std::max<size_t>(1, std::min<size_t>(depth, fit)));
+}
+
 // Sender lead over the last credited step.  depth + 2 keeps the wire full
 // (receiver posts `depth` ahead; the +2 covers credit round-trip latency)
 // while bounding unsolicited data at a slow receiver to window x chunk.
-inline int credit_window() {
-    return ring_pipeline_depth() + 2;
+inline int credit_window_for_depth(int depth) {
+    return depth + 2;
 }
 
 inline std::chrono::milliseconds recv_wait_limit() {
@@ -272,6 +299,47 @@ inline void copy_wire_unified(at::Tensor& dst_chunk, const void* wire, size_t nb
     unstage_from_recv(dst_chunk, wire, nbytes);
 }
 
+/// CPU (vDSP) reduce of `src` into `dst` for the ring unified-memory path.
+/// f16/bf16 widen to fp32, reduce, narrow back (AccelerateOps).
+inline void cpu_reduce_op_dtype(at::ScalarType dtype, void* dst, const void* src,
+                                int64_t count, c10d::ReduceOp::RedOpType op) {
+    switch (dtype) {
+        case at::kFloat:
+            cpu_reduce_op(static_cast<float*>(dst),
+                          static_cast<const float*>(src), count, op);
+            break;
+        case at::kHalf:
+            cpu_reduce_op_half(static_cast<c10::Half*>(dst),
+                               static_cast<const c10::Half*>(src), count, op);
+            break;
+        case at::kBFloat16:
+            cpu_reduce_op_bf16(static_cast<c10::BFloat16*>(dst),
+                               static_cast<const c10::BFloat16*>(src), count, op);
+            break;
+        default:
+            MCCL_CHECK(false, "cpu_reduce_op_dtype: unsupported dtype " +
+                       std::string(at::toString(dtype)));
+    }
+}
+
+inline void cpu_scale_inplace_dtype(at::ScalarType dtype, void* buf,
+                                    int64_t count, float scale) {
+    switch (dtype) {
+        case at::kFloat:
+            cpu_scale_inplace(static_cast<float*>(buf), count, scale);
+            break;
+        case at::kHalf:
+            cpu_scale_inplace_half(static_cast<c10::Half*>(buf), count, scale);
+            break;
+        case at::kBFloat16:
+            cpu_scale_inplace_bf16(static_cast<c10::BFloat16*>(buf), count, scale);
+            break;
+        default:
+            MCCL_CHECK(false, "cpu_scale_inplace_dtype: unsupported dtype " +
+                       std::string(at::toString(dtype)));
+    }
+}
+
 struct RingPipelineCtx {
     Transport* transport;
     Watchdog* watchdog;
@@ -344,7 +412,10 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
     }
     const bool credits_on = max_chunk >= credit_min_chunk_bytes() &&
                             credit_min_chunk_bytes() > 0;
-    const int cwin = credit_window();
+    // Depth is bounded by bytes in flight (see pipeline_inflight_budget_bytes);
+    // identical on every rank since chunk sizes are.
+    const int depth = ring_pipeline_depth_for_chunk(max_chunk);
+    const int cwin = credit_window_for_depth(depth);
 
     // Credits arrive from the RIGHT neighbor (the consumer of our sends):
     // one byte per step, tid = kCreditTidFlag | step.  Storage lives at
@@ -418,7 +489,6 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
     });
 
     // ── RX: post `depth` receives ahead; reduce/store; open send gates ──
-    const int depth = ring_pipeline_depth();
     std::vector<std::unique_ptr<PooledBuffer>> scratch(depth);
     std::vector<size_t> scratch_size(depth, 0);
     std::vector<RecvTicket> tickets(nsteps);
@@ -493,13 +563,18 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
                     const auto red_t0 = std::chrono::steady_clock::now();
                     if (ctx.use_cpu) {
                         MPSBufferView view = extract_mps_buffer(rchunk);
-                        cpu_reduce_op(static_cast<float*>(view.cpu_ptr),
-                                      static_cast<const float*>(recv_dst[g]),
-                                      rchunk.numel(), ctx.red_op);
+                        cpu_reduce_op_dtype(rchunk.scalar_type(), view.cpu_ptr,
+                                            recv_dst[g], rchunk.numel(),
+                                            ctx.red_op);
                     } else if (unified_metal_collective_path(rchunk)) {
                         gate_fence = reduce_wire_metal_unified(
                             rchunk, recv_dst[g], rbytes, ctx.red_op,
                             ctx.incoming_keep);
+                        // The fence is handed to TX below (not waited here),
+                        // so a later COPY into this chunk must fence it too.
+                        if (use_event_fence && gate_fence > 0) {
+                            chunk_pending[st.recv_idx] = gate_fence;
+                        }
                     } else {
                         at::Tensor incoming = torch::empty_like(rchunk);
                         unstage_from_recv(incoming, recv_dst[g], rbytes);
@@ -527,7 +602,14 @@ void run_ring_pipeline(const RingPipelineCtx& ctx,
             }
 
             if (st.recv_idx >= 0 && chunk_bytes(st.recv_idx) > 0) {
-                if (gate_fence > 0) {
+                // Unified path: staging returns cpu_ptr without touching the
+                // GPU, so the reduce fence rides along with the gate and the
+                // TX thread waits on it right before the send (wait_gate ->
+                // wait_for_mccl_fence).  RX keeps receiving meanwhile.
+                // Blit path: the chunk is read by a GPU blit that must run
+                // after the reduce kernel; wait here as before.
+                if (gate_fence > 0 &&
+                    !unified_metal_collective_path(chunks[st.recv_idx])) {
                     wait_for_mccl_fence(gate_fence);
                     gate_fence = 0;
                 }
@@ -604,6 +686,53 @@ inline bool fp32_cpu_reduce_enabled() {
 inline bool prefer_cpu_unified_buffer_path(const at::Tensor& tensor) {
     if (!fp32_cpu_reduce_enabled()) return false;
     return tensor_cpu_accessible(tensor);
+}
+
+// MCCL_UNIFIED_CPU_REDUCE (default on): ring allreduce reduces shared-storage
+// f32/f16/bf16 chunks with vDSP directly in unified memory (f16/bf16 widen to
+// fp32 per hop, see AccelerateOps).  One vDSP pass per ring step; no
+// MCCL-queue drains, no staging tensors, no GPU fences on the RX critical
+// path.  Set to 0 to restore the Metal-kernel reduce for shared storage
+// (MCCL_FP32_CPU_REDUCE=1 still selects the fp32 CPU path on its own).
+inline bool unified_cpu_reduce_enabled() {
+    static bool enabled = [] {
+        auto* v = std::getenv("MCCL_UNIFIED_CPU_REDUCE");
+        if (!v) return true;
+        std::string s(v);
+        return !(s == "0" || s == "false" || s == "off" || s == "no");
+    }();
+    return enabled;
+}
+
+inline bool ring_cpu_reduce_dtype(at::ScalarType dtype) {
+    return dtype == at::kFloat || dtype == at::kHalf || dtype == at::kBFloat16;
+}
+
+// Ring allreduce: reduce this tensor on the CPU in unified memory?
+inline bool ring_cpu_reduce_path(const at::Tensor& tensor) {
+    const auto dtype = tensor.scalar_type();
+    if (dtype == at::kFloat && prefer_cpu_unified_buffer_path(tensor)) return true;
+    return unified_cpu_reduce_enabled() && unified_collective_enabled() &&
+           ring_cpu_reduce_dtype(dtype) && tensor_cpu_accessible(tensor);
+}
+
+// MCCL_COLLECTIVE_STORE_BARRIER (default off): TCPStore barrier at the start of
+// every data-path collective.  Not needed for correctness: collective_seq_
+// advances identically on every rank, the demux keys wire traffic by
+// (op, seq, tid) and parks early arrivals (bounded by park_limit), ring credits
+// bound a fast sender to credit_window chunks ahead, and every star/tree path
+// ends with a reply or ack so no rank can run more than one collective ahead.
+// At world_size N the barrier costs one store set + (N-1) serial wait/get
+// round trips per collective on the rank-0 TCPStore (~1,100 requests per DDP
+// bucket at N=24).  Set to 1 to restore it when debugging a hang.
+inline bool collective_store_barrier_enabled() {
+    static bool enabled = [] {
+        auto* v = std::getenv("MCCL_COLLECTIVE_STORE_BARRIER");
+        if (!v) return false;
+        std::string s(v);
+        return s == "1" || s == "true" || s == "on" || s == "yes";
+    }();
+    return enabled;
 }
 
 /// fp32 unified MPS vDSP path (MCCL_FP32_CPU_REDUCE=1 only).
@@ -927,6 +1056,7 @@ void ProcessGroupMCCL::init_transport() {
 
 void ProcessGroupMCCL::rendezvous_collective_enter(uint32_t seq, const char* op) {
     if (getSize() <= 1) return;
+    if (!collective_store_barrier_enabled()) return;
     rendezvous_->barrier(std::string(op) + "_" + std::to_string(seq));
 }
 
@@ -1215,8 +1345,12 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         // reduce phase chains to reduce_engine for bucket overlap.
         int peer = 1 - getRank();
 
+        // fp32 only: the split reduce below is vDSP on float*; f16/bf16 take the
+        // Metal two-rank path (pre-v6.6 this cast silently reduced half data as
+        // floats when MCCL_FP32_CPU_REDUCE=1).
         const bool use_split_large =
             nbytes > transport_->config().small_msg_threshold &&
+            tensor.scalar_type() == at::kFloat &&
             prefer_cpu_unified_buffer_path(tensor);
 
         if (use_split_large) {
@@ -1248,7 +1382,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                         [this, tensor_copy, seq, red_op, nbytes, shared_recv_buf, work_ptr]() mutable {
                             watchdog_->touch(seq);  // re-arm for the reduce phase
                             auto red_t0 = std::chrono::steady_clock::now();
-                            bool cpu_ok = prefer_cpu_unified_buffer_path(tensor_copy);
+                            bool cpu_ok = tensor_copy.scalar_type() == at::kFloat &&
+                                          prefer_cpu_unified_buffer_path(tensor_copy);
                             int64_t count = tensor_copy.numel();
 
                             if (cpu_ok) {
@@ -1336,11 +1471,13 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         }
     } else {
         // ── 3+ ranks: collective executor pool ──
+        const uint64_t ticket = transport_collective_lock_.take_ticket();
         collective_pool_->submit(
-            [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine, work_ptr]() mutable {
+            [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine, work_ptr, ticket]() mutable {
+                OrderedTransportGuard transport_guard(transport_collective_lock_, ticket);
                 begin_execute(seq);
                 if (sync_val) wait_for_mps(sync_val);
-                std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
+                transport_guard.enter();
                 const auto exec_t0 = std::chrono::steady_clock::now();
                 const char* algo = "unknown";
                 if (nbytes <= transport_->config().small_msg_threshold) {
@@ -1421,11 +1558,13 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce_coalesced(
 
     ProgressEngine& coalesced_engine =
         (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
+    const uint64_t ticket = transport_collective_lock_.take_ticket();
     coalesced_engine.submit(
-        [this, flat_copy, tensors_copy, seq, ws, nbytes, red_op, sync_val, work_ptr]() mutable {
+        [this, flat_copy, tensors_copy, seq, ws, nbytes, red_op, sync_val, work_ptr, ticket]() mutable {
+            OrderedTransportGuard transport_guard(transport_collective_lock_, ticket);
             begin_execute(seq);
             if (sync_val) wait_for_mps(sync_val);
-            std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
+            transport_guard.enter();
             if (ws == 2) {
                 allreduce_two_rank(flat_copy, seq, red_op);
             } else if (ws >= 3) {
@@ -1723,8 +1862,7 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
     int64_t total_elems = tensor.numel();
 
     int64_t chunk_elems = (total_elems + (2 * ws) - 1) / (2 * ws);
-    bool use_cpu = (tensor.scalar_type() == at::kFloat) &&
-                   prefer_cpu_unified_buffer_path(tensor);
+    bool use_cpu = ring_cpu_reduce_path(tensor);
 
     int left = (rank - 1 + ws) % ws;
     int right = (rank + 1) % ws;
@@ -1829,7 +1967,9 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
 
         void* recv_wire_dst = recv_buf_pool.data();
         at::Tensor incoming_direct;
-        if (recv_bytes > 0 && unified_metal_collective_path(recv_chunk)) {
+        // CPU reduce reads the wire bytes from recv_buf_pool; only the Metal
+        // path receives straight into a staging tensor.
+        if (recv_bytes > 0 && !use_cpu && unified_metal_collective_path(recv_chunk)) {
             incoming_direct = torch::empty_like(recv_chunk);
             void* direct = tensor_wire_recv_ptr(incoming_direct);
             if (direct) {
@@ -1847,10 +1987,8 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
         if (recv_bytes > 0) {
             if (use_cpu) {
                 MPSBufferView chunk_view = extract_mps_buffer(recv_chunk);
-                cpu_reduce_op(
-                    static_cast<float*>(chunk_view.cpu_ptr),
-                    static_cast<const float*>(recv_buf_pool.data()),
-                    recv_chunk.numel(), op);
+                cpu_reduce_op_dtype(recv_chunk.scalar_type(), chunk_view.cpu_ptr,
+                                    recv_buf_pool.data(), recv_chunk.numel(), op);
             } else if (unified_metal_collective_path(recv_chunk) &&
                        recv_wire_dst != recv_buf_pool.data()) {
                 uint64_t v = reduce_chunk_metal_fenced(
@@ -1947,7 +2085,8 @@ void ProcessGroupMCCL::allreduce_ring_chunked(at::Tensor& tensor, uint32_t seq,
     if (use_cpu) {
         if (op == c10d::ReduceOp::AVG) {
             MPSBufferView view = extract_mps_buffer(tensor);
-            cpu_scale_inplace(static_cast<float*>(view.cpu_ptr), total_elems, 1.0f / ws);
+            cpu_scale_inplace_dtype(tensor.scalar_type(), view.cpu_ptr,
+                                    total_elems, 1.0f / ws);
         }
         mps_stream_sync_after_cpu_mps_buffer_write();
     } else {
@@ -1987,8 +2126,7 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
     size_t elem_size = tensor.element_size();
     int64_t total_elems = tensor.numel();
     int64_t chunk_elems = (total_elems + ws - 1) / ws;
-    bool use_cpu = (tensor.scalar_type() == at::kFloat) &&
-                   prefer_cpu_unified_buffer_path(tensor);
+    bool use_cpu = ring_cpu_reduce_path(tensor);
 
     int left = (rank - 1 + ws) % ws;
     int right = (rank + 1) % ws;
@@ -2093,10 +2231,8 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
         if (recv_bytes > 0) {
             if (use_cpu) {
                 MPSBufferView chunk_view = extract_mps_buffer(recv_chunk);
-                cpu_reduce_op(
-                    static_cast<float*>(chunk_view.cpu_ptr),
-                    static_cast<const float*>(recv_buf_pool.data()),
-                    recv_chunk.numel(), op);
+                cpu_reduce_op_dtype(recv_chunk.scalar_type(), chunk_view.cpu_ptr,
+                                    recv_buf_pool.data(), recv_chunk.numel(), op);
             } else if (unified_metal_collective_path(recv_chunk)) {
                 uint64_t v = reduce_wire_metal_unified(
                     recv_chunk, recv_buf_pool.data(), recv_bytes, op,
@@ -2169,8 +2305,8 @@ void ProcessGroupMCCL::allreduce_ring(at::Tensor& tensor, uint32_t seq,
     if (use_cpu) {
         if (op == c10d::ReduceOp::AVG) {
             MPSBufferView view = extract_mps_buffer(tensor);
-            cpu_scale_inplace(static_cast<float*>(view.cpu_ptr),
-                              total_elems, 1.0f / ws);
+            cpu_scale_inplace_dtype(tensor.scalar_type(), view.cpu_ptr,
+                                    total_elems, 1.0f / ws);
         }
         mps_stream_sync_after_cpu_mps_buffer_write();
     } else {
@@ -2482,10 +2618,11 @@ void ProcessGroupMCCL::broadcast_ring_pipelined(at::Tensor& tensor,
     // at most cwin slices ahead of what `next` has consumed; every rank that
     // RECEIVES credits `prev` per consumed slice.  Without this, the root
     // streams the entire payload into a slow successor's park buffer.
+    const int depth = ring_pipeline_depth_for_chunk(slice);
+    const int cwin = credit_window_for_depth(depth);
     const bool credits_on = slice >= credit_min_chunk_bytes() &&
                             credit_min_chunk_bytes() > 0 &&
-                            nslices > static_cast<size_t>(credit_window());
-    const int cwin = credit_window();
+                            nslices > static_cast<size_t>(cwin);
     const bool sender = !is_tail;          // root and middle ranks send
     std::vector<uint8_t> credit_bytes((credits_on && sender) ? nslices : 0);
     std::vector<RecvTicket> credit_tickets((credits_on && sender) ? nslices : 0);
@@ -2533,7 +2670,6 @@ void ProcessGroupMCCL::broadcast_ring_pipelined(at::Tensor& tensor,
                 send_slice(s);
             }
         } else {
-            const int depth = ring_pipeline_depth();
             size_t next_post = 0;
             for (; next_post < nslices && next_post < static_cast<size_t>(depth);
                  ++next_post) {
@@ -2896,11 +3032,13 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
     if (ws >= 3 && collective_pool_) {
         const bool use_ring = (ws >= 4) &&
                               (nbytes > transport_->config().small_msg_threshold);
+        const uint64_t ticket = transport_collective_lock_.take_ticket();
         collective_pool_->submit(
-            [this, tensor_copy, seq, root, nbytes, use_ring, sync_val_bc, work_ptr]() mutable {
+            [this, tensor_copy, seq, root, nbytes, use_ring, sync_val_bc, work_ptr, ticket]() mutable {
+                OrderedTransportGuard transport_guard(transport_collective_lock_, ticket);
                 begin_execute(seq);
                 if (sync_val_bc) wait_for_mps(sync_val_bc);
-                std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
+                transport_guard.enter();
                 const auto exec_t0 = std::chrono::steady_clock::now();
                 if (use_ring) {
                     broadcast_ring_pipelined(tensor_copy, seq, root);
@@ -3029,11 +3167,13 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
 
     ProgressEngine& ag_engine =
         (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
+    const uint64_t ticket = transport_collective_lock_.take_ticket();
     ag_engine.submit(
-        [this, input_copy, outputs_copy, seq, rank, ws, nbytes, sync_val_ag, work_ptr]() mutable {
+        [this, input_copy, outputs_copy, seq, rank, ws, nbytes, sync_val_ag, work_ptr, ticket]() mutable {
+            OrderedTransportGuard transport_guard(transport_collective_lock_, ticket);
             begin_execute(seq);
             if (sync_val_ag) wait_for_mps(sync_val_ag);
-            std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
+            transport_guard.enter();
             bool use_cpu = (input_copy.scalar_type() == at::kFloat) &&
                            prefer_cpu_unified_buffer_path(input_copy);
 
@@ -3184,11 +3324,13 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
 
     ProgressEngine& rs_engine =
         (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
+    const uint64_t ticket = transport_collective_lock_.take_ticket();
     rs_engine.submit(
-        [this, output_copy, inputs_copy, seq, rank, ws, nbytes, rs_op, sync_val_rs, work_ptr]() mutable {
+        [this, output_copy, inputs_copy, seq, rank, ws, nbytes, rs_op, sync_val_rs, work_ptr, ticket]() mutable {
+            OrderedTransportGuard transport_guard(transport_collective_lock_, ticket);
             begin_execute(seq);
             if (sync_val_rs) wait_for_mps(sync_val_rs);
-            std::lock_guard<std::mutex> transport_guard(transport_collective_mu_);
+            transport_guard.enter();
             int left = (rank - 1 + ws) % ws;
             int right = (rank + 1) % ws;
             bool use_cpu = (inputs_copy[0].scalar_type() == at::kFloat) &&
@@ -3419,9 +3561,16 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
     watchdog_->watch(seq, "recv");
     metrics_->op_start(seq, "recv", nbytes);
 
+    // The destination may still have GPU work queued against it (e.g. the
+    // zero-fill of a fresh torch.zeros on MPS).  Order that ahead of our write
+    // into its storage, exactly as send()/allreduce() do, or the late fill
+    // overwrites the received payload.
+    uint64_t sync_val_r = sync_mps_for_collective();
+
     net_engine_for(srcRank).submit(
-        [this, tensor, srcRank, seq, tag, nbytes, work_ptr]() mutable {
+        [this, tensor, srcRank, seq, tag, nbytes, sync_val_r, work_ptr]() mutable {
             begin_execute(seq);
+            if (sync_val_r) wait_for_mps(sync_val_r);
             bool use_cpu = prefer_cpu_unified_buffer_path(tensor);
             if (use_cpu) {
                 MPSBufferView view = extract_mps_buffer(tensor);

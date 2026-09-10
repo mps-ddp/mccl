@@ -20,10 +20,67 @@
 
 #include <memory>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <unordered_map>
 
 namespace mccl {
+
+/// FIFO-ordered lock for the per-rank transport section.  With
+/// MCCL_COLLECTIVE_CONCURRENCY >= 2 several pool threads race for the
+/// transport; a plain std::mutex hands it to whichever thread the OS wakes
+/// first, so rank A can run collective k+1 before k while rank B runs k first
+/// -> both block on each other's wire traffic forever.  Tickets are taken on
+/// the issuing thread (collective issue order, identical on every rank) and
+/// the section is entered strictly in ticket order.
+class OrderedTransportLock {
+public:
+    uint64_t take_ticket() { return next_ticket_.fetch_add(1); }
+    void enter(uint64_t ticket) {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return serving_ == ticket; });
+    }
+    void leave() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            ++serving_;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::atomic<uint64_t> next_ticket_{0};
+    uint64_t serving_{0};
+};
+
+/// Scoped ticket holder.  ``enter()`` blocks until it is this ticket's turn;
+/// the destructor always consumes the turn (entering first if the owner
+/// threw before ``enter()``), so an abandoned ticket can never stall later
+/// collectives.
+class OrderedTransportGuard {
+public:
+    OrderedTransportGuard(OrderedTransportLock& lock, uint64_t ticket)
+        : lock_(lock), ticket_(ticket) {}
+    OrderedTransportGuard(const OrderedTransportGuard&) = delete;
+    OrderedTransportGuard& operator=(const OrderedTransportGuard&) = delete;
+    void enter() {
+        if (!entered_) {
+            lock_.enter(ticket_);
+            entered_ = true;
+        }
+    }
+    ~OrderedTransportGuard() {
+        enter();
+        lock_.leave();
+    }
+
+private:
+    OrderedTransportLock& lock_;
+    uint64_t ticket_;
+    bool entered_ = false;
+};
 
 class ProcessGroupMCCL : public c10d::Backend {
 public:
@@ -201,11 +258,12 @@ private:
     std::unique_ptr<Transport> transport_;
     std::unique_ptr<ProgressEngine> reduce_engine_;
     /// Executor pool for ws>=3 collectives: MCCL_COLLECTIVE_CONCURRENCY workers
-    /// dequeue in submission order.  transport_collective_mu_ ensures only one
+    /// dequeue in submission order.  transport_collective_lock_ ensures only one
     /// collective uses TCP at a time per rank (ring, tree, broadcast, etc.).
     std::unique_ptr<ProgressEngine> collective_pool_;
-    /// Serializes all collective_pool transport I/O on shared links.
-    std::mutex transport_collective_mu_;
+    /// Serializes all collective_pool transport I/O on shared links, in
+    /// collective issue order (see OrderedTransportLock).
+    OrderedTransportLock transport_collective_lock_;
     std::vector<std::unique_ptr<ProgressEngine>> net_engines_;
     std::unique_ptr<Rendezvous> rendezvous_;
     std::unique_ptr<Watchdog> watchdog_;

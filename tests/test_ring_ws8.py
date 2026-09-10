@@ -31,6 +31,7 @@ def _spawn_allreduce(world_size: int) -> None:
         """
         import torch
         import torch.distributed as dist
+        import mccl  # registers the 'mccl' backend
 
         rank = int(__import__('sys').argv[1])
         world_size = int(__import__('sys').argv[2])

@@ -3561,9 +3561,16 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
     watchdog_->watch(seq, "recv");
     metrics_->op_start(seq, "recv", nbytes);
 
+    // The destination may still have GPU work queued against it (e.g. the
+    // zero-fill of a fresh torch.zeros on MPS).  Order that ahead of our write
+    // into its storage, exactly as send()/allreduce() do, or the late fill
+    // overwrites the received payload.
+    uint64_t sync_val_r = sync_mps_for_collective();
+
     net_engine_for(srcRank).submit(
-        [this, tensor, srcRank, seq, tag, nbytes, work_ptr]() mutable {
+        [this, tensor, srcRank, seq, tag, nbytes, sync_val_r, work_ptr]() mutable {
             begin_execute(seq);
+            if (sync_val_r) wait_for_mps(sync_val_r);
             bool use_cpu = prefer_cpu_unified_buffer_path(tensor);
             if (use_cpu) {
                 MPSBufferView view = extract_mps_buffer(tensor);

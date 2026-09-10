@@ -735,6 +735,26 @@ inline bool collective_store_barrier_enabled() {
     return enabled;
 }
 
+// F3 (opt-in): let ring allreduces on the unified-CPU path share the wire
+// instead of serializing per rank.  Bucket k+1's ring can start while bucket
+// k's is still draining, hiding the fill/drain idle at bucket boundaries.
+// Requires MCCL_COLLECTIVE_CONCURRENCY>=2 (extra pool thread).  Correctness
+// does not depend on serialization: the demux routes by (seq, tid), credits
+// are per collective, every pool is mutex-protected, and collective *issue*
+// order is still identical on all ranks (OrderedTransportLock tickets), so
+// no rank can wait on a ring another rank has not started.  Non-ring
+// collectives (star/tree, broadcast, allgather, reduce_scatter) keep strict
+// serialization and wait for any in-flight rings to finish first.
+inline bool concurrent_rings_enabled() {
+    static bool enabled = [] {
+        auto* v = std::getenv("MCCL_CONCURRENT_RINGS");
+        if (!v) return false;
+        std::string s(v);
+        return s == "1" || s == "true" || s == "on" || s == "yes";
+    }();
+    return enabled;
+}
+
 /// fp32 unified MPS vDSP path (MCCL_FP32_CPU_REDUCE=1 only).
 inline void reduce_wire_into_chunk_fp32(at::Tensor& chunk, const void* wire,
                                         size_t nbytes,
@@ -901,6 +921,13 @@ ProcessGroupMCCL::ProcessGroupMCCL(
         collective_pool_ = std::make_unique<ProgressEngine>(
             queue_depth, metrics_.get(), coll_threads);
         collective_pool_->start();
+        collective_pool_threads_ = coll_threads;
+        if (concurrent_rings_enabled()) {
+            MCCL_INFO("MCCL_CONCURRENT_RINGS=1: unified-CPU ring allreduces share the wire "
+                      "(%s, pool threads=%d)",
+                      coll_threads > 1 ? "active" : "inactive: needs MCCL_COLLECTIVE_CONCURRENCY>=2",
+                      coll_threads);
+        }
     }
 
     // Create net engines (one per peer rank, excluding self)
@@ -1474,26 +1501,39 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         const uint64_t ticket = transport_collective_lock_.take_ticket();
         collective_pool_->submit(
             [this, tensor_copy, seq, ws, nbytes, red_op, sync_val, defer_mps_sync_to_engine, work_ptr, ticket]() mutable {
-                OrderedTransportGuard transport_guard(transport_collective_lock_, ticket);
                 begin_execute(seq);
                 if (sync_val) wait_for_mps(sync_val);
-                transport_guard.enter();
-                const auto exec_t0 = std::chrono::steady_clock::now();
-                const char* algo = "unknown";
-                if (nbytes <= transport_->config().small_msg_threshold) {
-                    algo = "tree_small";
-                    allreduce_small(tensor_copy, seq, red_op);
+                const bool is_ring = nbytes > transport_->config().small_msg_threshold;
+                const bool share_wire = is_ring && concurrent_rings_enabled() &&
+                                        collective_pool_threads_ > 1 &&
+                                        ring_cpu_reduce_path(tensor_copy);
+                auto run_body = [&]() {
+                    const auto exec_t0 = std::chrono::steady_clock::now();
+                    const char* algo = "unknown";
+                    if (!is_ring) {
+                        algo = "tree_small";
+                        allreduce_small(tensor_copy, seq, red_op);
+                    } else {
+                        algo = use_chunked_ring_default() ? "ring_chunked" : "ring";
+                        allreduce_ring_dispatch(tensor_copy, seq, red_op, work_ptr);
+                    }
+                    const double exec_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - exec_t0).count();
+                    const double gbps =
+                        exec_ms > 0 ? (nbytes * 8.0) / (exec_ms * 1e6) : 0.0;
+                    MCCL_INFO("allreduce seq=%u: algo=%s nbytes=%zu exec=%.2fms (%.2f Gbps algbw)%s",
+                              seq, algo, nbytes, exec_ms, gbps,
+                              share_wire ? " concurrent_ring" : "");
+                    arm_work_release(work_ptr);
+                };
+                if (share_wire) {
+                    ConcurrentRingTransportGuard ring_guard(transport_collective_lock_, ticket);
+                    run_body();
                 } else {
-                    algo = use_chunked_ring_default() ? "ring_chunked" : "ring";
-                    allreduce_ring_dispatch(tensor_copy, seq, red_op, work_ptr);
+                    OrderedTransportGuard transport_guard(transport_collective_lock_, ticket);
+                    transport_guard.enter();
+                    run_body();
                 }
-                const double exec_ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - exec_t0).count();
-                const double gbps =
-                    exec_ms > 0 ? (nbytes * 8.0) / (exec_ms * 1e6) : 0.0;
-                MCCL_INFO("allreduce seq=%u: algo=%s nbytes=%zu exec=%.2fms (%.2f Gbps algbw)",
-                          seq, algo, nbytes, exec_ms, gbps);
-                arm_work_release(work_ptr);
             },
             [this, work_ptr, seq]() {
                 unregister_work(seq);

@@ -91,6 +91,8 @@ jobs:
         run: pytest -v tests/test_ddp_conv_overlap.py tests/test_ddp_consumer_release.py tests/test_race_stress.py tests/test_pipeline_differential.py
       - name: Compression, metrics, failure injection, event sync
         run: pytest -v tests/test_compression.py tests/test_compression_e2e.py tests/test_metrics.py tests/test_failure_injection.py tests/test_event_sync_counter_gap.py
+      - name: F3 concurrent rings (opt-in wire sharing)
+        run: pytest -v tests/test_concurrent_rings.py
       - name: Soak
         run: pytest -v tests/test_soak.py
       - name: Bus bandwidth report (informational)

@@ -45,6 +45,7 @@ class MCCLConfig:
     fp32_cpu_reduce: bool = False    # vDSP fp32 reduce in unified memory
     unified_cpu_reduce: bool = True  # ring: vDSP reduce for shared f32/f16/bf16 (0 = Metal kernels)
     collective_store_barrier: bool = False  # TCPStore barrier per collective (debug only)
+    concurrent_rings: bool = False  # F3: unified-CPU rings share wire (needs collective_concurrency>=2)
     cpu_write_sync: str = "auto"     # "auto" (none) or "full" (debug)
     event_sync: bool = True          # MTLSharedEvent sync path
     link_profile: str = ""           # "" or "thunderbolt"
@@ -92,6 +93,7 @@ class MCCLConfig:
             "MCCL_FP32_CPU_REDUCE": "fp32_cpu_reduce",
             "MCCL_UNIFIED_CPU_REDUCE": "unified_cpu_reduce",
             "MCCL_COLLECTIVE_STORE_BARRIER": "collective_store_barrier",
+            "MCCL_CONCURRENT_RINGS": "concurrent_rings",
             "MCCL_CPU_WRITE_SYNC": "cpu_write_sync",
             "MCCL_EVENT_SYNC": "event_sync",
             "MCCL_LINK_PROFILE": "link_profile",

@@ -136,7 +136,8 @@ Network and staging run on a **background queue** (`ProgressEngine`, `csrc/runti
 | `MCCL_RING_PIPELINE` | on | Streaming TX/RX ring pipeline (NCCL-style): both link directions + reduce busy concurrently. `0` = lock-step fallback (debug). |
 | `MCCL_PIPELINE_DEPTH` | `4` | Receives posted ahead per ring pipeline (1-8). Memory cost is `depth x chunk` per pipeline. |
 | `MCCL_PIPELINE_INFLIGHT_BYTES` | 8 MB | Caps effective depth at `budget / chunk` (min 1) so large ring chunks do not pile up in the kernel (macOS ENOBUFS). 0.5-2 MB chunks (DDP buckets at ws>=8) get the full depth; >=8 MB chunks run at depth 1. |
-| `MCCL_COLLECTIVE_CONCURRENCY` | `1` | Collectives in flight (1-8; hard ceiling `MCCL_MAX_COLLECTIVE_CONCURRENCY`, default 8). Raise to overlap DDP buckets on the wire. |
+| `MCCL_COLLECTIVE_CONCURRENCY` | `1` | Collectives in flight (1-8; hard ceiling `MCCL_MAX_COLLECTIVE_CONCURRENCY`, default 8). Required ≥2 for `MCCL_CONCURRENT_RINGS`. |
+| `MCCL_CONCURRENT_RINGS` | off | **F3 (opt-in):** unified-CPU ring allreduces may share the wire (bucket k+1 starts while k drains). Needs `MCCL_COLLECTIVE_CONCURRENCY>=2`. Small/tree/bcast collectives still wait for all in-flight rings. |
 | `MCCL_DEMUX_PARK_BYTES` | auto (cap 4 GB) | Per-peer bound on messages buffered before their receive is posted. Unset = auto-scale from ws × concurrency × credit window × bucket (cap 4 GiB). |
 | `MCCL_DEMUX_INFLIGHT_BUDGET_BYTES` | 1 GB | Caps effective concurrency as `budget / DDP_bucket`. |
 | `MCCL_UNIFIED_COLLECTIVE` | on | Shared-storage fast path after producer MPS fence. `0` = Metal+blit staging. |

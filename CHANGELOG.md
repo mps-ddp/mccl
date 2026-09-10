@@ -1,5 +1,10 @@
 # Changelog
 
+## v6.7 — F3 concurrent rings (opt-in)
+
+### Added
+- **`MCCL_CONCURRENT_RINGS=1`** (default off): unified-CPU ring allreduces may share the wire when `MCCL_COLLECTIVE_CONCURRENCY>=2`. Bucket k+1's ring starts while bucket k drains; small/tree/bcast/allgather/reduce_scatter still take an exclusive section and wait for `concurrent_rings==0`. `tests/test_concurrent_rings.py`.
+
 ## v6.6 — 24-node 10GbE ring path
 
 ### Changed

@@ -265,6 +265,7 @@ class TestConcurrentCollectives:
             timeout=420,
         )
 
+    @pytest.mark.slow
     @pytest.mark.parametrize("world_size", [5])
     def test_async_large_buckets_ws5(self, world_size):
         """Regression: cluster deadlock (seq=21, ~33 MB chunks, concurrency=2)."""
@@ -274,6 +275,7 @@ class TestConcurrentCollectives:
             timeout=900,
         )
 
+    @pytest.mark.slow
     @pytest.mark.parametrize("pipeline", ["0", "1"])
     def test_async_large_buckets_ws8(self, pipeline):
         """ws=8 DDP-scale async buckets (25 MB tensor, concurrency=2)."""
@@ -289,6 +291,7 @@ class TestConcurrentCollectives:
 
 
 class TestOddChunkBoundary:
+    @pytest.mark.slow
     @pytest.mark.parametrize("pipeline", ["0", "1"])
     def test_odd_sizes_ws8(self, pipeline):
         # Remainders mod 16 (2*ws at ws=8) exercise zero-byte ring steps.
@@ -326,6 +329,7 @@ class TestCreditFlowControl:
             timeout=420,
         )
 
+    @pytest.mark.slow
     @pytest.mark.parametrize("world_size", [8])
     def test_skewed_start_lockstep_ws8(self, world_size):
         """Late rank + lock-step ring + concurrency=2; park limit must scale."""

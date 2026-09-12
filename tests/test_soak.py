@@ -11,10 +11,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-pytestmark = pytest.mark.skipif(
-    platform.system() != "Darwin" or platform.machine() not in ("arm64", "aarch64"),
-    reason="Soak tests require macOS on Apple Silicon",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        platform.system() != "Darwin" or platform.machine() not in ("arm64", "aarch64"),
+        reason="Soak tests require macOS on Apple Silicon",
+    ),
+    pytest.mark.slow,
+]
 
 
 def _worker(rank, world_size, fn, port):

@@ -14,10 +14,13 @@ import pytest
 
 from mccl_test_utils import run_workers
 
-pytestmark = pytest.mark.skipif(
-    platform.system() != "Darwin" or platform.machine() not in ("arm64", "aarch64"),
-    reason="MCCL tests require macOS on Apple Silicon",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        platform.system() != "Darwin" or platform.machine() not in ("arm64", "aarch64"),
+        reason="MCCL tests require macOS on Apple Silicon",
+    ),
+    pytest.mark.slow,
+]
 
 
 def _ring_kernel_race_fn(rank, world_size):

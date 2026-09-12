@@ -13,10 +13,13 @@ from mccl_test_utils import run_workers
 from test_ring_pipeline import _concurrent_buckets_fn, _concurrent_large_buckets_fn
 from test_ddp_multibucket import _ddp_multibucket_parity_fn
 
-pytestmark = pytest.mark.skipif(
-    platform.system() != "Darwin" or platform.machine() not in ("arm64", "aarch64"),
-    reason="MCCL tests require macOS on Apple Silicon",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        platform.system() != "Darwin" or platform.machine() not in ("arm64", "aarch64"),
+        reason="MCCL tests require macOS on Apple Silicon",
+    ),
+    pytest.mark.slow,
+]
 
 F3_ENV = {"MCCL_CONCURRENT_RINGS": "1", "MCCL_COLLECTIVE_CONCURRENCY": "2"}
 

@@ -1258,11 +1258,11 @@ void ProcessGroupMCCL::compressed_send(int peer, OpType op, uint32_t seq,
             comp_buf.data(), max_comp, tensor.scalar_type(),
             compression_stable_id(tensor));
 
-        // Two messages: a 4-byte size header, then EXACTLY comp_size bytes.
-        // (Padding to max_compressed_size — the old scheme — transmitted the
-        // full worst case regardless of ratio, negating TopK's savings.)
+        // Two messages: a 4-byte size header (dummy tid — must differ from payload
+        // tid or the demux router merges/drops one leg), then comp_size bytes.
         uint32_t wire_size = static_cast<uint32_t>(comp_size);
-        MCCL_CHECK(transport_->send_chunks(peer, op, seq, tid,
+        const uint32_t hdr_tid = collective_dummy_tid(tid);
+        MCCL_CHECK(transport_->send_chunks(peer, op, seq, hdr_tid,
                                            &wire_size, sizeof(wire_size)),
                    "compressed_send size header failed");
         MCCL_CHECK(transport_->send_chunks(peer, op, seq, tid,
@@ -1289,7 +1289,8 @@ void ProcessGroupMCCL::compressed_recv(int peer, OpType op, uint32_t seq,
         size_t max_comp = compressor_->max_compressed_size(nbytes);
 
         uint32_t wire_size = 0;
-        MCCL_CHECK(transport_->recv_chunks(peer, op, seq, tid,
+        const uint32_t hdr_tid = collective_dummy_tid(tid);
+        MCCL_CHECK(transport_->recv_chunks(peer, op, seq, hdr_tid,
                                            &wire_size, sizeof(wire_size)),
                    "compressed_recv size header failed");
         MCCL_CHECK(wire_size > 0 && wire_size <= max_comp,
@@ -1816,6 +1817,7 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
         void* recv_wire = tensor_wire_recv_ptr(incoming);
         PooledBuffer recv_buf(staging_memory_pool(), nbytes);
         void* recv_dst = recv_wire ? recv_wire : recv_buf.data();
+        auto net_t0 = std::chrono::steady_clock::now();
         if (rank == 0) {
             MCCL_CHECK(transport_->send_chunks(
                            peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes),
@@ -1831,6 +1833,8 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
                            peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes),
                        "allreduce_two_rank unified send failed");
         }
+        auto net_t1 = std::chrono::steady_clock::now();
+        auto red_t0 = std::chrono::steady_clock::now();
         if (!recv_wire) {
             unstage_from_recv(incoming, recv_buf.data(), nbytes);
         }
@@ -1839,11 +1843,16 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
         } else {
             metal_reduce_op_fenced(tensor, incoming, op);
         }
+        auto red_t1 = std::chrono::steady_clock::now();
+        double net_ms = std::chrono::duration<double, std::milli>(net_t1 - net_t0).count();
+        double red_ms = std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
+        metrics_->record_phase(seq, 0, net_ms, red_ms);
         metrics_->record_transport_bytes(nbytes, true);
         metrics_->record_transport_bytes(nbytes, false);
     } else if (tensor.scalar_type() == at::kFloat && cpu_ok && fp32_cpu_reduce_enabled()) {
         StagingBuffer staged = stage_for_send(tensor);
         PooledBuffer recv_buf(staging_memory_pool(), nbytes);
+        auto net_t0 = std::chrono::steady_clock::now();
         if (rank == 0) {
             MCCL_CHECK(transport_->send_chunks(
                            peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes),
@@ -1859,6 +1868,8 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
                            peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes),
                        "allreduce_two_rank fp32 send failed");
         }
+        auto net_t1 = std::chrono::steady_clock::now();
+        auto red_t0 = std::chrono::steady_clock::now();
         reduce_wire_into_chunk_fp32(tensor, recv_buf.data(), nbytes, op);
         if (op == c10d::ReduceOp::AVG) {
             MPSBufferView view = extract_mps_buffer(tensor);
@@ -1866,11 +1877,16 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
             blit_buffer_to_tensor(view.cpu_ptr, tensor);
             metal_sync_queue_only();
         }
+        auto red_t1 = std::chrono::steady_clock::now();
+        double net_ms = std::chrono::duration<double, std::milli>(net_t1 - net_t0).count();
+        double red_ms = std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
+        metrics_->record_phase(seq, 0, net_ms, red_ms);
         metrics_->record_transport_bytes(nbytes, true);
         metrics_->record_transport_bytes(nbytes, false);
     } else {
         // f16/bf16 or compressed path: Metal pipeline
         at::Tensor recv_tensor = torch::empty_like(tensor);
+        auto net_t0 = std::chrono::steady_clock::now();
 
         if (rank == 0) {
             compressed_send(peer, OpType::ALLREDUCE, seq, 0, tensor);
@@ -1880,11 +1896,17 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
             compressed_send(peer, OpType::ALLREDUCE, seq, 0, tensor);
         }
 
+        auto net_t1 = std::chrono::steady_clock::now();
+        auto red_t0 = std::chrono::steady_clock::now();
         if (op == c10d::ReduceOp::AVG) {
             metal_accumulate_and_scale(tensor, recv_tensor, 1.0 / 2.0);
         } else {
             metal_reduce_op_fenced(tensor, recv_tensor, op);
         }
+        auto red_t1 = std::chrono::steady_clock::now();
+        double net_ms = std::chrono::duration<double, std::milli>(net_t1 - net_t0).count();
+        double red_ms = std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
+        metrics_->record_phase(seq, 0, net_ms, red_ms);
     }
 }
 
@@ -2446,7 +2468,7 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
             }
 
             for (int peer = 1; peer < ws; peer++) {
-                if (hub_cpu_fp32) {
+                if (hub_cpu_fp32 && !compressor_) {
                     PooledBuffer recv_buf(staging_memory_pool(), hub_nbytes);
                     MCCL_CHECK(transport_->recv_chunks(peer, OpType::ALLREDUCE, seq, 0,
                                                        recv_buf.data(), hub_nbytes),
@@ -2454,6 +2476,14 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
                     metrics_->record_transport_bytes(hub_nbytes, false);
                     cpu_reduce_op(static_cast<float*>(hub_view.cpu_ptr),
                                   static_cast<const float*>(recv_buf.data()),
+                                  hub_count, op);
+                    blit_buffer_to_tensor(hub_view.cpu_ptr, tensor);
+                } else if (hub_cpu_fp32 && compressor_) {
+                    at::Tensor incoming = torch::empty_like(tensor);
+                    compressed_recv(peer, OpType::ALLREDUCE, seq, 0, incoming, true);
+                    MPSBufferView iv = extract_mps_buffer(incoming);
+                    cpu_reduce_op(static_cast<float*>(hub_view.cpu_ptr),
+                                  static_cast<const float*>(iv.cpu_ptr),
                                   hub_count, op);
                     blit_buffer_to_tensor(hub_view.cpu_ptr, tensor);
                 } else {

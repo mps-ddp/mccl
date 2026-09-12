@@ -9,10 +9,13 @@ import pytest
 from mccl_test_utils import run_workers
 from test_ring_algo_correctness import _allreduce_vs_f64_reference_fn
 
-pytestmark = pytest.mark.skipif(
-    platform.system() != "Darwin" or platform.machine() not in ("arm64", "aarch64"),
-    reason="requires macOS Apple Silicon + MCCL",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        platform.system() != "Darwin" or platform.machine() not in ("arm64", "aarch64"),
+        reason="requires macOS Apple Silicon + MCCL",
+    ),
+    pytest.mark.slow,
+]
 
 # test_broadcast_object_list.py base harness
 _TEST_HARNESS = {

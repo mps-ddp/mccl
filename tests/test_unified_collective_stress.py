@@ -154,6 +154,7 @@ class TestUnifiedCollectiveStress:
     def test_async_bucket_stream(self, world_size):
         run_workers(_async_buckets_fn, world_size=world_size, env=_UNIFIED_ENV, timeout=600)
 
+    @pytest.mark.slow
     @pytest.mark.parametrize("world_size", [2, 4, 8])
     def test_ddp_conv_overlap_parity(self, world_size):
         run_workers(_ddp_conv_overlap_fn, world_size=world_size, env=_UNIFIED_ENV, timeout=900)

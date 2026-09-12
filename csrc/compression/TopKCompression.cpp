@@ -39,8 +39,13 @@ size_t TopKCompressor::compress(const void* src, size_t nbytes,
                                 void* dst, size_t dst_capacity,
                                 at::ScalarType dtype,
                                 uint64_t stable_id) {
-    MCCL_CHECK(dtype == at::kFloat,
-               "TopK compression currently supports float32 only");
+    // DDP and other collectives may move int64 metadata while TopK is enabled
+    // globally; pass those through uncompressed (same wire framing).
+    if (dtype != at::kFloat) {
+        MCCL_CHECK(dst_capacity >= nbytes, "TopK passthrough: buffer too small");
+        memcpy(dst, src, nbytes);
+        return nbytes;
+    }
 
     size_t count = nbytes / sizeof(float);
     uint32_t k = std::max(uint32_t(1),
@@ -122,8 +127,11 @@ size_t TopKCompressor::compress(const void* src, size_t nbytes,
 void TopKCompressor::decompress(const void* src, size_t compressed_size,
                                 void* dst, size_t nbytes,
                                 at::ScalarType dtype) {
-    MCCL_CHECK(dtype == at::kFloat,
-               "TopK decompression currently supports float32 only");
+    if (dtype != at::kFloat || compressed_size == nbytes) {
+        MCCL_CHECK(compressed_size == nbytes, "TopK passthrough: size mismatch");
+        memcpy(dst, src, nbytes);
+        return;
+    }
 
     size_t count = nbytes / sizeof(float);
 
@@ -152,9 +160,12 @@ void TopKCompressor::decompress(const void* src, size_t compressed_size,
 }
 
 size_t TopKCompressor::max_compressed_size(size_t nbytes) const {
-    size_t count = nbytes / sizeof(float);
+    size_t count = std::max(size_t(1), nbytes / sizeof(float));
     uint32_t k = static_cast<uint32_t>(count * k_ratio_) + 1;
-    return sizeof(uint32_t) + k * sizeof(IndexValue);
+    size_t topk_max = sizeof(uint32_t) + k * sizeof(IndexValue);
+    // Passthrough (non-fp32 metadata) sends nbytes raw; fp32 TopK worst case
+    // can also exceed nbytes when k ≈ count.
+    return std::max(nbytes, topk_max);
 }
 
 void TopKCompressor::reset_error_feedback() {

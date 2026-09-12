@@ -85,6 +85,7 @@ ALGO_ENVS = {
 }
 
 
+@pytest.mark.slow
 class TestAllreduceVsReference:
     @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
     @pytest.mark.parametrize("op", ["SUM", "AVG", "MAX"])

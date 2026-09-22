@@ -65,7 +65,7 @@ def _ddp_backward_finite_fn(rank, world_size):
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-@pytest.mark.parametrize("world_size", [4, 7])
+@pytest.mark.parametrize("world_size", [2, 4, 7])
 def test_ddp_backward_grad_finite(dtype, world_size):
     env = {
         "MCCL_RING_ALGO": "chunked",

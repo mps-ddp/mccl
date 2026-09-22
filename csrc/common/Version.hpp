@@ -1,7 +1,7 @@
 #pragma once
 
-#define MCCL_VERSION_MAJOR 0
-#define MCCL_VERSION_MINOR 5
+#define MCCL_VERSION_MAJOR 6
+#define MCCL_VERSION_MINOR 7
 #define MCCL_VERSION_PATCH 0
 
 // v4: compressed payloads framed as [4-byte size][exact payload]; chunked-
@@ -12,7 +12,7 @@
 //     Mixed-version jobs must be rejected at handshake.
 #define MCCL_PROTOCOL_VERSION 5
 
-#define MCCL_VERSION_STRING "0.5.0"
+#define MCCL_VERSION_STRING "6.7.0"
 
 namespace mccl {
 

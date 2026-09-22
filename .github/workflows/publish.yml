@@ -14,7 +14,7 @@ permissions:
   id-token: write
 
 jobs:
-  publish:
+  build:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -31,9 +31,23 @@ jobs:
           MCCL_REQUIRE_METALLIB: "1"
         run: python -m build
 
-      # Uses repo secret PYPI_API_TOKEN (classic API token). For OIDC instead, remove `with:` and
-      # configure https://pypi.org/manage/project/settings/publishing/ for this workflow.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # gh-action-pypi-publish only runs on Linux. Uses repo secret PYPI_API_TOKEN.
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          packages-dir: dist/
           password: ${{ secrets.PYPI_API_TOKEN }}

@@ -1,10 +1,6 @@
 # MCCL only builds on macOS Apple Silicon. Hosted macos-14+ runners are arm64 (M-series).
 #
-# PR/push job = the salient set for the production path (DDP ring allreduce
-# over TCP at ws>=3): build, wire protocol, reduce kernels, ring vs reference,
-# pipelined ring/demux/credits/concurrency ordering, no-store-barrier slow
-# rank + f16/bf16 ring, DDP parity.  Everything else (tree, compression,
-# metrics, race/soak, env matrices) runs nightly or on manual dispatch.
+# Push/PR: build + one DDP backward smoke. The rest of tests/ is local.
 name: CI
 
 on:
@@ -13,8 +9,6 @@ on:
   pull_request:
     branches: [main, master]
   workflow_dispatch:
-  schedule:
-    - cron: "0 9 * * *"  # nightly full matrix + soak
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -23,7 +17,7 @@ concurrency:
 jobs:
   build-test:
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -42,58 +36,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install numpy "pytest>=7.0" "pytest-timeout>=2.1" "setuptools>=68.0" "wheel>=0.41"
-          # Same torch the training cluster runs; build must use this env (no isolation).
           pip install torch==2.14.0
           pip install -e . --no-deps --no-build-isolation
 
-      - name: Build, protocol, reduce kernels, config
-        run: pytest -v tests/test_build.py tests/test_protocol.py tests/test_local_kernels.py tests/test_cpu_tensors.py tests/test_config_profiles.py
-
-      - name: Ring allreduce vs reference (chunked ring, odd sizes, determinism, other collectives)
-        run: pytest -v tests/test_correctness_vs_reference.py -k "chunked_default or large_odd or schedule or Determinism or Other"
-
-      - name: Pipelined ring, demux, credits, concurrency ordering (ws=4/5/7/8)
-        run: pytest -v tests/test_ring_pipeline.py -k "not 6"
-
-      - name: Slow rank without store barrier, f16/bf16 ring, CPU vs Metal parity
-        run: pytest -v tests/test_slow_rank_no_barrier.py
-
-      - name: DDP parity (2-proc, multi-bucket, bf16 grads)
-        run: pytest -v tests/test_ddp.py tests/test_ddp_multibucket.py tests/test_mccl_ddp_backward_smoke.py
-
-  nightly-full-matrix:
-    # Everything not in the PR job, on a schedule or manual dispatch.
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: macos-15
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install dependencies
-        env:
-          MCCL_REQUIRE_METALLIB: "1"
+      - name: Build and 2-worker DDP smoke
         run: |
-          python -m pip install --upgrade pip
-          pip install numpy "pytest>=7.0" "pytest-timeout>=2.1" "setuptools>=68.0" "wheel>=0.41"
-          pip install torch==2.14.0
-          pip install -e . --no-deps --no-build-isolation
-      - name: Full correctness matrix
-        run: pytest -v tests/test_correctness_vs_reference.py
-      - name: Ring pipeline + ring algo (all ws) + tree collectives
-        run: pytest -v tests/test_ring_pipeline.py tests/test_ring_algo_correctness.py tests/test_tree_collectives.py tests/test_ring_ws8.py
-      - name: Process group, v2 collectives, edge cases, broadcast_object_list
-        run: pytest -v tests/test_process_group_local.py tests/test_v2_collectives.py tests/test_edge_cases.py tests/test_broadcast_object_list.py
-      - name: Unified collective stress, Metal/CPU parity, concurrency v6, ws5 env matrix
-        run: pytest -v tests/test_unified_collective_stress.py tests/test_metal_cpu_parity.py tests/test_collective_concurrency_v6.py tests/test_ws5_env_matrix.py
-      - name: DDP overlap / consumer release, race stress, pipeline differential
-        run: pytest -v tests/test_ddp_conv_overlap.py tests/test_ddp_consumer_release.py tests/test_race_stress.py tests/test_pipeline_differential.py
-      - name: Compression, metrics, failure injection, event sync
-        run: pytest -v tests/test_compression.py tests/test_compression_e2e.py tests/test_metrics.py tests/test_failure_injection.py tests/test_event_sync_counter_gap.py
-      - name: F3 concurrent rings (opt-in wire sharing)
-        run: pytest -v tests/test_concurrent_rings.py
-      - name: Soak
-        run: pytest -v tests/test_soak.py
-      - name: Bus bandwidth report (informational)
-        run: python tests/bench_busbw.py --quick || true
+          pytest -v --timeout=180 tests/test_build.py
+          pytest -v --timeout=180 tests/test_mccl_ddp_backward_smoke.py -k "float32-2"

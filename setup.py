@@ -344,10 +344,25 @@ MM_SOURCES = [
     "csrc/transforms/Stft.mm",
 ]
 
+def _csrc_build_depends() -> list[str]:
+    """Headers and Metal sources. Extension ``sources`` are only .cpp/.mm, so without
+    this the sdist omits them and ``python -m build`` fails with a missing include.
+    """
+    keep = {".hpp", ".h", ".metal"}
+    found: list[str] = []
+    root = os.path.join(_REPO_ROOT, "csrc")
+    for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
+            if os.path.splitext(name)[1] in keep:
+                found.append(os.path.relpath(os.path.join(dirpath, name), _REPO_ROOT))
+    return sorted(found)
+
+
 ext = Extension(
     name="mccl._C",
     sources=CPP_SOURCES + MM_SOURCES,
     include_dirs=["csrc"],
+    depends=_csrc_build_depends(),
     language="c++",
 )
 
@@ -356,6 +371,7 @@ setup(
     version="6.7.0",
     description="MPS-native ProcessGroup backend for PyTorch Distributed on Apple Silicon",
     packages=["mccl"],
+    include_package_data=True,
     ext_modules=[ext],
     cmdclass={"build_ext": MCCLBuildExt},
     python_requires=">=3.11",

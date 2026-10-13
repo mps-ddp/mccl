@@ -1,7 +1,7 @@
 #pragma once
 
 #define MCCL_VERSION_MAJOR 6
-#define MCCL_VERSION_MINOR 7
+#define MCCL_VERSION_MINOR 8
 #define MCCL_VERSION_PATCH 0
 
 // v4: compressed payloads framed as [4-byte size][exact payload]; chunked-
@@ -10,9 +10,12 @@
 //     (<= chunk_bytes per message); the v4 single-message overlap framing
 //     is gone, and ring traffic from concurrent collectives interleaves.
 //     Mixed-version jobs must be rejected at handshake.
-#define MCCL_PROTOCOL_VERSION 5
+// v6: small allreduces at world_size >= 3 default to recursive doubling,
+//     and star / broadcast / allgather / reduce_scatter acks are one 4-byte
+//     word (v5 sent a tensor-shaped ack, tensor-sized for 2-rank broadcast).
+#define MCCL_PROTOCOL_VERSION 6
 
-#define MCCL_VERSION_STRING "6.7.0"
+#define MCCL_VERSION_STRING "6.8.0"
 
 namespace mccl {
 

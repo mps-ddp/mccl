@@ -70,18 +70,49 @@ void Rendezvous::barrier(const std::string& tag) {
     std::vector<uint8_t> val = {1};
     store_->set(key, val);
 
+    // Wait on all peers in one store call: waiting peer by peer costs a store
+    // round trip per peer, so the barrier grows linearly with world size.
+    // The timeout restarts whenever a peer arrives, as the per-peer wait did.
+    std::vector<int> pending_ranks;
+    std::vector<std::string> pending_keys;
     for (int r = 0; r < world_size_; r++) {
         if (r == rank_) continue;
-        std::string peer_key = barrier_key(tag, epoch, r);
+        pending_ranks.push_back(r);
+        pending_keys.push_back(barrier_key(tag, epoch, r));
+    }
+
+    while (!pending_keys.empty()) {
         try {
-            store_->wait({peer_key}, timeout_);
-            store_->get(peer_key);
+            store_->wait(pending_keys, timeout_);
+            break;
         } catch (const std::exception& e) {
-            throw TimeoutError(
-                "Barrier '" + tag + "': rank " + std::to_string(rank_) +
-                " timed out waiting for rank " + std::to_string(r) +
-                ": " + e.what()
-            );
+            std::vector<int> still_ranks;
+            std::vector<std::string> still_keys;
+            for (size_t i = 0; i < pending_keys.size(); i++) {
+                bool present = false;
+                try {
+                    present = store_->check({pending_keys[i]});
+                } catch (const std::exception&) {
+                }
+                if (!present) {
+                    still_ranks.push_back(pending_ranks[i]);
+                    still_keys.push_back(pending_keys[i]);
+                }
+            }
+            if (still_keys.size() == pending_keys.size()) {
+                std::string missing;
+                for (int r : still_ranks) {
+                    if (!missing.empty()) missing += ",";
+                    missing += std::to_string(r);
+                }
+                throw TimeoutError(
+                    "Barrier '" + tag + "': rank " + std::to_string(rank_) +
+                    " timed out waiting for rank " + missing +
+                    ": " + e.what()
+                );
+            }
+            pending_ranks.swap(still_ranks);
+            pending_keys.swap(still_keys);
         }
     }
 

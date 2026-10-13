@@ -147,6 +147,7 @@ Network and staging run on a **background queue** (`ProgressEngine`, `csrc/runti
 | `MCCL_CREDIT_MIN_CHUNK` | 1 MB | Chunks at or above this engage NCCL-style credit flow control: a sender runs at most `depth+2` steps ahead of its consumer, so a slow/late rank is never flooded. `0` disables. |
 | `MCCL_UNIFIED_CPU_REDUCE` | on | Ring allreduce reduces shared-storage f32/f16/bf16 chunks with vDSP directly in unified memory (f16/bf16 accumulate in fp32 per hop). `0` = Metal kernels + per-step GPU fences (private storage always uses Metal). |
 | `MCCL_COLLECTIVE_STORE_BARRIER` | off | TCPStore barrier at the start of every collective (`1` = on). Debug aid only: costs `world_size-1` serial store round trips per collective. |
+| `MCCL_SMALL_ALGO` | `tree` | Allreduces at or below `MCCL_SMALL_MSG_THRESHOLD` with world size ≥3: `tree` = recursive doubling on unified memory (log2 N rounds, +2 beyond a power of two); `star` = rank-0 star (root serves N-1 peers in turn), the pre-6.8 default. Compression or private storage always use the star. |
 | `MCCL_FP32_CPU_REDUCE` | off | Legacy opt-in: fp32 CPU reduce on all paths (two-rank, tree, split-large), independent of `MCCL_UNIFIED_CPU_REDUCE`. |
 | `MCCL_CPU_WRITE_SYNC` | `none` | `full` restores a full `torch.mps.synchronize()` after CPU-path collectives (debugging only; serializes buckets). |
 | `MCCL_EVENT_SYNC` | on | `0` disables MTLSharedEvent sync (falls back to blocking stream sync; kills overlap). |

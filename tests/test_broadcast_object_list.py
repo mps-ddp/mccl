@@ -210,9 +210,9 @@ assert obj[0] == "/tmp/lightning_logs/version_0", repr(obj)
 # ~512KB — forces broadcast_ring_pipelined (not tree_small).
 n = 512 * 1024
 if rank == 0:
-    t = torch.arange(n, dtype=torch.uint8, device="cpu")
+    t = torch.arange(n, dtype=torch.uint8).to("mps")
 else:
-    t = torch.zeros(n, dtype=torch.uint8, device="cpu")
+    t = torch.zeros(n, dtype=torch.uint8, device="mps")
 dist.broadcast(t, src=0)
 expected = torch.arange(n, dtype=torch.uint8, device="cpu")
 assert torch.equal(t.cpu(), expected), f"rank {rank}: large broadcast corrupt"

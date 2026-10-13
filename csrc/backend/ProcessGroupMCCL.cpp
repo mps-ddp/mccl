@@ -682,6 +682,19 @@ inline bool fp32_cpu_reduce_enabled() {
     return enabled;
 }
 
+// MCCL_SMALL_ALGO: "tree" (default) runs sub-threshold allreduces at
+// world_size >= 3 as recursive doubling on unified memory, log2(N) rounds
+// (+2 to fold in ranks beyond a power of two).  "star" restores the rank-0
+// star, whose root serves the N-1 peers one after another; the tree then runs
+// only with MCCL_FP32_CPU_REDUCE=1, as before.
+inline bool small_allreduce_tree_default() {
+    static bool enabled = [] {
+        auto* v = std::getenv("MCCL_SMALL_ALGO");
+        return !(v && std::string(v) == "star");
+    }();
+    return enabled;
+}
+
 // CPU recv/reduce only when MCCL_FP32_CPU_REDUCE=1 (Metal is the default).
 inline bool prefer_cpu_unified_buffer_path(const at::Tensor& tensor) {
     if (!fp32_cpu_reduce_enabled()) return false;
@@ -1818,21 +1831,12 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
         PooledBuffer recv_buf(staging_memory_pool(), nbytes);
         void* recv_dst = recv_wire ? recv_wire : recv_buf.data();
         auto net_t0 = std::chrono::steady_clock::now();
-        if (rank == 0) {
-            MCCL_CHECK(transport_->send_chunks(
-                           peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes),
-                       "allreduce_two_rank unified send failed");
-            MCCL_CHECK(transport_->recv_chunks(
-                           peer, OpType::ALLREDUCE, seq, 0, recv_dst, nbytes),
-                       "allreduce_two_rank unified recv failed");
-        } else {
-            MCCL_CHECK(transport_->recv_chunks(
-                           peer, OpType::ALLREDUCE, seq, 0, recv_dst, nbytes),
-                       "allreduce_two_rank unified recv failed");
-            MCCL_CHECK(transport_->send_chunks(
-                           peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes),
-                       "allreduce_two_rank unified send failed");
-        }
+        // Both directions at once: a send-then-receive order idles one
+        // direction of the link and halves bus bandwidth.
+        MCCL_CHECK(transport_->send_recv_overlap(
+                       peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes,
+                       peer, OpType::ALLREDUCE, seq, 0, recv_dst, nbytes),
+                   "allreduce_two_rank unified exchange failed");
         auto net_t1 = std::chrono::steady_clock::now();
         auto red_t0 = std::chrono::steady_clock::now();
         if (!recv_wire) {
@@ -1843,6 +1847,9 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
         } else {
             metal_reduce_op_fenced(tensor, incoming, op);
         }
+        // `incoming` goes back to the allocator on return; the reduce reading
+        // it must finish first.
+        metal_sync_queue_only();
         auto red_t1 = std::chrono::steady_clock::now();
         double net_ms = std::chrono::duration<double, std::milli>(net_t1 - net_t0).count();
         double red_ms = std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
@@ -1888,7 +1895,18 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
         at::Tensor recv_tensor = torch::empty_like(tensor);
         auto net_t0 = std::chrono::steady_clock::now();
 
-        if (rank == 0) {
+        if (!compressor_) {
+            // Full duplex, as in the unified branch above.
+            StagingBuffer staged = stage_for_send(tensor);
+            PooledBuffer recv_buf(staging_memory_pool(), nbytes);
+            MCCL_CHECK(transport_->send_recv_overlap(
+                           peer, OpType::ALLREDUCE, seq, 0, staged.data, nbytes,
+                           peer, OpType::ALLREDUCE, seq, 0, recv_buf.data(), nbytes),
+                       "allreduce_two_rank exchange failed");
+            unstage_from_recv(recv_tensor, recv_buf.data(), nbytes);
+            metrics_->record_transport_bytes(nbytes, true);
+            metrics_->record_transport_bytes(nbytes, false);
+        } else if (rank == 0) {
             compressed_send(peer, OpType::ALLREDUCE, seq, 0, tensor);
             compressed_recv(peer, OpType::ALLREDUCE, seq, 0, recv_tensor);
         } else {
@@ -1903,6 +1921,8 @@ void ProcessGroupMCCL::allreduce_two_rank(at::Tensor& tensor, uint32_t seq,
         } else {
             metal_reduce_op_fenced(tensor, recv_tensor, op);
         }
+        // `recv_tensor` goes back to the allocator on return.
+        metal_sync_queue_only();
         auto red_t1 = std::chrono::steady_clock::now();
         double net_ms = std::chrono::duration<double, std::milli>(net_t1 - net_t0).count();
         double red_ms = std::chrono::duration<double, std::milli>(red_t1 - red_t0).count();
@@ -2393,8 +2413,11 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
         return;
     }
 
-    // Recursive-doubling tree (CPU reduce): opt-in via MCCL_FP32_CPU_REDUCE=1.
-    if (fp32_cpu_reduce_enabled()) {
+    // Recursive-doubling tree (CPU reduce on unified memory).  It reads the
+    // tensor's bytes directly, so the default relies on the producer fence;
+    // without shared events only MCCL_FP32_CPU_REDUCE=1 selects it.
+    if (fp32_cpu_reduce_enabled() ||
+        (small_allreduce_tree_default() && event_sync_available())) {
         auto dtype = tensor.scalar_type();
         bool tree_ok = !compressor_ && tensor_cpu_accessible(tensor) &&
                        (dtype == at::kFloat || dtype == at::kHalf ||
@@ -2511,10 +2534,11 @@ void ProcessGroupMCCL::allreduce_small(at::Tensor& tensor, uint32_t seq,
             }
         } else {
             compressed_send(0, OpType::ALLREDUCE, seq, 0, tensor);
-
-            at::Tensor result = torch::empty_like(tensor);
-            compressed_recv(0, OpType::ALLREDUCE, seq, 1, result);
-            tensor.copy_(result);
+            // Receive in place.  A temporary plus tensor.copy_() leaves the copy
+            // pending on PyTorch's stream after the temporary is freed; the
+            // allocator hands its buffer to the next same-size temporary, whose
+            // receive (a CPU write) lands before the GPU runs this copy.
+            compressed_recv(0, OpType::ALLREDUCE, seq, 1, tensor);
             metal_sync_queue_only();
         }
     }
@@ -2822,18 +2846,18 @@ void ProcessGroupMCCL::broadcast_two_rank(at::Tensor& tensor, uint32_t seq, int 
             }
         }
     } else {
-        // Serial compressed path (default fp32).  Use a separate recv tensor
-        // (same as allreduce_two_rank) — in-place unstage_from_recv on the
-        // output tensor is unreliable on MPS for small payloads.
-        at::Tensor recv_tensor = torch::empty_like(tensor);
-        at::Tensor ack = torch::zeros_like(tensor);
+        // Serial compressed path (default fp32).  Non-root receives in place:
+        // a temporary plus tensor.copy_() leaves the copy pending on PyTorch's
+        // stream after the temporary's buffer is recycled (see allreduce_small).
+        // The ack is a host word for the same reason: a zeros() tensor would
+        // leave a fill pending on a buffer the allocator may hand out again.
+        uint32_t ack = 0;
         if (rank == root) {
             compressed_send(peer, kWire, seq, 0, tensor);
-            compressed_recv(peer, kWire, seq, 0, ack);
+            wire_recv(transport_.get(), peer, seq, 0, &ack, sizeof(ack));
         } else {
-            compressed_recv(peer, kWire, seq, 0, recv_tensor);
-            tensor.copy_(recv_tensor);
-            compressed_send(peer, kWire, seq, 0, ack);
+            compressed_recv(peer, kWire, seq, 0, tensor);
+            wire_send(transport_.get(), peer, seq, 0, &ack, sizeof(ack));
         }
     }
 }
@@ -2846,23 +2870,21 @@ void ProcessGroupMCCL::broadcast_star_small(at::Tensor& tensor, uint32_t seq, in
 
     rendezvous_collective_enter(seq, "broadcast");
 
-    at::Tensor ack = torch::zeros(1, tensor.options());
+    uint32_t ack = 0;
     if (rank == root) {
         for (int peer = 0; peer < ws; peer++) {
             if (peer == root) continue;
             watchdog_->touch(seq);
             compressed_send(peer, kWire, seq, 0, tensor);
-            compressed_recv(peer, kWire, seq, 0, ack);
+            wire_recv(transport_.get(), peer, seq, 0, &ack, sizeof(ack));
             metrics_->record_transport_bytes(tensor_nbytes(tensor), true);
-            metrics_->record_transport_bytes(sizeof(float), false);
+            metrics_->record_transport_bytes(sizeof(ack), false);
         }
     } else {
-        at::Tensor recv_tensor = torch::empty_like(tensor);
-        compressed_recv(root, kWire, seq, 0, recv_tensor);
-        tensor.copy_(recv_tensor);
-        compressed_send(root, kWire, seq, 0, ack);
+        compressed_recv(root, kWire, seq, 0, tensor);
+        wire_send(transport_.get(), root, seq, 0, &ack, sizeof(ack));
         metrics_->record_transport_bytes(tensor_nbytes(tensor), false);
-        metrics_->record_transport_bytes(sizeof(float), true);
+        metrics_->record_transport_bytes(sizeof(ack), true);
     }
 }
 
@@ -2936,7 +2958,7 @@ void ProcessGroupMCCL::allgather_star_small(std::vector<at::Tensor>& outputs,
 
     rendezvous_collective_enter(seq, "allgather");
 
-    at::Tensor ack = torch::zeros(1, input.options());
+    uint32_t ack = 0;
     for (int src = 0; src < ws; src++) {
         watchdog_->touch(seq);
         if (rank == src) {
@@ -2946,8 +2968,8 @@ void ProcessGroupMCCL::allgather_star_small(std::vector<at::Tensor>& outputs,
                 }
                 compressed_send(dst, kWireCollectiveOp(), seq,
                                 static_cast<uint32_t>(rank), input);
-                compressed_recv(dst, kWireCollectiveOp(), seq,
-                                static_cast<uint32_t>(rank), ack);
+                wire_recv(transport_.get(), dst, seq,
+                          static_cast<uint32_t>(rank), &ack, sizeof(ack));
                 metrics_->record_transport_bytes(nbytes, true);
             }
         } else {
@@ -2955,8 +2977,8 @@ void ProcessGroupMCCL::allgather_star_small(std::vector<at::Tensor>& outputs,
             // cpu_ptr on unified MPS; copy_ would blit stale GPU bytes instead.
             compressed_recv(src, kWireCollectiveOp(), seq,
                             static_cast<uint32_t>(src), outputs[src]);
-            compressed_send(src, kWireCollectiveOp(), seq,
-                            static_cast<uint32_t>(src), ack);
+            wire_send(transport_.get(), src, seq,
+                      static_cast<uint32_t>(src), &ack, sizeof(ack));
             metrics_->record_transport_bytes(nbytes, false);
         }
     }
@@ -2992,7 +3014,7 @@ void ProcessGroupMCCL::reduce_scatter_star_small(std::vector<at::Tensor>& inputs
     const int64_t count = output.numel();
     float* out_fp32 = unified_fp32 ? static_cast<float*>(out_view.cpu_ptr) : nullptr;
 
-    at::Tensor ack = torch::zeros(1, output.options());
+    uint32_t ack = 0;
     for (int dest = 0; dest < ws; dest++) {
         watchdog_->touch(seq);
         const uint32_t tid = static_cast<uint32_t>(dest);
@@ -3011,14 +3033,14 @@ void ProcessGroupMCCL::reduce_scatter_star_small(std::vector<at::Tensor>& inputs
                     unstage_from_recv(recv_tensor, wire_buf.data(), nbytes);
                     metal_reduce_op(output, recv_tensor, op);
                 }
-                compressed_send(src, kWireCollectiveOp(), seq, tid, ack);
+                wire_send(transport_.get(), src, seq, tid, &ack, sizeof(ack));
                 metrics_->record_transport_bytes(nbytes, false);
             }
         } else {
             blit_tensor_to_buffer(inputs[dest], wire_buf.data());
             mccl_queue_drain();
             wire_send(transport_.get(), dest, seq, tid, wire_buf.data(), nbytes);
-            compressed_recv(dest, kWireCollectiveOp(), seq, tid, ack);
+            wire_recv(transport_.get(), dest, seq, tid, &ack, sizeof(ack));
             metrics_->record_transport_bytes(nbytes, true);
         }
     }

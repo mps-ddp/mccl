@@ -1,5 +1,23 @@
 # Changelog
 
+## v6.8 — correctness under load, faster small and two-rank collectives
+
+### Changed
+- **Small allreduces use recursive doubling by default** (`MCCL_SMALL_ALGO=tree`): at world size ≥3, sub-threshold allreduces on shared storage run log2(N) rounds (+2 beyond a power of two) instead of the rank-0 star, whose root serves N-1 peers in turn. 4 KB at N=15: 2.4 ms → 1.0 ms; on one Mac, 3.2x faster at ws=4 and 3.5x at ws=8. `MCCL_SMALL_ALGO=star` restores the previous behaviour exactly.
+- **Two-rank allreduce sends and receives at the same time** (`send_recv_overlap`) instead of rank 0 sending, then receiving: the serial order idled one direction of the link and capped bus bandwidth at half the wire (0.61 GB/s on 10GbE). Compressed payloads keep the serial order.
+- **Protocol version 6**: the small-allreduce default and the ack format changed on the wire, so 6.7 and 6.8 ranks refuse to form a group instead of deadlocking.
+
+### Fixed
+- **`Rendezvous::barrier` made 2(N-1) serial store round trips per rank** (one `wait` + `get` per peer): 14 ms at N=15. It now waits on all peers in one request (0.5 ms at any N); the timeout restarts whenever a peer arrives, and the error lists every missing rank.
+- **Small allreduce (star) and small broadcast returned another collective's data on non-root ranks** when several were in flight. Non-root ranks received into a temporary and queued `tensor.copy_()` on PyTorch's stream; the temporary was freed with the copy still pending, and the allocator handed its buffer to the next same-size temporary, whose receive (a CPU write) landed first. Reproduced by `test_concurrent_rings.py::test_mixed_small_ring_broadcast[4]` (with or without F3) and by back-to-back async broadcasts at ws=2 and 4. Non-root ranks now receive in place.
+- **Star/broadcast/allgather/reduce_scatter acks were MPS tensors created on the engine thread** (`torch.zeros`), leaving a fill pending on a buffer the allocator may hand out again (same hazard as the v6.6 `recv()` fix). Acks are now a host word; the 2-rank broadcast ack shrinks from the full tensor to 4 bytes.
+- **Two-rank allreduce freed its receive temporary while the Metal reduce could still be reading it** (`metal_reduce_op_fenced` signals a fence without waiting). The path now drains MCCL's queue before returning.
+
+### Tests and CI
+- `tests/test_inflight_small_collectives.py`: bursts of same-size small allreduces (tree, star, F3) and broadcasts at ws=2-4, polled to completion before anything commits PyTorch's stream, then checked exactly; 2-rank large allreduces in flight for f32/f16/bf16, SUM and AVG. On 6.7.0 8 of its 10 cases fail.
+- CI runs the build check, the 2-worker DDP smoke test and the in-flight test.
+- Removed stale or manual tests: `test_mps_storage_access.py` (asserted private storage; torch 2.14 allocates shared), `test_ws5_env_matrix.py` (old job-config matrix), `soak_allreduce_ring_manual.py`, and the root `test_quick.py` / `_stft_dbg.py`. `test_broadcast_object_list.py` broadcasts MPS tensors (torch 2.14 rejects CPU tensors on a device-bound group).
+
 ## v6.7 — F3 concurrent rings (opt-in)
 
 ### Added

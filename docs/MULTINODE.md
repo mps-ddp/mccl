@@ -144,10 +144,10 @@ torchrun --nnodes=24 --node_rank=$i --nproc_per_node=1 \
 | Knob | Default | At 24 ranks |
 |------|---------|-------------|
 | `MCCL_RING_PIPELINE` | on | Streaming TX/RX ring: both link directions busy through all 2(N-1) steps. Set `0` only to bisect a suspected pipeline bug. |
-| `MCCL_PIPELINE_DEPTH` | 1 | Posted-ahead receives per collective. Raise to 3-4 on high-latency links. |
+| `MCCL_PIPELINE_DEPTH` | 4 | Posted-ahead receives per ring pipeline (1-8), capped at `MCCL_PIPELINE_INFLIGHT_BYTES / chunk` (8 MB budget), so chunks of 8 MB or more run at depth 1. |
 | `MCCL_COLLECTIVE_CONCURRENCY` | 1 | DDP buckets in flight. Raise to 2-4 if `avg_network_ms` shows gaps between buckets. |
 | `MCCL_CREDIT_MIN_CHUNK` | 1 MB | Credit flow control: senders stay at most `depth+2` chunks ahead of each consumer, so a slow GPU / late bucket start on one Mac is throttled at the source instead of flooding its receive buffers. Mixed M1/M4 clusters rely on this. |
-| `MCCL_SMALL_MSG_THRESHOLD` | auto | Below: recursive-doubling tree allreduce (~2+log2 N rounds). Above: pipelined ring. Auto-scales with world size (256 KiB at N<=4 up to 2 MiB at N=24+) since the ring pays 2(N-1) latencies; set explicitly to pin. |
+| `MCCL_SMALL_MSG_THRESHOLD` | 256 KiB | At or below: recursive-doubling allreduce (log2 N rounds, +2 beyond a power of two; `MCCL_SMALL_ALGO=star` selects the rank-0 star). Above: pipelined ring. Fixed at every world size; the ring pays 2(N-1) hop latencies, so raise it on large clusters if small buckets dominate. |
 | broadcast | auto | ws>=4 uses binomial tree (small) / pipelined ring (large): root egress is S bytes, not (N-1)S. |
 
 4. **Verify the link**, then the ring bound:

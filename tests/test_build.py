@@ -27,7 +27,7 @@ def _xcrun_metal_available() -> bool:
 def test_python_package_imports():
     import mccl
     assert hasattr(mccl, "__version__")
-    assert mccl.__version__ == "6.7.0"
+    assert mccl.__version__ == "6.8.0"
 
 
 def test_compatibility_matrix():
@@ -42,8 +42,8 @@ def test_compatibility_matrix():
 )
 def test_native_extension_loads():
     from mccl._C import __version__, __protocol_version__
-    assert __version__ == "6.7.0"
-    assert __protocol_version__ == 5
+    assert __version__ == "6.8.0"
+    assert __protocol_version__ == 6
 
 
 @pytest.mark.skipif(

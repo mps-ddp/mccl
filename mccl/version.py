@@ -1,9 +1,9 @@
-__version__ = "6.7.0"
+__version__ = "6.8.0"
 
 COMPATIBILITY_MATRIX = {
-    "macos": ["15.0", "15.1", "15.2", "15.3", "15.4"],
-    "python": ["3.11", "3.12"],
-    "pytorch": ["2.5.x", "2.6.x"],
+    "macos": ["15.x", "26.x"],
+    "python": ["3.11", "3.12", "3.13"],
+    "pytorch": ["2.13.x", "2.14.x"],
     "hardware": "Apple Silicon (M1/M2/M3/M4 family)",
     "backend_name": "mccl",
     "supported_devices": ["mps"],

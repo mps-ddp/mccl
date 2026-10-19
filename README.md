@@ -95,66 +95,47 @@ for Thunderbolt networking.
 
 ## How it works
 
-- **In-place reduction.** On shared MPS storage, MCCL sends from and reduces into each
-  gradient bucket's own Metal buffer using Accelerate, with fp16 and bf16 accumulated in fp32.
-  Gradients are not staged through host memory or copied back to the GPU.
-- **Shared-event ordering.** The CPU engine starts on a bucket as soon as its GPU producers
-  finish, and later GPU work waits for the reduced result. MCCL never submits PyTorch's MPS
-  stream or drains the device, which is what allows communication to overlap backward.
-- **TCP transport.** Large allreduces use a pipelined reduce-scatter/allgather ring and small
-  ones use recursive doubling. Per-peer reader threads, credit-based flow control, and
-  issue-order admission keep every rank on the same schedule.
+**In-place reduction.** On shared MPS storage, MCCL sends from and reduces into each gradient
+bucket's own Metal buffer using Accelerate, with fp16 and bf16 accumulated in fp32. Gradients
+are not staged through host memory or copied back to the GPU.
+
+**Shared-event ordering.** The CPU engine starts on a bucket as soon as its GPU producers
+finish, and later GPU work waits for the reduced result. MCCL never submits PyTorch's MPS
+stream or drains the device, which is what allows communication to overlap backward.
+
+```mermaid
+sequenceDiagram
+    participant PT as PyTorch thread
+    participant GPU as MPS stream (GPU)
+    participant ENG as MCCL engine (CPU)
+    participant NET as Peer Macs
+    PT->>GPU: encode backward kernels that write bucket k
+    PT->>GPU: encode producer signal k and commit
+    GPU-->>ENG: producer event reaches k
+    ENG->>NET: ring reduce-scatter and allgather on bucket k, in place
+    ENG-->>GPU: CPU sets consumer event to k
+    PT->>GPU: encode GPU-side wait on k before the optimizer reads bucket k
+    Note over PT,GPU: Only PyTorch's thread submits its stream
+```
+
+**TCP transport.** Large allreduces use a pipelined reduce-scatter/allgather ring and small
+ones use recursive doubling. Per-peer reader threads, credit-based flow control, and
+issue-order admission keep every rank on the same schedule.
 
 Supported collectives: `allreduce`, `broadcast`, `allgather`, `reduce_scatter`, `barrier`,
 `send`, and `recv`.
 
 ## Configuration
 
-The defaults are the settings used for the results above. Set variables on every rank, or
-call `mccl.init(...)` before `init_process_group`.
+MCCL runs with its defaults, which are the settings behind the results above. The settings
+you are most likely to need, set on every rank:
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `MCCL_IFNAME` | unset | Network interface to use. Defaults to the interface on `MASTER_ADDR`'s subnet. |
-| `MCCL_PORT_BASE` | `20100` | Rank *r* listens on `base + r`. Keep clear of `MASTER_PORT`. |
-| `MCCL_LOG_LEVEL` | `WARN` | `INFO` logs the selected interface, address, MTU, and link speed. |
-| `MCCL_COMPRESSION` | `none` | `fp16` or `topk` gradient compression. |
-| `MCCL_WATCHDOG_TIMEOUT_MS` | `300000` | Timeout for a running collective. |
-| `MCCL_TRANSPORT` | `auto` | `tcp` or `rdma`. RDMA over Thunderbolt 5 is experimental. |
+- `MCCL_IFNAME=en0` selects the network interface on Macs with more than one.
+- `MCCL_PORT_BASE=20100` sets the first listen port (rank *r* uses `base + r`).
+- `MCCL_LOG_LEVEL=INFO` logs the selected interface, address, MTU, and link speed at startup.
 
-<details>
-<summary>Advanced settings</summary>
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `MCCL_LISTEN_ADDR` | auto | Address published to peers, overriding interface selection. |
-| `MCCL_SMALL_MSG_THRESHOLD` | 256 KiB | Allreduces at or below this size use the small-message algorithm. |
-| `MCCL_SMALL_ALGO` | `tree` | Small-message algorithm: `tree` (recursive doubling) or `star` (via rank 0). |
-| `MCCL_SOCK_BUFSIZE` | 32 MiB | Socket buffer size. `0` lets the kernel auto-tune. |
-| `MCCL_CHUNK_BYTES` | 16 MB | Maximum message size on the wire. |
-| `MCCL_RING_ALGO` | `auto` | `chunked` (double-buffered, 2N chunks) or `basic`. |
-| `MCCL_RING_PIPELINE` | on | Streaming ring. `0` selects a lock-step fallback for debugging. |
-| `MCCL_PIPELINE_DEPTH` | `4` | Receives posted ahead per ring pipeline (1–8). |
-| `MCCL_PIPELINE_INFLIGHT_BYTES` | 8 MB | Per-connection in-flight budget; caps the effective pipeline depth. |
-| `MCCL_CREDIT_MIN_CHUNK` | 1 MB | Minimum chunk size for credit flow control. `0` disables it. |
-| `MCCL_COLLECTIVE_CONCURRENCY` | `1` | Collectives in flight (1–8). |
-| `MCCL_CONCURRENT_RINGS` | off | Allow ring allreduces to overlap on the wire. Requires concurrency of 2 or more. |
-| `MCCL_DEMUX_PARK_BYTES` | auto | Per-peer limit on messages buffered before their receive is posted. |
-| `MCCL_DEMUX_INFLIGHT_BUDGET_BYTES` | 1 GiB | Caps effective concurrency at budget ÷ DDP bucket size. |
-| `MCCL_UNIFIED_COLLECTIVE` | on | In-place path for shared MPS storage. `0` stages through Metal. |
-| `MCCL_UNIFIED_CPU_REDUCE` | on | Accelerate reduction in unified memory. `0` uses Metal kernels. |
-| `MCCL_FP32_CPU_REDUCE` | off | Force fp32 CPU reduction on every path. |
-| `MCCL_EVENT_SYNC` | on | Shared-event ordering. `0` uses a blocking stream sync (debugging only). |
-| `MCCL_OVERLAP_COMM` | on | Overlap communication with computation. |
-| `MCCL_CPU_WRITE_SYNC` | none | `full` synchronizes MPS after CPU-path collectives (debugging only). |
-| `MCCL_COLLECTIVE_STORE_BARRIER` | off | Store barrier before every collective (debugging only). |
-| `MCCL_TRANSPORT_CRC` | off | CRC32 on every payload. |
-| `MCCL_FAST_MATH` | on | Metal fast math. `0` selects strict math. |
-| `MCCL_LINK_PROFILE` | unset | `thunderbolt` raises the minimum transport chunk to 16 MB. |
-| `MCCL_TOPK_RATIO` | `0.01` | Fraction of values kept by `topk` compression. |
-| `MCCL_STFT_BACKEND` | `auto` | Backend for `mccl.transforms.stft`: `vdsp`, `metal`, or `auto`. |
-
-</details>
+See [docs/CONFIGURATION.md](https://github.com/mps-ddp/mccl/blob/master/docs/CONFIGURATION.md)
+for every setting.
 
 ## Diagnostics and testing
 

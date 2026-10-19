@@ -1,6 +1,7 @@
 # MCCL only builds on macOS Apple Silicon. Hosted macos-14+ runners are arm64 (M-series).
 #
-# Push/PR: build + one DDP backward smoke. The rest of tests/ is local.
+# Push/PR: build, one DDP backward smoke, and the in-flight collectives check.
+# The rest of tests/ is local.
 name: CI
 
 on:
@@ -42,4 +43,7 @@ jobs:
       - name: Build and 2-worker DDP smoke
         run: |
           pytest -v --timeout=180 tests/test_build.py
-          pytest -v --timeout=180 tests/test_mccl_ddp_backward_smoke.py -k "float32-2"
+          pytest -v --timeout=180 tests/test_mccl_ddp_backward_smoke.py -k "2-float32"
+
+      - name: Collectives in flight (exact results)
+        run: pytest -v --timeout=600 tests/test_inflight_small_collectives.py

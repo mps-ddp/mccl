@@ -1,36 +1,39 @@
-# MCCL
+# MCCL (Metal Collective Communication Library)
 
 [![CI](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/mccl)](https://pypi.org/project/mccl/)
 [![Python](https://img.shields.io/pypi/pyversions/mccl)](https://pypi.org/project/mccl/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/mps-ddp/mccl/blob/master/LICENSE)
 
-MCCL is a `torch.distributed` backend for Apple-silicon GPUs. It runs PyTorch DDP across
-Macs over standard Ethernet, and existing training code needs only `backend="mccl"`.
+MCCL is a `torch.distributed` backend for Apple-silicon GPUs. Training code selects it
+with `backend="mccl"`. It runs multi-node PyTorch over Ethernet, and has been run on up
+to 24 Macs at Skywalker Sound.
 
-PyTorch has no built-in distributed backend for MPS tensors, and Gloo accepts only CPU
-tensors, so every gradient bucket must be staged through host memory after a device
-synchronization. MCCL reduces gradients in place in unified memory and uses Metal shared
-events to order that work against PyTorch's MPS stream, so communication overlaps the
-backward pass.
+PyTorch has no distributed backend for MPS tensors, and Gloo accepts only CPU tensors, so
+a Gloo run copies every gradient bucket to CPU after a device synchronization. MCCL
+reduces gradients in place in unified memory and uses Metal shared events to order that
+work against PyTorch's MPS stream, so the allreduce overlaps the backward pass.
 
 ## Performance
 
-MCCL has run DDP jobs on up to 24 Macs, including full training runs to convergence. The
-measurements below come from a controlled pool of 15 Mac Studios (M4 Max, 40-core GPU,
-128 GB) on one 10 GbE switch with jumbo frames, using MCCL 6.8.0 and PyTorch 2.14.
+Measured on 24 Mac Studios at Skywalker Sound (M4 Max, 40-core GPU, 128 GB), one 10 GbE
+switch, jumbo frames, MCCL 6.8.0, and PyTorch 2.14.
 
 | Measurement | Result |
 | --- | --- |
-| 256 MB allreduce, averaged over 4–15 Macs | 99.7% of TCP goodput (1.234 GB/s bus bandwidth) |
-| Communication hidden behind backward (25 MB DDP buckets) | 94% at 4, 8, and 15 Macs |
-| 113.5M-parameter ViT on CIFAR-10, 1 → 15 Macs | 199 → 2,875 samples/s (96.5% scaling efficiency) |
-| 10-minute soak at 15 Macs | 18,884 allreduces per rank, zero incorrect elements |
-| CPU cost at line rate | about 0.25 of one core |
+| 256 MB allreduce, 4–24 Macs | 99.7% of TCP goodput at 24 Macs (1.234 GB/s bus bandwidth) |
+| Communication hidden behind gradient computation (25 MB buckets) | 94% at 4, 8, 16, and 24 Macs |
+| 113.5M-parameter ViT on CIFAR-10, 1 → 24 Macs | 198 → 4,568 samples/s (95.9% scaling efficiency; 1.78× CPU-staged Gloo) |
+| Same ViT on A100 80 GB GPUs | 1,088 samples/s on one GPU and 2,028 on two with TF32 matmul (24 Macs are 2.25× that two-GPU run). One A100 with fp32 matmul reaches 340 samples/s |
+| 31.6M-parameter ResNet on CIFAR-10, 400 steps, batch 64 per Mac | 42.0% validation accuracy on 1 Mac, 63.2% on 24 |
+| 10-minute soak at 24 Macs | 17,784 allreduces per rank, zero incorrect elements |
+| CPU cost at line rate | 0.31 cores |
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mps-ddp/mccl/master/docs/images/coll_vs_nodes.png" width="85%" alt="Allreduce bus bandwidth and efficiency from 4 to 15 Macs">
-  <img src="https://raw.githubusercontent.com/mps-ddp/mccl/master/docs/images/cifar_scaling.png" width="85%" alt="ViT training throughput and scaling efficiency from 1 to 15 Macs">
+  <img src="https://raw.githubusercontent.com/mps-ddp/mccl/master/docs/images/coll_vs_nodes.png" width="85%" alt="Allreduce bus bandwidth and efficiency from 4 to 24 Macs">
+  <img src="https://raw.githubusercontent.com/mps-ddp/mccl/master/docs/images/overlap.png" width="55%" alt="Overlap of 25 MB bucket communication with GPU work at 4, 8, 16, and 24 Macs">
+  <img src="https://raw.githubusercontent.com/mps-ddp/mccl/master/docs/images/cifar_scaling.png" width="85%" alt="ViT training throughput from 1 to 24 Macs">
+  <img src="https://raw.githubusercontent.com/mps-ddp/mccl/master/docs/images/cifar_convergence.png" width="85%" alt="ResNet validation loss and accuracy versus optimizer step from 1 to 24 Macs">
 </p>
 
 ## Installation
@@ -147,27 +150,18 @@ per Mac, withholds implicit GPU synchronization, and checks every output element
 
 ## Known issue: MPS reflect-padding gradients
 
-On PyTorch 2.14 and macOS 15.7, the MPS backward pass of reflect padding silently returns
-wrong gradients for inputs longer than 2¹⁶ samples, or from 2¹⁶ for multi-channel inputs.
-Centered `torch.stft` pads a batch as channels, so batched spectral losses on clips longer
-than about 1.4 s at 48 kHz train on wrong gradients with no error or NaN. Validate GPU losses
-against a CPU reference; `mccl.transforms.stft(..., backend="vdsp")` is an independent
-Accelerate implementation suitable for that check.
+On PyTorch 2.14 and macOS 15.7, the MPS backward pass of reflect padding is exact up to
+65,535 samples (2¹⁶ − 1), silently returns wrong gradients above 2¹⁶ samples for single-channel
+inputs (except at exact multiples of 2¹⁶), and fails at every length ≥ 2¹⁶ when batch or
+channel count exceeds one. Centered `torch.stft` pads a batch as channels, so spectral
+losses on clips longer than about 1.4 s at 48 kHz train on wrong gradients with no error or
+NaN. Validate GPU losses against a CPU reference; `mccl.transforms.stft(..., backend="vdsp")`
+is an independent Accelerate implementation suitable for that check.
 
 ## Limitations
 
-- Small collectives are bound by network latency. With a 563 µs median TCP round trip, a
-  1 MB allreduce at 15 Macs reaches 13% of goodput.
-- MCCL uses a flat ring. A latency model fit to the 4–15-Mac measurements predicts that
-  25 MB buckets become latency-bound near 65 Macs; hierarchical allreduce is not yet
-  implemented.
-- The in-place path requires shared MPS storage, the PyTorch 2.14 default. Private storage
-  falls back to a staged path.
-
-## Paper
-
-An experience paper on MCCL's design and evaluation is forthcoming. The preprint link will
-be added here.
+The in-place path requires shared MPS storage, the PyTorch 2.14 default. Private storage
+falls back to a staged path.
 
 ## License
 

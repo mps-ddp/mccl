@@ -10,7 +10,7 @@ import mccl
 mccl.init(compression="fp16", log_level="INFO")  # same as MCCL_COMPRESSION=fp16 MCCL_LOG_LEVEL=INFO
 ```
 
-The defaults are the settings used for the published 15-Mac results. For multi-node setup
+The defaults are the settings used for the paper's 24-Mac results. For multi-node setup
 and troubleshooting, see [MULTINODE.md](MULTINODE.md).
 
 ## Networking

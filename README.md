@@ -14,26 +14,6 @@ a Gloo run copies every gradient bucket to CPU after a device synchronization. M
 reduces gradients in place in unified memory and uses Metal shared events to order that
 work against PyTorch's MPS stream, so the allreduce overlaps the backward pass.
 
-## Performance
-
-Measured on 24 Mac Studios at Skywalker Sound (M4 Max, 40-core GPU, 128 GB), one 10 GbE
-switch, jumbo frames, MCCL 6.8.0, and PyTorch 2.14.
-
-| Measurement | Result |
-| --- | --- |
-| 256 MB allreduce, 4–24 Macs | 99.7% of TCP goodput at 24 Macs (1.234 GB/s bus bandwidth) |
-| Communication hidden behind gradient computation (25 MB buckets) | 94% at 4, 8, 16, and 24 Macs |
-| 113.5M-parameter ViT on CIFAR-10, 1 → 24 Macs | 198 → 4,568 samples/s (95.9% scaling efficiency; 1.78× CPU-staged Gloo) |
-| Same ViT on A100 80 GB GPUs | 1,088 samples/s on one GPU and 2,028 on two with TF32 matmul (24 Macs are 2.25× that two-GPU run). One A100 with fp32 matmul reaches 340 samples/s |
-| 31.6M-parameter ResNet on CIFAR-10, 400 steps, batch 64 per Mac | 42.0% validation accuracy on 1 Mac, 63.2% on 24 |
-| 10-minute soak at 24 Macs | 17,784 allreduces per rank, zero incorrect elements |
-| CPU cost at line rate | 0.31 cores |
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/mps-ddp/mccl/master/docs/images/coll_vs_nodes.png" width="85%" alt="Allreduce bus bandwidth and efficiency from 4 to 24 Macs">
-  <img src="https://raw.githubusercontent.com/mps-ddp/mccl/master/docs/images/cifar_scaling.png" width="85%" alt="ViT training throughput from 1 to 24 Macs">
-</p>
-
 ## Installation
 
 Requires an Apple-silicon Mac, macOS 15 or 26, Python 3.11–3.13, and PyTorch 2.13 or 2.14.
@@ -79,7 +59,7 @@ MCCL_IFNAME=en0 torchrun --nnodes=4 --nproc_per_node=1 --node_rank=$NODE_RANK \
 ```
 
 `MCCL_IFNAME` selects the training interface on Macs with more than one network interface.
-The results above used these settings on every Mac, with jumbo frames enabled on the switch:
+The measurements below used these settings on every Mac, with jumbo frames enabled on the switch:
 
 | Setting | Value |
 | --- | --- |
@@ -93,6 +73,26 @@ See [docs/MULTINODE.md](https://github.com/mps-ddp/mccl/blob/master/docs/MULTINO
 the multi-node checklist and troubleshooting, and
 [docs/THUNDERBOLT_SETUP.md](https://github.com/mps-ddp/mccl/blob/master/docs/THUNDERBOLT_SETUP.md)
 for Thunderbolt networking.
+
+## Performance
+
+Measured on 24 Mac Studios at Skywalker Sound (M4 Max, 40-core GPU, 128 GB), one 10 GbE
+switch, jumbo frames, MCCL 6.8.0, and PyTorch 2.14.
+
+| Measurement | Result |
+| --- | --- |
+| 256 MB allreduce, 4–24 Macs | 99.7% of TCP goodput at 24 Macs (1.234 GB/s bus bandwidth) |
+| Communication hidden behind gradient computation (25 MB buckets) | 94% at 4, 8, 16, and 24 Macs |
+| 113.5M-parameter ViT on CIFAR-10, 1 → 24 Macs | 198 → 4,568 samples/s (95.9% scaling efficiency; 1.78× CPU-staged Gloo) |
+| Same ViT on A100 80 GB GPUs | 1,088 samples/s on one GPU and 2,028 on two with TF32 matmul (24 Macs are 2.25× that two-GPU run). One A100 with fp32 matmul reaches 340 samples/s |
+| 31.6M-parameter ResNet on CIFAR-10, 400 steps, batch 64 per Mac | 42.0% validation accuracy on 1 Mac, 63.2% on 24 |
+| 10-minute soak at 24 Macs | 17,784 allreduces per rank, zero incorrect elements |
+| CPU cost at line rate | 0.31 cores |
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mps-ddp/mccl/master/docs/images/coll_vs_nodes.png" width="85%" alt="Allreduce bus bandwidth and efficiency from 4 to 24 Macs">
+  <img src="https://raw.githubusercontent.com/mps-ddp/mccl/master/docs/images/cifar_scaling.png" width="85%" alt="ViT training throughput from 1 to 24 Macs">
+</p>
 
 ## How it works
 

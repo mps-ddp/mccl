@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: If you use MCCL, please cite it as below.
+title: "MCCL (Metal Collective Communication Library)"
+type: software
+authors:
+  - family-names: Sasso
+    given-names: Kevin
+    affiliation: Skywalker Sound
+version: 6.8.0
+date-released: "2026-10-13"
+license: MIT
+repository-code: "https://github.com/mps-ddp/mccl"
+url: "https://github.com/mps-ddp/mccl"
+preferred-citation:
+  type: software
+  title: "MCCL (Metal Collective Communication Library)"
+  authors:
+    - family-names: Sasso
+      given-names: Kevin
+  year: 2026
+  version: 6.8.0
+  url: "https://github.com/mps-ddp/mccl"

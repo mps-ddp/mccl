@@ -163,6 +163,20 @@ is an independent Accelerate implementation suitable for that check.
 The in-place path requires shared MPS storage, the PyTorch 2.14 default. Private storage
 falls back to a staged path.
 
+## Citation
+
+If you use MCCL, please cite:
+
+```bibtex
+@software{sasso2026mccl,
+  author  = {Sasso, Kevin},
+  title   = {{MCCL} (Metal Collective Communication Library)},
+  year    = {2026},
+  version = {6.8.0},
+  url     = {https://github.com/mps-ddp/mccl}
+}
+```
+
 ## License
 
 MIT. See [LICENSE](https://github.com/mps-ddp/mccl/blob/master/LICENSE).

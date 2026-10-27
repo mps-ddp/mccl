@@ -31,9 +31,7 @@ switch, jumbo frames, MCCL 6.8.0, and PyTorch 2.14.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/mps-ddp/mccl/master/docs/images/coll_vs_nodes.png" width="85%" alt="Allreduce bus bandwidth and efficiency from 4 to 24 Macs">
-  <img src="https://raw.githubusercontent.com/mps-ddp/mccl/master/docs/images/overlap.png" width="55%" alt="Overlap of 25 MB bucket communication with GPU work at 4, 8, 16, and 24 Macs">
   <img src="https://raw.githubusercontent.com/mps-ddp/mccl/master/docs/images/cifar_scaling.png" width="85%" alt="ViT training throughput from 1 to 24 Macs">
-  <img src="https://raw.githubusercontent.com/mps-ddp/mccl/master/docs/images/cifar_convergence.png" width="85%" alt="ResNet validation loss and accuracy versus optimizer step from 1 to 24 Macs">
 </p>
 
 ## Installation

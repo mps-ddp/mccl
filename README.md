@@ -1,7 +1,9 @@
 # MCCL (Metal Collective Communication Library)
 
-[![CI](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml)
+[MCCL: Training Pytorch models across a fleet of Macs at Skywalker Sound](https://arxiv.org/abs/2610.39029)
+
 [![arXiv](https://img.shields.io/badge/arXiv-2610.39029-b31b1b.svg)](https://arxiv.org/abs/2610.39029)
+[![CI](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/mccl)](https://pypi.org/project/mccl/)
 [![Python](https://img.shields.io/pypi/pyversions/mccl)](https://pypi.org/project/mccl/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/mps-ddp/mccl/blob/master/LICENSE)

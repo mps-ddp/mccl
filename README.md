@@ -1,6 +1,7 @@
 # MCCL (Metal Collective Communication Library)
 
 [![CI](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml)
+[![arXiv](https://img.shields.io/badge/arXiv-2610.39029-b31b1b.svg)](https://arxiv.org/abs/2610.39029)
 [![PyPI](https://img.shields.io/pypi/v/mccl)](https://pypi.org/project/mccl/)
 [![Python](https://img.shields.io/pypi/pyversions/mccl)](https://pypi.org/project/mccl/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/mps-ddp/mccl/blob/master/LICENSE)
@@ -163,7 +164,21 @@ falls back to a staged path.
 
 ## Citation
 
-If you use MCCL, please cite:
+Paper: [MCCL: Training Pytorch models across a fleet of Macs at Skywalker Sound](https://arxiv.org/abs/2610.39029)
+
+```bibtex
+@misc{sasso2026mccltrainingpytorchmodels,
+      title={MCCL: Training Pytorch models across a fleet of Macs at Skywalker Sound},
+      author={Kevin Sasso and Chris Fiegel and Francis Aitken and Nicolas Tsingos and Nicholas Tong},
+      year={2026},
+      eprint={2610.39029},
+      archivePrefix={arXiv},
+      primaryClass={cs.DC},
+      url={https://arxiv.org/abs/2610.39029},
+}
+```
+
+Software:
 
 ```bibtex
 @software{sasso2026mccl,

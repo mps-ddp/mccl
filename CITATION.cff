@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-message: If you use MCCL, please cite it as below.
+message: If you use MCCL, please cite the paper.
 title: "MCCL (Metal Collective Communication Library)"
 type: software
 authors:
@@ -12,11 +12,21 @@ license: MIT
 repository-code: "https://github.com/mps-ddp/mccl"
 url: "https://github.com/mps-ddp/mccl"
 preferred-citation:
-  type: software
-  title: "MCCL (Metal Collective Communication Library)"
+  type: article
+  title: "MCCL: Training Pytorch models across a fleet of Macs at Skywalker Sound"
   authors:
     - family-names: Sasso
       given-names: Kevin
+    - family-names: Fiegel
+      given-names: Chris
+    - family-names: Aitken
+      given-names: Francis
+    - family-names: Tsingos
+      given-names: Nicolas
+    - family-names: Tong
+      given-names: Nicholas
   year: 2026
-  version: 6.8.0
-  url: "https://github.com/mps-ddp/mccl"
+  url: "https://arxiv.org/abs/2610.39029"
+  identifiers:
+    - type: other
+      value: "arXiv:2610.39029"

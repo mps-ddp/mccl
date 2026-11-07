@@ -1,4 +1,4 @@
-__version__ = "6.8.0"
+__version__ = "6.9.0"
 
 COMPATIBILITY_MATRIX = {
     "macos": ["15.x", "26.x"],

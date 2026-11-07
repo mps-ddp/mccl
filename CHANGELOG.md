@@ -1,5 +1,16 @@
 # Changelog
 
+## v6.9 — low-latency pipeline inference
+
+### Added
+- **Stream-ordered P2P receive** (`MCCL_STREAM_ORDERED_RECV=1`): `recv().wait()` places an `MTLSharedEvent` wait on PyTorch's MPS stream and returns immediately, allowing a pipeline stage to encode its Metal work before the network payload arrives.
+- **Residency keeper**: `mccl.pin_residency`, `mccl.set_residency_busy`, and `mccl.stop_residency` keep large model buffers in an `MTLResidencySet` across idle pipeline gaps. An optional native heartbeat also keeps the GPU and P-core ready without Python or GIL involvement.
+- **Low-latency P2P mode** (`MCCL_LOW_LATENCY_P2P=1`) raises progress/reader thread QoS and briefly spins before blocking to reduce small-message wake-up latency.
+
+### Changed
+- CPU tensor `send`/`recv` bypass MPS synchronization, avoiding an unnecessary GPU dependency for pipeline headers.
+- Isolated builds accept PyTorch 2.15.
+
 ## v6.8 — correctness under load, faster small and two-rank collectives
 
 ### Changed

@@ -6,8 +6,8 @@ authors:
   - family-names: Sasso
     given-names: Kevin
     affiliation: Skywalker Sound
-version: 6.8.0
-date-released: "2026-10-13"
+version: 6.9.0
+date-released: "2026-11-07"
 license: MIT
 repository-code: "https://github.com/mps-ddp/mccl"
 url: "https://github.com/mps-ddp/mccl"

@@ -9,8 +9,21 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/mps-ddp/mccl/blob/master/LICENSE)
 
 MCCL is a `torch.distributed` backend for Apple-silicon GPUs. Training code selects it
-with `backend="mccl"`. It runs multi-node PyTorch over Ethernet, and has been run on up
-to 24 Macs at Skywalker Sound.
+with `backend="mccl"`. It runs multi-node PyTorch over Ethernet. At Skywalker Sound,
+MCCL has trained production audio VAEs across as many as 24 Macs.
+
+MCCL now also powers distributed pipeline inference for frontier open-weight models on
+the same 10GbE Mac fleet:
+
+- **Kimi K2.6 (1.04T parameters):** 15.2 tok/s for one user and 28.6 tok/s aggregate
+  across four users on 10 Macs.
+- **GLM-5.3 (743B parameters, full 4-bit):** 28.9 tok/s for one user and 39.4 tok/s
+  aggregate across four users on 6 Macs.
+- **Kimi K3 (2.8T parameters):** served at 2.9 tok/s on 21 Macs as a full-fleet
+  distributed-inference proof.
+
+The interactive-serving figures are warm, short-prompt 240-token generation measurements.
+More details, reproducible inference code, and a technical blog are coming soon.
 
 PyTorch has no distributed backend for MPS tensors, and Gloo accepts only CPU tensors, so
 a Gloo run copies every gradient bucket to CPU after a device synchronization. MCCL

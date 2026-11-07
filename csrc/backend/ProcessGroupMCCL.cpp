@@ -3592,10 +3592,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
     watchdog_->watch(seq, "send");
     metrics_->op_start(seq, "send", nbytes);
 
-    uint64_t sync_val_s = sync_mps_for_collective();
+    const bool is_cpu = tensor.is_cpu();
+    uint64_t sync_val_s = is_cpu ? 0 : sync_mps_for_collective();
 
     net_engine_for(dstRank).submit(
-        [this, tensor, dstRank, seq, tag, nbytes, sync_val_s, work_ptr]() mutable {
+        [this, tensor, is_cpu, dstRank, seq, tag, nbytes, sync_val_s, work_ptr]() mutable {
             begin_execute(seq);
             if (sync_val_s) wait_for_mps(sync_val_s);
             StagingBuffer staged = stage_for_send_collective(tensor);
@@ -3604,7 +3605,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
                                                staged.data, staged.nbytes),
                        "send to rank " + std::to_string(dstRank) + " failed");
             metrics_->record_transport_bytes(nbytes, true);
-            arm_work_release(work_ptr);
+            if (!is_cpu) {
+                arm_work_release(work_ptr);
+            }
         },
         [this, work_ptr, seq]() {
             unregister_work(seq);
@@ -3657,12 +3660,37 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
     // zero-fill of a fresh torch.zeros on MPS).  Order that ahead of our write
     // into its storage, exactly as send()/allreduce() do, or the late fill
     // overwrites the received payload.
-    uint64_t sync_val_r = sync_mps_for_collective();
+    const bool is_cpu = tensor.is_cpu();
+    uint64_t sync_val_r = is_cpu ? 0 : sync_mps_for_collective();
+    uint64_t so_tok = 0;
+    if (!is_cpu && stream_ordered_recv_enabled() && unified_collective_enabled() &&
+        tensor_cpu_accessible(tensor) && event_sync_available()) {
+        so_tok = next_p2p_event_value();
+        work->set_stream_ordered_token(so_tok);
+    }
 
     net_engine_for(srcRank).submit(
-        [this, tensor, srcRank, seq, tag, nbytes, sync_val_r, work_ptr]() mutable {
+        [this, tensor, is_cpu, so_tok, srcRank, seq, tag, nbytes, sync_val_r, work_ptr]() mutable {
             begin_execute(seq);
             if (sync_val_r) wait_for_mps(sync_val_r);
+            if (is_cpu) {
+                MCCL_CHECK(transport_->recv_chunks(srcRank, OpType::RECV, seq,
+                                                   static_cast<uint32_t>(tag),
+                                                   tensor.data_ptr(), nbytes),
+                           "recv from rank " + std::to_string(srcRank) + " failed");
+                metrics_->record_transport_bytes(nbytes, false);
+                return;
+            }
+            if (so_tok > 0) {
+                MPSBufferView view = extract_mps_buffer(tensor);
+                MCCL_CHECK(transport_->recv_chunks(srcRank, OpType::RECV, seq,
+                                                   static_cast<uint32_t>(tag),
+                                                   view.cpu_ptr, nbytes),
+                           "recv from rank " + std::to_string(srcRank) + " failed");
+                metrics_->record_transport_bytes(nbytes, false);
+                signal_p2p_done_cpu(so_tok);
+                return;
+            }
             bool use_cpu = prefer_cpu_unified_buffer_path(tensor);
             if (use_cpu) {
                 MPSBufferView view = extract_mps_buffer(tensor);
@@ -3690,7 +3718,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
             metrics_->op_end(seq);
             work_ptr->markComplete();
         },
-        [this, work_ptr, seq](std::exception_ptr e) {
+        [this, work_ptr, seq, so_tok](std::exception_ptr e) {
+            if (so_tok > 0) {
+                signal_p2p_done_cpu(so_tok);
+            }
             unregister_work(seq);
             watchdog_->complete(seq);
             metrics_->op_end(seq);

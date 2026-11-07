@@ -41,4 +41,11 @@ uint64_t next_event_value();
 /// Returns 0 when overlap/event sync is off (consumer uses legacy drain in Work::wait).
 uint64_t publish_collective_release(bool overlap_comm);
 
+/// Stream-ordered P2P recv: allocate a token, enqueue GPU wait on the PyTorch MPS stream,
+/// and signal from the network thread once unified-memory recv completes.
+uint64_t next_p2p_event_value();
+void block_mps_on_p2p(uint64_t value);
+void signal_p2p_done_cpu(uint64_t value);
+void wait_for_p2p(uint64_t value);
+
 } // namespace mccl

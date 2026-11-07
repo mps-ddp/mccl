@@ -151,6 +151,26 @@ PYBIND11_MODULE(_C, m) {
           []() { return mccl::unified_collective_enabled(); },
           "True when unified collective is enabled (default on; set MCCL_UNIFIED_COLLECTIVE=0 to disable)");
 
+    m.def("_pin_residency",
+          [](const std::vector<at::Tensor>& tensors, int period_us, bool warm_pcore) {
+              return mccl::pin_residency(tensors, period_us, warm_pcore);
+          },
+          py::arg("tensors"),
+          py::arg("period_us") = 5000,
+          py::arg("warm_pcore") = false,
+          "Pin MPS tensors in a persistent MTLResidencySet with an optional C++ Metal heartbeat",
+          py::call_guard<py::gil_scoped_release>());
+
+    m.def("_set_residency_busy",
+          [](bool busy) { mccl::set_residency_busy(busy); },
+          py::arg("busy"),
+          "Pause/resume the C++ Metal residency heartbeat during active stage compute");
+
+    m.def("_stop_residency",
+          []() { mccl::stop_residency(); },
+          "Stop the C++ Metal residency heartbeat thread",
+          py::call_guard<py::gil_scoped_release>());
+
     m.def("_unstage_from_recv",
           [](const at::Tensor& tensor, const at::Tensor& src, bool cpu_unified_stage) {
               MCCL_CHECK(src.is_cpu() && src.is_contiguous(),

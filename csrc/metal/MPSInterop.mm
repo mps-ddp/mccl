@@ -5,8 +5,13 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
+#include <pthread/qos.h>
 
 #include "metal/MPSInterop.hpp"
 #include "metal/EventSync.hpp"
@@ -682,6 +687,156 @@ void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes,
 
     chunked_blit_from_staging(blit_src, nbytes, dst_buf, view.byte_offset);
     mccl_queue_drain();
+}
+
+namespace {
+
+struct ResidencyKeeper {
+    std::mutex mu;
+    id<MTLCommandQueue> queue = nil;
+    id<MTLResidencySet> res_set = nil;
+    id<MTLBuffer> scratch = nil;
+    std::atomic<bool> running{false};
+    std::atomic<bool> busy{false};
+    std::atomic<uint64_t> epoch{0};
+    std::thread worker;
+
+    void stop() {
+        if (running.exchange(false, std::memory_order_acq_rel)) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    ~ResidencyKeeper() {
+        stop();
+    }
+};
+
+ResidencyKeeper& residency_keeper() {
+    static ResidencyKeeper k;
+    return k;
+}
+
+bool env_flag_on(const char* name) {
+    auto* v = std::getenv(name);
+    if (!v) return false;
+    std::string s(v);
+    return s == "1" || s == "true" || s == "on" || s == "yes";
+}
+
+} // anonymous namespace
+
+bool stream_ordered_recv_enabled() {
+    return env_flag_on("MCCL_STREAM_ORDERED_RECV");
+}
+
+bool low_latency_p2p_enabled() {
+    return env_flag_on("MCCL_LOW_LATENCY_P2P");
+}
+
+void set_residency_busy(bool busy) {
+    ResidencyKeeper& k = residency_keeper();
+    k.busy.store(busy, std::memory_order_relaxed);
+    k.epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+void stop_residency() {
+    residency_keeper().stop();
+}
+
+int pin_residency(const std::vector<at::Tensor>& tensors, int period_us, bool warm_pcore) {
+    ResidencyKeeper& k = residency_keeper();
+    k.stop();
+
+    std::lock_guard<std::mutex> lock(k.mu);
+    if (@available(macOS 15.0, *)) {
+        @autoreleasepool {
+            id<MTLDevice> dev = cached_device();
+            if (!k.queue) {
+                k.queue = [dev newCommandQueue];
+            }
+            if (!k.scratch) {
+                k.scratch = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+            }
+
+            std::unordered_set<const void*> seen;
+            std::vector<id<MTLBuffer>> bufs;
+            bufs.reserve(tensors.size());
+            for (const auto& t : tensors) {
+                if (!t.defined() || !t.is_mps()) continue;
+                id<MTLBuffer> b = at::mps::getMTLBufferStorage(t);
+                if (b != nil && seen.insert((__bridge const void*)b).second) {
+                    bufs.push_back(b);
+                }
+            }
+            if (bufs.empty()) {
+                return 0;
+            }
+
+            MTLResidencySetDescriptor* desc = [[MTLResidencySetDescriptor alloc] init];
+            desc.initialCapacity = bufs.size();
+            NSError* err = nil;
+            id<MTLResidencySet> rs = [dev newResidencySetWithDescriptor:desc error:&err];
+            MCCL_CHECK(rs != nil, "pin_residency: newResidencySetWithDescriptor failed");
+
+            for (id<MTLBuffer> b : bufs) {
+                [rs addAllocation:b];
+            }
+            [rs commit];
+            [rs requestResidency];
+            [k.queue addResidencySet:rs];
+            [cached_queue() addResidencySet:rs];
+            k.res_set = rs;
+
+            if (period_us > 0) {
+                k.running.store(true, std::memory_order_release);
+                k.worker = std::thread([&k, period_us, warm_pcore]() {
+                    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+                    pthread_setname_np("mccl_residency");
+                    volatile uint64_t acc = 1;
+                    uint64_t idle_ticks = 0;
+                    while (k.running.load(std::memory_order_relaxed)) {
+                        uint64_t e0 = k.epoch.load(std::memory_order_relaxed);
+                        if (warm_pcore && idle_ticks >= 2 && !k.busy.load(std::memory_order_relaxed)) {
+                            auto t0 = std::chrono::steady_clock::now();
+                            while (k.running.load(std::memory_order_relaxed) &&
+                                   !k.busy.load(std::memory_order_relaxed) &&
+                                   k.epoch.load(std::memory_order_relaxed) == e0 &&
+                                   std::chrono::steady_clock::now() - t0 <
+                                       std::chrono::microseconds(period_us)) {
+                                for (int i = 0; i < 200; ++i) {
+                                    acc = acc * 2862933555777941757ULL + 3037000493ULL;
+                                }
+                            }
+                        } else {
+                            std::this_thread::sleep_for(std::chrono::microseconds(period_us));
+                        }
+                        if (k.busy.load(std::memory_order_relaxed) ||
+                            k.epoch.load(std::memory_order_relaxed) != e0) {
+                            idle_ticks = 0;
+                            continue;
+                        }
+                        idle_ticks++;
+                        if (idle_ticks >= 2 && k.queue && k.res_set) {
+                            @autoreleasepool {
+                                id<MTLCommandBuffer> cmd = [k.queue commandBuffer];
+                                [cmd useResidencySet:k.res_set];
+                                id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+                                [blit fillBuffer:k.scratch range:NSMakeRange(0, 64) value:0];
+                                [blit endEncoding];
+                                [cmd commit];
+                                [cmd waitUntilCompleted];
+                            }
+                        }
+                    }
+                });
+            }
+            return static_cast<int>(bufs.size());
+        }
+    }
+    return 0;
 }
 
 } // namespace mccl

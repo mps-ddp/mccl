@@ -32,6 +32,10 @@ public:
     /// Set by the engine thread before markComplete (overlap consumer release token).
     void set_release_token(uint64_t token);
 
+    /// Stream-ordered P2P recv token: Work::wait() enqueues a GPU wait on the MPS stream
+    /// and returns immediately to let the caller encode ahead of network arrival.
+    void set_stream_ordered_token(uint64_t token);
+
     /// Hold async-reduce staging tensors until ``wait()`` (NCCL TensorShelf).
     void stash_tensors(std::vector<at::Tensor> tensors);
 
@@ -45,6 +49,8 @@ private:
     uint32_t seq_;
     std::atomic<uint64_t> release_token_{0};
     std::atomic<bool> release_waited_{false};
+    std::atomic<uint64_t> stream_ordered_token_{0};
+    std::atomic<bool> stream_ordered_waited_{false};
     bool completed_ = false;
     bool success_ = false;
     std::exception_ptr exception_;

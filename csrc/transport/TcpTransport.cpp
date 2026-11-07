@@ -1,8 +1,12 @@
 #include "transport/TcpTransport.hpp"
+#include "metal/MPSInterop.hpp"
 #include "common/CollectiveEnv.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 #include "common/Version.hpp"
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 #include <cstdlib>
 #include <cstring>
@@ -808,6 +812,11 @@ bool TcpTransport::route_message(int peer, const MessageHeader& hdr) {
 }
 
 void TcpTransport::reader_loop(int peer) {
+#if defined(__APPLE__)
+    if (low_latency_p2p_enabled()) {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+#endif
     MCCL_DEBUG("Rank %d: reader for peer %d started", rank_, peer);
     std::vector<uint8_t> scratch;
 

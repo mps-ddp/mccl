@@ -164,6 +164,25 @@ def staging_pool_bytes() -> int:
         return 0
 
 
+def pin_residency(tensors, period_us: int = 5000, warm_pcore: bool = False) -> int:
+    """Pin MPS tensors' MTLBuffers into a persistent Metal MTLResidencySet and run a C++
+    heartbeat thread so macOS AGX never evicts multi-GB buffers across idle gaps."""
+    from mccl._C import _pin_residency
+    return int(_pin_residency(list(tensors), int(period_us), bool(warm_pcore)))
+
+
+def set_residency_busy(busy: bool) -> None:
+    """Pause/resume the C++ residency heartbeat while the caller is actively encoding/running."""
+    from mccl._C import _set_residency_busy
+    _set_residency_busy(bool(busy))
+
+
+def stop_residency() -> None:
+    """Stop the C++ residency heartbeat thread."""
+    from mccl._C import _stop_residency
+    _stop_residency()
+
+
 __all__ = [
     "__version__",
     "COMPATIBILITY_MATRIX",
@@ -175,5 +194,8 @@ __all__ = [
     "reset_metrics",
     "trim_staging_pool",
     "staging_pool_bytes",
+    "pin_residency",
+    "set_residency_busy",
+    "stop_residency",
     "apply_thunderbolt_production_defaults",
 ]

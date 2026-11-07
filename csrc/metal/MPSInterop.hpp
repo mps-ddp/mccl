@@ -121,4 +121,16 @@ void* get_mtl_device();
 /// Get or create a dedicated MTLCommandQueue for MCCL operations.
 void* get_mccl_command_queue();
 
+/// Pin MPS tensors' underlying MTLBuffers into a persistent Metal MTLResidencySet and
+/// optionally run a lightweight C++ Metal heartbeat thread (zero Python / zero GIL) so the
+/// macOS AGX driver never demotes multi-GB model/gradient buffers across idle gaps.
+int pin_residency(const std::vector<at::Tensor>& tensors, int period_us = 5000,
+                  bool warm_pcore = false);
+void set_residency_busy(bool busy);
+void stop_residency();
+
+/// Opt-in P2P inference flags (MCCL_STREAM_ORDERED_RECV=1, MCCL_LOW_LATENCY_P2P=1).
+bool stream_ordered_recv_enabled();
+bool low_latency_p2p_enabled();
+
 } // namespace mccl

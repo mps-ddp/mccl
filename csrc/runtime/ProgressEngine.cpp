@@ -1,9 +1,13 @@
 #include "runtime/ProgressEngine.hpp"
 #include "runtime/Metrics.hpp"
+#include "metal/MPSInterop.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 
 #include <utility>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 namespace mccl {
 
@@ -28,6 +32,9 @@ void ProgressEngine::start() {
         threads_.emplace_back([this] {
 #if defined(__APPLE__)
             pthread_setname_np("mccl_engine");
+            if (low_latency_p2p_enabled()) {
+                pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+            }
 #endif
             worker_loop();
         });

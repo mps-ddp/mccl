@@ -20,12 +20,15 @@ struct EventState {
     id<MTLSharedEvent> mps_event   = nil;
     id<MTLSharedEvent> mccl_event  = nil;
     id<MTLSharedEvent> fence_event = nil;
+    id<MTLSharedEvent> p2p_event   = nil;
     id<MTLDevice>      device      = nil;
     id<MTLCommandQueue> mccl_queue = nil;
     std::atomic<uint64_t> mps_counter{0};
     std::atomic<uint64_t> fence_counter{0};
     std::atomic<uint64_t> mccl_counter{0};
     std::atomic<uint64_t> mccl_cpu_done{0};
+    std::atomic<uint64_t> p2p_counter{0};
+    std::mutex p2p_mu;
     std::atomic<bool> initialized{false};
 };
 
@@ -107,10 +110,20 @@ void event_sync_init() {
             return;
         }
 
+        s.p2p_event = [s.device newSharedEvent];
+        if (!s.p2p_event) {
+            MCCL_WARN("EventSync: MTLSharedEvent creation failed (p2p_event)");
+            s.mps_event = nil;
+            s.mccl_event = nil;
+            s.fence_event = nil;
+            return;
+        }
+
         s.mps_counter.store(0);
         s.fence_counter.store(0);
         s.mccl_counter.store(0);
         s.mccl_cpu_done.store(0);
+        s.p2p_counter.store(0);
         s.initialized.store(true, std::memory_order_release);
         MCCL_INFO("EventSync initialized (per-event MTLSharedEvent counters)");
     }
@@ -231,6 +244,41 @@ uint64_t publish_collective_release(bool overlap_comm) {
     signal_mccl_done_gpu(v);
     signal_mccl_done(v);
     return v;
+}
+
+uint64_t next_p2p_event_value() {
+    return state().p2p_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+void block_mps_on_p2p(uint64_t value) {
+    EventState& s = state();
+    MCCL_CHECK(s.initialized, "EventSync not initialized");
+    if (value == 0) {
+        return;
+    }
+    dispatch_sync(
+        (dispatch_queue_t)torch::mps::get_dispatch_queue(), ^{
+            id<MTLCommandBuffer> cmd =
+                (id<MTLCommandBuffer>)torch::mps::get_command_buffer();
+            [cmd encodeWaitForEvent:s.p2p_event value:value];
+        });
+}
+
+void signal_p2p_done_cpu(uint64_t value) {
+    EventState& s = state();
+    MCCL_CHECK(s.initialized, "EventSync not initialized");
+    std::atomic_thread_fence(std::memory_order_release);
+    std::lock_guard<std::mutex> lock(s.p2p_mu);
+    if (s.p2p_event.signaledValue < value) {
+        s.p2p_event.signaledValue = value;
+    }
+}
+
+void wait_for_p2p(uint64_t value) {
+    EventState& s = state();
+    MCCL_CHECK(s.initialized, "EventSync not initialized");
+    if (value == 0) return;
+    spin_wait_event(s.p2p_event, value);
 }
 
 } // namespace mccl

@@ -12,6 +12,8 @@ MCCL is a `torch.distributed` backend for Apple-silicon GPUs. Training code sele
 with `backend="mccl"`. It runs multi-node PyTorch over Ethernet. At Skywalker Sound,
 MCCL has trained production audio VAEs across as many as 24 Macs.
 
+### Distributed inference update — November 2026
+
 MCCL now also powers distributed pipeline inference for frontier open-weight models on
 the same 10GbE Mac fleet:
 

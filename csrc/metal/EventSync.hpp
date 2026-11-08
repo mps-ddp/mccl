@@ -48,4 +48,11 @@ void block_mps_on_p2p(uint64_t value);
 void signal_p2p_done_cpu(uint64_t value);
 void wait_for_p2p(uint64_t value);
 
+/// Stream-ordered all_to_all (MCCL_STREAM_ORDERED_A2A=1): its own event, because all_to_alls complete in
+/// issue order on the collective engine while P2P recvs complete per peer, and the event's value is a
+/// high-water mark. Returns 0 (not stream-ordered) if the event cannot be created.
+uint64_t next_a2a_event_value();
+void block_mps_on_a2a(uint64_t value);
+void signal_a2a_done_cpu(uint64_t value);
+
 } // namespace mccl

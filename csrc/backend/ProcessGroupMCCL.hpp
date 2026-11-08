@@ -180,6 +180,15 @@ public:
         std::vector<std::vector<at::Tensor>>& inputTensors,
         const c10d::ReduceScatterOptions& opts = c10d::ReduceScatterOptions()) override;
 
+    /// all_to_all_single: dim-0 chunk j of the input goes to rank j and chunk j of the output
+    /// comes from rank j (equal splits when the split vectors are empty).
+    c10::intrusive_ptr<c10d::Work> alltoall_base(
+        at::Tensor& outputTensor,
+        at::Tensor& inputTensor,
+        std::vector<int64_t>& outputSplitSizes,
+        std::vector<int64_t>& inputSplitSizes,
+        const c10d::AllToAllOptions& opts = c10d::AllToAllOptions()) override;
+
     c10::intrusive_ptr<c10d::Work> send(
         std::vector<at::Tensor>& tensors,
         int dstRank,

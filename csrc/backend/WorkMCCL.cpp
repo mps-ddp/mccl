@@ -24,6 +24,13 @@ WorkMCCL::WorkMCCL(c10d::OpType opType, uint32_t seq,
 WorkMCCL::~WorkMCCL() = default;
 
 bool WorkMCCL::wait(std::chrono::milliseconds timeout) {
+    const uint64_t a2a_tok = stream_ordered_a2a_token_.load(std::memory_order_acquire);
+    if (a2a_tok > 0) {
+        if (!stream_ordered_waited_.exchange(true, std::memory_order_acq_rel)) {
+            block_mps_on_a2a(a2a_tok);
+        }
+        return true;
+    }
     const uint64_t so_tok = stream_ordered_token_.load(std::memory_order_acquire);
     if (so_tok > 0) {
         if (!stream_ordered_waited_.exchange(true, std::memory_order_acq_rel)) {
@@ -136,6 +143,10 @@ void WorkMCCL::set_release_token(uint64_t token) {
 
 void WorkMCCL::set_stream_ordered_token(uint64_t token) {
     stream_ordered_token_.store(token, std::memory_order_release);
+}
+
+void WorkMCCL::set_stream_ordered_a2a_token(uint64_t token) {
+    stream_ordered_a2a_token_.store(token, std::memory_order_release);
 }
 
 void WorkMCCL::stash_tensors(std::vector<at::Tensor> tensors) {

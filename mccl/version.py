@@ -10,7 +10,7 @@ COMPATIBILITY_MATRIX = {
     "supported_collectives": [
         "allreduce", "broadcast", "barrier",
         "allgather", "reduce_scatter",
-        "send", "recv",
+        "send", "recv", "alltoall_base",
     ],
     "compression_modes": ["none", "fp16", "topk"],
 }

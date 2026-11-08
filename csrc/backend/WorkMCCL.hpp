@@ -36,6 +36,9 @@ public:
     /// and returns immediately to let the caller encode ahead of network arrival.
     void set_stream_ordered_token(uint64_t token);
 
+    /// Stream-ordered all_to_all token (EventSync a2a event); same wait() semantics as above.
+    void set_stream_ordered_a2a_token(uint64_t token);
+
     /// Hold async-reduce staging tensors until ``wait()`` (NCCL TensorShelf).
     void stash_tensors(std::vector<at::Tensor> tensors);
 
@@ -50,6 +53,7 @@ private:
     std::atomic<uint64_t> release_token_{0};
     std::atomic<bool> release_waited_{false};
     std::atomic<uint64_t> stream_ordered_token_{0};
+    std::atomic<uint64_t> stream_ordered_a2a_token_{0};
     std::atomic<bool> stream_ordered_waited_{false};
     bool completed_ = false;
     bool success_ = false;

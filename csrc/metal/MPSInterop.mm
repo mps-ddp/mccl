@@ -732,6 +732,10 @@ bool stream_ordered_recv_enabled() {
     return env_flag_on("MCCL_STREAM_ORDERED_RECV");
 }
 
+bool stream_ordered_a2a_enabled() {
+    return env_flag_on("MCCL_STREAM_ORDERED_A2A");
+}
+
 bool low_latency_p2p_enabled() {
     return env_flag_on("MCCL_LOW_LATENCY_P2P");
 }

@@ -29,6 +29,9 @@ struct EventState {
     std::atomic<uint64_t> mccl_cpu_done{0};
     std::atomic<uint64_t> p2p_counter{0};
     std::mutex p2p_mu;
+    id<MTLSharedEvent> a2a_event   = nil;  // created on first stream-ordered all_to_all
+    std::atomic<uint64_t> a2a_counter{0};
+    std::mutex a2a_mu;
     std::atomic<bool> initialized{false};
 };
 
@@ -279,6 +282,43 @@ void wait_for_p2p(uint64_t value) {
     MCCL_CHECK(s.initialized, "EventSync not initialized");
     if (value == 0) return;
     spin_wait_event(s.p2p_event, value);
+}
+
+uint64_t next_a2a_event_value() {
+    EventState& s = state();
+    if (!s.initialized.load(std::memory_order_acquire)) return 0;
+    {
+        std::lock_guard<std::mutex> lock(s.a2a_mu);
+        if (!s.a2a_event) {
+            s.a2a_event = [s.device newSharedEvent];
+            if (!s.a2a_event) {
+                MCCL_WARN("EventSync: MTLSharedEvent creation failed (a2a_event)");
+                return 0;
+            }
+        }
+    }
+    return s.a2a_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+void block_mps_on_a2a(uint64_t value) {
+    EventState& s = state();
+    if (value == 0 || !s.a2a_event) return;
+    dispatch_sync(
+        (dispatch_queue_t)torch::mps::get_dispatch_queue(), ^{
+            id<MTLCommandBuffer> cmd =
+                (id<MTLCommandBuffer>)torch::mps::get_command_buffer();
+            [cmd encodeWaitForEvent:s.a2a_event value:value];
+        });
+}
+
+void signal_a2a_done_cpu(uint64_t value) {
+    EventState& s = state();
+    if (value == 0 || !s.a2a_event) return;
+    std::atomic_thread_fence(std::memory_order_release);
+    std::lock_guard<std::mutex> lock(s.a2a_mu);
+    if (s.a2a_event.signaledValue < value) {
+        s.a2a_event.signaledValue = value;
+    }
 }
 
 } // namespace mccl

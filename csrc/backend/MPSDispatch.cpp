@@ -110,6 +110,22 @@ reduce_scatter_MPS(
   return {std::move(output_vec), work};
 }
 
+c10::intrusive_ptr<c10d::Work> alltoall_base_MPS(
+    at::Tensor& output,
+    at::Tensor& input,
+    const c10::intrusive_ptr<c10d::ProcessGroup>& process_group,
+    std::vector<int64_t> output_split_sizes,
+    std::vector<int64_t> input_split_sizes,
+    bool async_op,
+    int64_t timeout) {
+  c10d::AllToAllOptions opts;
+  opts.asyncOp = async_op;
+  if (timeout >= 0)
+    opts.timeout = std::chrono::milliseconds(timeout);
+  return process_group->getBackend(c10::DeviceType::MPS)
+      ->alltoall_base(output, input, output_split_sizes, input_split_sizes, opts);
+}
+
 c10::intrusive_ptr<c10d::Work> send_MPS(
     at::TensorList tensors,
     const c10::intrusive_ptr<c10d::ProcessGroup>& process_group,
@@ -136,6 +152,7 @@ TORCH_LIBRARY_IMPL(c10d, MPS, m) {
   m.impl("barrier", barrier_MPS);
   m.impl("allgather_", allgather_MPS);
   m.impl("reduce_scatter_", reduce_scatter_MPS);
+  m.impl("alltoall_base_", alltoall_base_MPS);
   m.impl("send", send_MPS);
   m.impl("recv_", recv_MPS);
 }

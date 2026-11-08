@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <thread>
+#include <unistd.h>
 
 namespace mccl {
 
@@ -3339,6 +3340,216 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
             }
             }  // end lock-step fallback
             mps_stream_sync_after_cpu_mps_buffer_write();
+            arm_work_release(work_ptr);
+        },
+        [this, work_ptr, seq]() {
+            unregister_work(seq);
+            watchdog_->complete(seq);
+            metrics_->op_end(seq);
+            work_ptr->markComplete();
+        },
+        [this, work_ptr, seq](std::exception_ptr e) {
+            unregister_work(seq);
+            watchdog_->complete(seq);
+            metrics_->op_end(seq);
+            metrics_->record_error();
+            work_ptr->markError(e);
+        }
+    );
+
+    return work;
+}
+
+
+// ── alltoall_base ───────────────────────────────────────────────────
+
+namespace {
+
+/// Rows per rank along dim 0: the explicit split sizes, or an equal split when empty.
+std::vector<int64_t> alltoall_rows(const at::Tensor& t, const std::vector<int64_t>& splits,
+                                   int ws, const char* which) {
+    const int64_t rows = t.size(0);
+    if (splits.empty()) {
+        MCCL_CHECK_TENSOR(rows % ws == 0,
+            std::string("alltoall: ") + which + " dim 0 (" + std::to_string(rows) +
+            ") must be divisible by world_size " + std::to_string(ws));
+        return std::vector<int64_t>(ws, rows / ws);
+    }
+    MCCL_CHECK_TENSOR(static_cast<int>(splits.size()) == ws,
+        std::string("alltoall: ") + which + " split sizes need world_size entries");
+    int64_t total = 0;
+    for (int64_t s : splits) {
+        MCCL_CHECK_TENSOR(s >= 0, "alltoall: negative split size");
+        total += s;
+    }
+    MCCL_CHECK_TENSOR(total == rows,
+        std::string("alltoall: ") + which + " split sizes must sum to dim 0");
+    return splits;
+}
+
+std::vector<at::Tensor> alltoall_chunks(const at::Tensor& t, const std::vector<int64_t>& rows) {
+    std::vector<at::Tensor> chunks;
+    chunks.reserve(rows.size());
+    int64_t off = 0;
+    for (int64_t n : rows) {
+        chunks.push_back(t.narrow(0, off, n));
+        off += n;
+    }
+    return chunks;
+}
+
+/// Address the wire can read or write in place: CPU tensors and shared-storage MPS tensors
+/// (unified collective path); nullptr for private Metal storage, which needs a blit.
+void* alltoall_wire_ptr(const at::Tensor& t) {
+    if (t.is_cpu()) return t.data_ptr();
+    return tensor_wire_recv_ptr(t);
+}
+
+/// Page-aligned host buffer (Metal blits require page alignment).
+struct PageBuffer {
+    void* data = nullptr;
+    explicit PageBuffer(size_t nbytes) {
+        const size_t page = static_cast<size_t>(getpagesize());
+        const size_t len = std::max(page, (nbytes + page - 1) & ~(page - 1));
+        MCCL_CHECK(posix_memalign(&data, page, len) == 0 && data != nullptr,
+                   "alltoall: posix_memalign failed for " + std::to_string(len) + " bytes");
+    }
+    ~PageBuffer() { free(data); }
+    PageBuffer(const PageBuffer&) = delete;
+    PageBuffer& operator=(const PageBuffer&) = delete;
+};
+
+}  // namespace
+
+c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall_base(
+    at::Tensor& outputTensor,
+    at::Tensor& inputTensor,
+    std::vector<int64_t>& outputSplitSizes,
+    std::vector<int64_t>& inputSplitSizes,
+    const c10d::AllToAllOptions& /*opts*/) {
+
+    at::Tensor input = ensure_contiguous(inputTensor);
+    check_single_tensor(input);
+    // Received chunks are written in place; a silent clone would drop them.
+    require_contiguous_output(outputTensor, "alltoall_base");
+    check_single_tensor(outputTensor);
+    MCCL_CHECK_TENSOR(input.scalar_type() == outputTensor.scalar_type(), "alltoall: dtype mismatch");
+    MCCL_CHECK_TENSOR(input.device().type() == outputTensor.device().type(),
+                      "alltoall: input and output must be on the same device");
+    MCCL_CHECK_TENSOR(input.dim() >= 1 && outputTensor.dim() >= 1,
+                      "alltoall: tensors need a dim 0 to split");
+    MCCL_CHECK_TENSOR(!outputTensor.is_alias_of(inputTensor), "alltoall: output must not alias input");
+
+    const int ws = getSize();
+    const int rank = getRank();
+    std::vector<at::Tensor> in_chunks =
+        alltoall_chunks(input, alltoall_rows(input, inputSplitSizes, ws, "input"));
+    std::vector<at::Tensor> out_chunks =
+        alltoall_chunks(outputTensor, alltoall_rows(outputTensor, outputSplitSizes, ws, "output"));
+    MCCL_CHECK_TENSOR(in_chunks[rank].numel() == out_chunks[rank].numel(),
+                      "alltoall: this rank's input and output chunks differ in size");
+
+    std::vector<at::Tensor> outputs{outputTensor};
+    if (in_chunks[rank].numel() > 0) {
+        // Own chunk: stream-ordered copy, fenced below together with the producer's writes.
+        out_chunks[rank].copy_(in_chunks[rank]);
+    }
+    if (ws == 1) {
+        return make_completed_work(c10d::OpType::ALLTOALL_BASE, outputs);
+    }
+
+    // Every rank takes a seq even when its own chunks are empty (uneven splits), so the
+    // collective sequence stays identical across ranks.
+    uint32_t seq = collective_seq_.fetch_add(1);
+    const size_t send_bytes = tensor_nbytes(input) - tensor_nbytes(in_chunks[rank]);
+
+    auto work = c10::make_intrusive<WorkMCCL>(c10d::OpType::ALLTOALL_BASE, seq, outputs);
+    auto work_ptr = work;
+
+    register_work(seq, work);
+    watchdog_->watch(seq, "alltoall");
+    metrics_->op_start(seq, "alltoall", send_bytes);
+
+    // Stream-ordered completion: Work::wait() enqueues a GPU wait on this token and returns, so the caller
+    // keeps encoding; the engine signals the token once every chunk has landed. Tokens are taken here in
+    // issue order and signalled in the same order (one engine, or the ordered transport section).
+    uint64_t so_tok = 0;
+    if (outputTensor.is_mps() && stream_ordered_a2a_enabled() && event_sync_available()) {
+        so_tok = next_a2a_event_value();
+        if (so_tok) work->set_stream_ordered_a2a_token(so_tok);
+    }
+
+    uint64_t sync_val = sync_mps_for_collective();
+    if (!sync_val && input.is_mps()) {
+        // No shared events: the engine touches the buffers directly, so drain here on the
+        // producer thread (engine threads must not synchronize the MPS stream).
+        mps_stream_sync();
+    }
+
+    ProgressEngine& engine =
+        (ws >= 3 && collective_pool_) ? *collective_pool_ : *reduce_engine_;
+    const uint64_t ticket = transport_collective_lock_.take_ticket();
+    engine.submit(
+        [this, in_chunks, out_chunks, seq, rank, ws, sync_val, so_tok, work_ptr, ticket]() mutable {
+            OrderedTransportGuard transport_guard(transport_collective_lock_, ticket);
+            begin_execute(seq);
+            if (sync_val) wait_for_mps(sync_val);
+            transport_guard.enter();
+
+            // Every receive is posted before the first send so chunks land in place as they
+            // arrive; sends go in pairwise order (step s: to rank+s while rank-s sends to us).
+            std::vector<RecvTicket> tickets(ws);
+            std::vector<std::unique_ptr<PageBuffer>> landing(ws);
+            try {
+                for (int s = 1; s < ws; s++) {
+                    const int src = (rank - s + ws) % ws;
+                    const size_t nb = tensor_nbytes(out_chunks[src]);
+                    if (nb == 0) continue;
+                    void* dst = alltoall_wire_ptr(out_chunks[src]);
+                    if (!dst) {
+                        landing[src] = std::make_unique<PageBuffer>(nb);
+                        dst = landing[src]->data;
+                    }
+                    tickets[src] = transport_->post_recv(src, kWireCollectiveOp(), seq, 0, dst, nb);
+                }
+                for (int s = 1; s < ws; s++) {
+                    const int dst = (rank + s) % ws;
+                    const size_t nb = tensor_nbytes(in_chunks[dst]);
+                    if (nb == 0) continue;
+                    const void* src = alltoall_wire_ptr(in_chunks[dst]);
+                    std::unique_ptr<PageBuffer> staged;
+                    if (!src) {
+                        staged = std::make_unique<PageBuffer>(nb);
+                        blit_tensor_to_buffer(in_chunks[dst], staged->data);
+                        src = staged->data;
+                    }
+                    MCCL_CHECK(transport_->send_chunks(dst, kWireCollectiveOp(), seq, 0, src, nb),
+                               "alltoall send to rank " + std::to_string(dst) + " failed");
+                    metrics_->record_transport_bytes(nb, true);
+                    watchdog_->touch(seq);
+                }
+                for (int s = 1; s < ws; s++) {
+                    const int src = (rank - s + ws) % ws;
+                    if (!tickets[src]) continue;
+                    MCCL_CHECK(transport_->wait_recv(tickets[src]),
+                               "alltoall recv from rank " + std::to_string(src) + " failed");
+                    tickets[src].reset();
+                    if (landing[src]) blit_buffer_to_tensor(landing[src]->data, out_chunks[src]);
+                    metrics_->record_transport_bytes(tensor_nbytes(out_chunks[src]), false);
+                    watchdog_->touch(seq);
+                }
+            } catch (...) {
+                // Posted receives point into out_chunks / landing: retire them before unwinding.
+                transport_->cancel_recvs(seq, "alltoall aborted");
+                for (auto& t : tickets) {
+                    if (!t) continue;
+                    try { transport_->wait_recv(t); } catch (...) {}
+                }
+                signal_a2a_done_cpu(so_tok);  // never leave the GPU parked on a failed exchange
+                throw;
+            }
+            mps_stream_sync_after_cpu_mps_buffer_write();
+            signal_a2a_done_cpu(so_tok);
             arm_work_release(work_ptr);
         },
         [this, work_ptr, seq]() {

@@ -132,5 +132,7 @@ void stop_residency();
 /// Opt-in P2P inference flags (MCCL_STREAM_ORDERED_RECV=1, MCCL_LOW_LATENCY_P2P=1).
 bool stream_ordered_recv_enabled();
 bool low_latency_p2p_enabled();
+/// Opt-in (MCCL_STREAM_ORDERED_A2A=1): all_to_all Work::wait() enqueues a GPU wait and returns.
+bool stream_ordered_a2a_enabled();
 
 } // namespace mccl

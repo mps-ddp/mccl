@@ -14,14 +14,17 @@ MCCL has trained production audio VAEs across as many as 24 Macs.
 
 ### Distributed inference update — November 2026
 
-MCCL now also powers distributed pipeline inference for frontier open-weight models on
-the same 10GbE Mac fleet:
+MCCL now also powers distributed PyTorch pipeline inference for frontier open-weight
+models on the same 10GbE Mac fleet:
 
-- **GLM-5.3-Flash (300B parameters, full 4-bit):** 43–48 tok/s for one user on 2 Macs.
-- **Kimi K2.6 (1.04T parameters):** up to 26.8 tok/s for one user on 10 Macs.
-- **GLM-5.3 (743B parameters, full 4-bit):** up to 39.7 tok/s for one user on 6 Macs.
-- **Kimi K3 (2.8T parameters):** served at 2.9 tok/s on 21 Macs as a full-fleet
-  distributed-inference proof.
+- **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (300B parameters,
+  full 4-bit):** 43–48 tok/s for one user on 2 Macs.
+- **[Kimi K2.6](https://huggingface.co/moonshotai/Kimi-K2.6) (1.04T parameters):**
+  up to 26.8 tok/s for one user on 10 Macs.
+- **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) (743B parameters, full 4-bit):**
+  up to 39.7 tok/s for one user on 6 Macs.
+- **[Kimi K3](https://huggingface.co/moonshotai/Kimi-K3) (2.8T parameters):** served
+  at 2.9 tok/s on 21 Macs as a full-fleet distributed-inference proof.
 
 The interactive-serving figures are warm measurements. Distributed inference is a new
 direction for MCCL, and these results are an early baseline. We expect throughput to

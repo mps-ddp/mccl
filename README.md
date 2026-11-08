@@ -23,8 +23,10 @@ the same 10GbE Mac fleet:
 - **Kimi K3 (2.8T parameters):** served at 2.9 tok/s on 21 Macs as a full-fleet
   distributed-inference proof.
 
-The interactive-serving figures are warm measurements. More details, reproducible
-inference code, and a technical blog are coming soon.
+The interactive-serving figures are warm measurements. Distributed inference is a new
+direction for MCCL, and these results are an early baseline. We expect throughput to
+improve as the runtime matures. More details, reproducible inference code, and a technical
+blog are coming soon.
 
 PyTorch has no distributed backend for MPS tensors, and Gloo accepts only CPU tensors, so
 a Gloo run copies every gradient bucket to CPU after a device synchronization. MCCL

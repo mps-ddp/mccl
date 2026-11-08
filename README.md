@@ -12,6 +12,24 @@ MCCL is a `torch.distributed` backend for Apple-silicon GPUs. Training code sele
 with `backend="mccl"`. It runs multi-node PyTorch over Ethernet. At Skywalker Sound,
 MCCL has trained production audio VAEs across as many as 24 Macs.
 
+PyTorch has no distributed backend for MPS tensors, and Gloo accepts only CPU tensors, so
+a Gloo run copies every gradient bucket to CPU after a device synchronization. MCCL
+reduces gradients in place in unified memory and uses Metal shared events to order that
+work against PyTorch's MPS stream, so the allreduce overlaps the backward pass.
+
+## Installation
+
+Requires an Apple-silicon Mac, macOS 15 or 26, Python 3.11–3.13, and PyTorch 2.13 or 2.14.
+
+```bash
+pip install torch==2.14.0   # PyPI wheels are built against PyTorch 2.14
+pip install mccl
+```
+
+To build from source, install the Xcode Command Line Tools (`xcode-select --install`), then
+run `pip install -e ".[dev]" --no-build-isolation` in a clone of this repository so the
+extension builds against your installed PyTorch.
+
 ### Distributed inference update — November 2026
 
 MCCL now also powers distributed PyTorch pipeline inference for frontier open-weight
@@ -30,24 +48,6 @@ The interactive-serving figures are warm measurements. Distributed inference is 
 direction for MCCL, and these results are an early baseline. We expect throughput to
 improve as the runtime matures. More details, reproducible inference code, and a technical
 blog are coming soon.
-
-PyTorch has no distributed backend for MPS tensors, and Gloo accepts only CPU tensors, so
-a Gloo run copies every gradient bucket to CPU after a device synchronization. MCCL
-reduces gradients in place in unified memory and uses Metal shared events to order that
-work against PyTorch's MPS stream, so the allreduce overlaps the backward pass.
-
-## Installation
-
-Requires an Apple-silicon Mac, macOS 15 or 26, Python 3.11–3.13, and PyTorch 2.13 or 2.14.
-
-```bash
-pip install torch==2.14.0   # PyPI wheels are built against PyTorch 2.14
-pip install mccl
-```
-
-To build from source, install the Xcode Command Line Tools (`xcode-select --install`), then
-run `pip install -e ".[dev]" --no-build-isolation` in a clone of this repository so the
-extension builds against your installed PyTorch.
 
 ## Quick start
 

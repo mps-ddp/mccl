@@ -147,6 +147,15 @@ public:
 
     ~ProcessGroupMCCL() override;
 
+    /// Stop every background thread (health monitor, watchdog, progress
+    /// engines, transport readers) and close the sockets.  Called by
+    /// ``torch.distributed.destroy_process_group()``; idempotent, and the
+    /// destructor calls it too.  Without it the threads outlive the group
+    /// until the backend is destroyed, which may be never, and a reader can
+    /// still be logging a peer's close while the process runs its static
+    /// destructors.
+    void shutdown() override;
+
     const std::string getBackendName() const override {
         return "mccl";
     }
@@ -337,6 +346,7 @@ private:
     std::unique_ptr<Compressor> compressor_;
 
     std::atomic<uint32_t> collective_seq_{0};
+    std::atomic<bool> shut_down_{false};
     bool transport_initialized_ = false;
     bool overlap_comm_ = true;
     /// Monotonic MCCL release tokens: producer waits before next MPS commit (overlap).

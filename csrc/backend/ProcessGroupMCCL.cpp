@@ -1042,6 +1042,11 @@ ProgressEngine& ProcessGroupMCCL::net_engine_for(int peer_rank) {
 }
 
 ProcessGroupMCCL::~ProcessGroupMCCL() {
+    shutdown();
+}
+
+void ProcessGroupMCCL::shutdown() {
+    if (shut_down_.exchange(true)) return;
     try {
         MCCL_INFO("ProcessGroupMCCL rank=%d shutting down", getRank());
         clear_active_pg_if(this);

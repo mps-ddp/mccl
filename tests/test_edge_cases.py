@@ -116,6 +116,52 @@ def _broadcast_nonroot_values_fn(rank, world_size):
         assert torch.equal(t.cpu(), expected), f"broadcast n={n} rank={rank}"
 
 
+def _transport_extra_dtypes_fn(rank, world_size):
+    import torch
+    import torch.distributed as dist
+
+    for dtype in (torch.int8, torch.int16, torch.uint16, torch.uint32, torch.uint64, torch.complex64):
+        # broadcast
+        if dtype == torch.complex64:
+            src_cpu = torch.complex(
+                torch.arange(64, dtype=torch.float32) + 1.0,
+                torch.arange(64, dtype=torch.float32) * -0.5,
+            )
+            b = src_cpu.to("mps") if rank == 0 else torch.zeros(64, dtype=dtype, device="mps")
+        else:
+            src_cpu = (torch.arange(64) % 100 + 1).to(dtype)
+            b = src_cpu.to("mps") if rank == 0 else torch.zeros(64, dtype=dtype, device="mps")
+        dist.broadcast(b, src=0)
+        assert torch.equal(b.cpu(), src_cpu), f"broadcast {dtype} failed"
+
+        # all_gather
+        if dtype == torch.complex64:
+            mine = (src_cpu + complex(float(rank * 10), float(rank))).to("mps")
+            expected = [src_cpu + complex(float(r * 10), float(r)) for r in range(world_size)]
+        else:
+            mine = ((torch.arange(64) % 50) + rank * 10).to(dtype).to("mps")
+            expected = [((torch.arange(64) % 50) + r * 10).to(dtype) for r in range(world_size)]
+        outs = [torch.zeros(64, dtype=dtype, device="mps") for _ in range(world_size)]
+        dist.all_gather(outs, mine)
+        for r in range(world_size):
+            assert torch.equal(outs[r].cpu(), expected[r]), f"all_gather {dtype} rank slot {r}"
+
+        # all_to_all_single
+        rows = 4
+        if dtype == torch.complex64:
+            inp = torch.zeros(world_size * rows, 3, dtype=dtype, device="mps")
+        else:
+            inp = torch.empty(world_size * rows, 3, dtype=dtype, device="mps")
+        for j in range(world_size):
+            inp[j * rows:(j + 1) * rows] = rank * world_size + j + 1
+        out = torch.zeros_like(inp)
+        dist.all_to_all_single(out, inp)
+        for j in range(world_size):
+            assert torch.all(out[j * rows:(j + 1) * rows].cpu() == j * world_size + rank + 1), (
+                f"all_to_all {dtype} src={j}"
+            )
+
+
 class TestWorldSizeOne:
     def test_all_ops_complete(self):
         run_workers(_ws1_all_ops_fn, world_size=1, timeout=120)
@@ -135,6 +181,10 @@ class TestValidation:
     @pytest.mark.parametrize("world_size", [2])
     def test_unsupported_dtype_rejected(self, world_size):
         run_workers(_bad_dtype_rejected_fn, world_size=world_size)
+
+    @pytest.mark.parametrize("world_size", [2, 3])
+    def test_transport_only_dtypes(self, world_size):
+        run_workers(_transport_extra_dtypes_fn, world_size=world_size)
 
 
 class TestBroadcast:

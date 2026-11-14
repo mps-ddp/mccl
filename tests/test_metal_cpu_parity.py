@@ -85,3 +85,47 @@ def test_fp32_metal_matches_cpu_reduce(world_size):
         timeout=600,
     )
     run_workers(_compare_metal_cpu_fn, world_size=world_size, env=base, timeout=120)
+
+
+def _bf16_allreduce_save_fn(rank, world_size):
+    import os
+    from pathlib import Path
+
+    import torch
+    import torch.distributed as dist
+
+    tag = os.environ["MCCL_TEST_TAG"]
+    out_dir = Path(os.environ["MCCL_TEST_OUT_DIR"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for op_name in ("SUM", "AVG"):
+        torch.manual_seed(9500 + rank)
+        t = (torch.randn(262_144) * 1.5).to(torch.bfloat16).to("mps")
+        dist.all_reduce(t, op=getattr(dist.ReduceOp, op_name))
+        torch.save(t.cpu(), out_dir / f"bf16_{tag}_{op_name}_r{rank}.pt")
+
+
+def test_bf16_metal_matches_cpu_reduce():
+    base = {
+        "MCCL_RING_ALGO": "chunked",
+        "MCCL_TEST_OUT_DIR": str(_OUT_DIR),
+    }
+    run_workers(
+        _bf16_allreduce_save_fn,
+        world_size=3,
+        env={**base, "MCCL_TEST_TAG": "cpu", "MCCL_UNIFIED_CPU_REDUCE": "1"},
+        timeout=300,
+    )
+    run_workers(
+        _bf16_allreduce_save_fn,
+        world_size=3,
+        env={**base, "MCCL_TEST_TAG": "metal", "MCCL_UNIFIED_CPU_REDUCE": "0"},
+        timeout=300,
+    )
+    for op_name in ("SUM", "AVG"):
+        for r in range(3):
+            cpu = torch.load(_OUT_DIR / f"bf16_cpu_{op_name}_r{r}.pt", weights_only=True)
+            metal = torch.load(_OUT_DIR / f"bf16_metal_{op_name}_r{r}.pt", weights_only=True)
+            assert torch.equal(cpu, metal), (
+                f"bf16 {op_name} rank={r}: CPU vs Metal max_err="
+                f"{(cpu.float() - metal.float()).abs().max().item()}"
+            )

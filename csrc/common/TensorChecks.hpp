@@ -21,11 +21,13 @@ inline void check_single_tensor(const at::Tensor& tensor) {
 
     auto dtype = tensor.scalar_type();
     MCCL_CHECK_TENSOR(
-        dtype == at::kFloat || dtype == at::kHalf || dtype == at::kBFloat16 || 
-        dtype == at::kLong || dtype == at::kInt || dtype == at::kBool || 
-        dtype == at::kByte || dtype == at::kDouble,
-        "MCCL supports float32/float16/bfloat16 (training), int64/int32/bool/uint8 (metadata), and float64, got: " +
-        std::string(at::toString(dtype))
+        dtype == at::kFloat || dtype == at::kHalf || dtype == at::kBFloat16 ||
+        dtype == at::kLong || dtype == at::kInt || dtype == at::kShort ||
+        dtype == at::kChar || dtype == at::kBool || dtype == at::kByte ||
+        dtype == at::kUInt16 || dtype == at::kUInt32 || dtype == at::kUInt64 ||
+        dtype == at::kComplexFloat || dtype == at::kDouble ||
+        dtype == at::kFloat8_e4m3fn || dtype == at::kFloat8_e5m2,
+        "MCCL unsupported tensor dtype: " + std::string(at::toString(dtype))
     );
 
     // numel() == 0 tensors are allowed: collectives treat them as no-ops at the

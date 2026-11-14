@@ -2,7 +2,7 @@
 
 #define MCCL_VERSION_MAJOR 6
 #define MCCL_VERSION_MINOR 9
-#define MCCL_VERSION_PATCH 0
+#define MCCL_VERSION_PATCH 1
 
 // v4: compressed payloads framed as [4-byte size][exact payload]; chunked-
 //     ring allgather schedule corrected.
@@ -15,7 +15,7 @@
 //     word (v5 sent a tensor-shaped ack, tensor-sized for 2-rank broadcast).
 #define MCCL_PROTOCOL_VERSION 6
 
-#define MCCL_VERSION_STRING "6.9.0"
+#define MCCL_VERSION_STRING "6.9.1"
 
 namespace mccl {
 

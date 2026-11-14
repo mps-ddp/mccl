@@ -2998,7 +2998,8 @@ void ProcessGroupMCCL::allgather_star_small(std::vector<at::Tensor>& outputs,
 void ProcessGroupMCCL::reduce_scatter_star_small(std::vector<at::Tensor>& inputs,
                                                  at::Tensor& output,
                                                  uint32_t seq, size_t nbytes,
-                                                 c10d::ReduceOp::RedOpType op) {
+                                                 c10d::ReduceOp::RedOpType op,
+                                                 std::vector<at::Tensor>* keep_tensors) {
     const int rank = getRank();
     const int ws = getSize();
 
@@ -3014,7 +3015,7 @@ void ProcessGroupMCCL::reduce_scatter_star_small(std::vector<at::Tensor>& inputs
     if (unified_fp32) {
         memcpy(out_view.cpu_ptr, wire_buf.data(), nbytes);
     } else {
-        output.copy_(inputs[rank]);
+        blit_buffer_to_tensor(wire_buf.data(), output);
     }
 
     const int64_t count = output.numel();
@@ -3037,7 +3038,8 @@ void ProcessGroupMCCL::reduce_scatter_star_small(std::vector<at::Tensor>& inputs
                 } else {
                     at::Tensor recv_tensor = torch::empty_like(output);
                     unstage_from_recv(recv_tensor, wire_buf.data(), nbytes);
-                    metal_reduce_op(output, recv_tensor, op);
+                    reduce_chunk_metal_fenced(output, std::move(recv_tensor), op,
+                                              keep_tensors);
                 }
                 wire_send(transport_.get(), src, seq, tid, &ack, sizeof(ack));
                 metrics_->record_transport_bytes(nbytes, false);
@@ -3048,6 +3050,14 @@ void ProcessGroupMCCL::reduce_scatter_star_small(std::vector<at::Tensor>& inputs
             wire_send(transport_.get(), dest, seq, tid, wire_buf.data(), nbytes);
             wire_recv(transport_.get(), dest, seq, tid, &ack, sizeof(ack));
             metrics_->record_transport_bytes(nbytes, true);
+        }
+    }
+
+    if (op == c10d::ReduceOp::AVG) {
+        if (out_fp32) {
+            cpu_scale_inplace(out_fp32, count, 1.0f / ws);
+        } else {
+            metal_scale_inplace(output, 1.0 / ws);
         }
     }
 }
@@ -3654,8 +3664,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
             if (ws >= 3) {
                 // Ring RS leaves reduced chunks rotated; star mesh matches
                 // allgather_star_small reliability on multi-rank TCP.
-                reduce_scatter_star_small(chunks, output_copy, seq, nbytes, rs_op);
-                mps_stream_sync_after_cpu_mps_buffer_write();
+                reduce_scatter_star_small(chunks, output_copy, seq, nbytes, rs_op,
+                                          &incoming_keep.tensors);
+                use_cpu = (output_copy.scalar_type() == at::kFloat) &&
+                          unified_metal_collective_path(output_copy);
             } else {
             if (ring_pipeline_for_message(nbytes, small_thresh_rs)) {
                 // Streaming pipeline: send(s) = (rank+1-s) = recv(s-1), so
@@ -3744,6 +3756,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                 MPSBufferView src_view = extract_mps_buffer(chunks[my_chunk]);
                 MPSBufferView dst_view = extract_mps_buffer(output_copy);
                 memcpy(dst_view.cpu_ptr, src_view.cpu_ptr, nbytes);
+                if (rs_op == c10d::ReduceOp::AVG) {
+                    cpu_scale_inplace(static_cast<float*>(dst_view.cpu_ptr),
+                                      output_copy.numel(), 1.0f / ws);
+                }
                 mps_stream_sync_after_cpu_mps_buffer_write();
             } else {
                 if (use_async_mccl_release()) {
@@ -3753,7 +3769,12 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
                 } else {
                     metal_sync_queue_only();
                 }
-                output_copy.copy_(chunks[my_chunk]);
+                PooledBuffer copy_buf(staging_memory_pool(), nbytes);
+                blit_tensor_to_buffer(chunks[my_chunk], copy_buf.data());
+                blit_buffer_to_tensor(copy_buf.data(), output_copy);
+                if (rs_op == c10d::ReduceOp::AVG) {
+                    metal_scale_inplace(output_copy, 1.0 / ws);
+                }
             }
             }  // ws == 2 ring paths
             collective_gpu_tail(this, use_cpu, work_ptr, incoming_keep);

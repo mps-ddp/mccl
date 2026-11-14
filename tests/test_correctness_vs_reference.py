@@ -195,6 +195,27 @@ def _broadcast_check_fn(rank, world_size):
         assert torch.equal(t.cpu(), torch.arange(n, dtype=torch.float32))
 
 
+def _reduce_scatter_avg_bf16_fn(rank, world_size):
+    import torch
+    import torch.distributed as dist
+
+    for dtype in (torch.float32, torch.bfloat16):
+        for n in (1024, 65536):
+            for op in (dist.ReduceOp.SUM, dist.ReduceOp.AVG):
+                ins = [
+                    torch.full((n,), float(rank + 1) * (i + 1), dtype=dtype, device="mps")
+                    for i in range(world_size)
+                ]
+                out = torch.zeros(n, dtype=dtype, device="mps")
+                dist.reduce_scatter(out, ins, op=op)
+                expected = sum(float(r + 1) * (rank + 1) for r in range(world_size))
+                if op == dist.ReduceOp.AVG:
+                    expected /= world_size
+                assert torch.allclose(
+                    out.cpu().float(), torch.full((n,), expected), atol=1e-2, rtol=1e-2
+                ), f"reduce_scatter {dtype} n={n} {op} rank={rank}"
+
+
 class TestOtherCollectivesVsReference:
     @pytest.mark.parametrize("world_size", [2, 3])
     def test_allgather(self, world_size):
@@ -203,6 +224,10 @@ class TestOtherCollectivesVsReference:
     @pytest.mark.parametrize("world_size", [2, 3])
     def test_reduce_scatter(self, world_size):
         run_workers(_reduce_scatter_check_fn, world_size=world_size)
+
+    @pytest.mark.parametrize("world_size", [2, 3])
+    def test_reduce_scatter_avg_and_bf16(self, world_size):
+        run_workers(_reduce_scatter_avg_bf16_fn, world_size=world_size)
 
     @pytest.mark.parametrize("world_size", [2, 3])
     def test_broadcast(self, world_size):

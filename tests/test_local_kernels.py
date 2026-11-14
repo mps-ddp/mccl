@@ -265,6 +265,13 @@ class TestScaleInplace:
         expected = torch.tensor([1.0, 2.0, 3.0], device="mps", dtype=torch.float16)
         assert torch.allclose(result, expected, rtol=1e-2, atol=1e-2)
 
+    def test_bf16_non_power_of_two_scale(self):
+        k = _kernels()
+        a = torch.full((19,), 100.0, device="mps", dtype=torch.bfloat16)
+        result = k["scale"](a, 1.0 / 3.0)
+        expected = torch.full((19,), 100.0 / 3.0, device="mps", dtype=torch.bfloat16)
+        assert torch.equal(result.cpu(), expected.cpu()), f"got {result[0].item()} vs {expected[0].item()}"
+
     def test_i64_world_size_avg_non_aligned(self):
         k = _kernels()
         for size in (1, 3, 7, 13):
@@ -335,3 +342,11 @@ class TestAccumulateAndScale:
         result = k["acc_scale"](a, b, 0.5)
         expected = torch.tensor([True, False, False], device="mps")
         assert torch.equal(result, expected)
+
+    def test_bf16_non_power_of_two_acc_scale(self):
+        k = _kernels()
+        a = torch.full((19,), 50.0, device="mps", dtype=torch.bfloat16)
+        b = torch.full((19,), 50.0, device="mps", dtype=torch.bfloat16)
+        result = k["acc_scale"](a, b, 1.0 / 3.0)
+        expected = torch.full((19,), 100.0 / 3.0, device="mps", dtype=torch.bfloat16)
+        assert torch.equal(result.cpu(), expected.cpu()), f"got {result[0].item()} vs {expected[0].item()}"

@@ -58,7 +58,13 @@ inline void log_impl(LogLevel level, const char* file, int line,
                       const char* fmt, ...) {
     if (level < global_log_level()) return;
 
-    static std::mutex mu;
+    // Intentionally leaked: a function-local static mutex is destroyed during
+    // exit-time static destruction, while detached or not-yet-joined threads
+    // may still log (a transport reader reporting a peer's close).  Locking a
+    // destroyed std::mutex throws std::system_error ("mutex lock failed:
+    // Invalid argument") and aborts the process.  The heap mutex is never
+    // destroyed, so logging stays valid until the process is gone.
+    static std::mutex& mu = *new std::mutex;
     std::lock_guard<std::mutex> lock(mu);
 
     auto now = std::chrono::system_clock::now();

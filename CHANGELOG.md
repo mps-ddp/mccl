@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **Clean exit after `destroy_process_group()`.** `ProcessGroupMCCL` now overrides `shutdown()`, which `destroy_process_group()` calls, so the health monitor, watchdog, progress engines and transport readers are joined and the sockets closed at that point instead of only in the destructor.  While anything still held the group (DDP's reducer does), those threads ran until process exit; a reader logging a peer's close during C++ static destruction then locked the already destroyed logger mutex and the process aborted with `libc++abi: ... mutex lock failed: Invalid argument` (SIGABRT) after a successful run, in 4 of 10 two-host runs.  The logger mutex is now never destroyed, and the health monitor and watchdog wake from their sleep on `stop()`, so shutdown no longer waits up to one heartbeat interval (5 s).
+
 ## v6.9 — low-latency pipeline inference
 
 ### Added

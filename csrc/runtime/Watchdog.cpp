@@ -21,7 +21,11 @@ void Watchdog::start() {
 
 void Watchdog::stop() {
     if (!running_.load()) return;
-    running_ = false;
+    {
+        std::lock_guard<std::mutex> lock(stop_mu_);
+        running_ = false;
+    }
+    stop_cv_.notify_all();
     if (thread_.joinable()) thread_.join();
     MCCL_DEBUG("Watchdog stopped");
 }
@@ -68,7 +72,12 @@ size_t Watchdog::active_count() const {
 
 void Watchdog::monitor_loop() {
     while (running_.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        {
+            std::unique_lock<std::mutex> lock(stop_mu_);
+            stop_cv_.wait_for(lock, std::chrono::milliseconds(500),
+                              [this] { return !running_.load(); });
+        }
+        if (!running_.load()) break;
 
         auto now = std::chrono::steady_clock::now();
         std::vector<WatchEntry> expired;

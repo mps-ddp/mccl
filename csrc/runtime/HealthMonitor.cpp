@@ -26,7 +26,11 @@ void HealthMonitor::start() {
 
 void HealthMonitor::stop() {
     if (!running_.load()) return;
-    running_ = false;
+    {
+        std::lock_guard<std::mutex> lock(stop_mu_);
+        running_ = false;
+    }
+    stop_cv_.notify_all();
     if (thread_.joinable()) thread_.join();
 }
 
@@ -56,7 +60,10 @@ void HealthMonitor::heartbeat_loop() {
     // safety net for in-progress collectives; this monitor catches the case
     // where is_peer_connected() returns false after a transport-level error.
     while (running_.load()) {
-        std::this_thread::sleep_for(interval_);
+        {
+            std::unique_lock<std::mutex> lock(stop_mu_);
+            stop_cv_.wait_for(lock, interval_, [this] { return !running_.load(); });
+        }
         if (!running_.load()) break;
 
         for (int r = 0; r < transport_->world_size(); r++) {

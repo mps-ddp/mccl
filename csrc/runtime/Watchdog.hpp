@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -65,6 +66,10 @@ private:
     std::unordered_map<uint32_t, WatchEntry> entries_;
 
     std::atomic<bool> running_{false};
+    // Wakes the loop's sleep so stop() returns at once instead of after a
+    // full interval (destroy_process_group joins this thread).
+    std::mutex stop_mu_;
+    std::condition_variable stop_cv_;
     std::thread thread_;
 };
 

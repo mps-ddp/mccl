@@ -294,7 +294,8 @@ private:
     void reduce_scatter_star_small(std::vector<at::Tensor>& inputs,
                                    at::Tensor& output,
                                    uint32_t seq, size_t nbytes,
-                                   c10d::ReduceOp::RedOpType op);
+                                   c10d::ReduceOp::RedOpType op,
+                                   std::vector<at::Tensor>* keep_tensors = nullptr);
 
     // Compressed send/recv helpers
     void compressed_send(int peer, OpType op, uint32_t seq, uint32_t tid,

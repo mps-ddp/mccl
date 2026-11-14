@@ -599,9 +599,6 @@ void metal_scale_inplace(const at::Tensor& buf, double scale) {
         if (buf.scalar_type() == at::kHalf) {
             __fp16 s = static_cast<__fp16>(scale);
             [enc setBytes:&s length:sizeof(s) atIndex:1];
-        } else if (buf.scalar_type() == at::kBFloat16) {
-            c10::BFloat16 s = static_cast<float>(scale);
-            [enc setBytes:&s length:sizeof(s) atIndex:1];
         } else {
             float s = static_cast<float>(scale);
             [enc setBytes:&s length:sizeof(s) atIndex:1];
@@ -660,9 +657,6 @@ void metal_accumulate_and_scale(const at::Tensor& dst, const at::Tensor& src,
 
         if (dst.scalar_type() == at::kHalf) {
             __fp16 s = static_cast<__fp16>(scale);
-            [enc setBytes:&s length:sizeof(s) atIndex:2];
-        } else if (dst.scalar_type() == at::kBFloat16) {
-            c10::BFloat16 s = static_cast<float>(scale);
             [enc setBytes:&s length:sizeof(s) atIndex:2];
         } else {
             float s = static_cast<float>(scale);

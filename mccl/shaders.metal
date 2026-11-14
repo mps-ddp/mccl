@@ -299,7 +299,7 @@ kernel void scale_inplace_f16(
 #if defined(__HAVE_BFLOAT__)
 kernel void scale_inplace_bf16(
     device bfloat* buf       [[buffer(0)]],
-    constant bfloat& scale   [[buffer(1)]],
+    constant float& scale    [[buffer(1)]],
     constant uint& count     [[buffer(2)]],
     constant bool& aligned   [[buffer(3)]],
     uint gid                 [[thread_position_in_grid]]
@@ -310,23 +310,26 @@ kernel void scale_inplace_bf16(
             uint vec_index = gid * 2;
             bfloat4 b0, b1;
             load2<bfloat, bfloat4>(buf, vec_index, b0, b1);
-            store2<bfloat, bfloat4>(buf, vec_index, b0 * scale, b1 * scale);
+            store2<bfloat, bfloat4>(buf, vec_index, bfloat4(float4(b0) * scale),
+                                    bfloat4(float4(b1) * scale));
         } else {
             bfloat4 b0, b1;
             load2_scalar<bfloat, bfloat4>(buf, base, b0, b1);
-            b0 *= scale;
-            b1 *= scale;
-            buf[base] = b0[0];
-            buf[base + 1] = b0[1];
-            buf[base + 2] = b0[2];
-            buf[base + 3] = b0[3];
-            buf[base + 4] = b1[0];
-            buf[base + 5] = b1[1];
-            buf[base + 6] = b1[2];
-            buf[base + 7] = b1[3];
+            float4 o0 = float4(b0) * scale;
+            float4 o1 = float4(b1) * scale;
+            buf[base] = bfloat(o0[0]);
+            buf[base + 1] = bfloat(o0[1]);
+            buf[base + 2] = bfloat(o0[2]);
+            buf[base + 3] = bfloat(o0[3]);
+            buf[base + 4] = bfloat(o1[0]);
+            buf[base + 5] = bfloat(o1[1]);
+            buf[base + 6] = bfloat(o1[2]);
+            buf[base + 7] = bfloat(o1[3]);
         }
     } else {
-        scale_tail<bfloat>(buf, scale, base, count);
+        for (uint i = base; i < min(base + kElementsPerThread, count); ++i) {
+            buf[i] = bfloat(float(buf[i]) * scale);
+        }
     }
 }
 #endif
@@ -518,7 +521,7 @@ kernel void accumulate_scale_f16(
 kernel void accumulate_scale_bf16(
     device bfloat* dst        [[buffer(0)]],
     device const bfloat* src  [[buffer(1)]],
-    constant bfloat& scale    [[buffer(2)]],
+    constant float& scale     [[buffer(2)]],
     constant uint& count      [[buffer(3)]],
     constant bool& aligned    [[buffer(4)]],
     uint gid                  [[thread_position_in_grid]]
@@ -530,23 +533,27 @@ kernel void accumulate_scale_bf16(
             uint vec_index = gid * 2;
             load2<bfloat, bfloat4>(dst, vec_index, d0, d1);
             load2<bfloat, bfloat4>(src, vec_index, s0, s1);
-            store2<bfloat, bfloat4>(dst, vec_index, (d0 + s0) * scale, (d1 + s1) * scale);
+            store2<bfloat, bfloat4>(dst, vec_index,
+                                    bfloat4((float4(d0) + float4(s0)) * scale),
+                                    bfloat4((float4(d1) + float4(s1)) * scale));
         } else {
             load2_scalar<bfloat, bfloat4>(dst, base, d0, d1);
             load2_scalar<bfloat, bfloat4>(src, base, s0, s1);
-            bfloat4 o0 = (d0 + s0) * scale;
-            bfloat4 o1 = (d1 + s1) * scale;
-            dst[base] = o0[0];
-            dst[base + 1] = o0[1];
-            dst[base + 2] = o0[2];
-            dst[base + 3] = o0[3];
-            dst[base + 4] = o1[0];
-            dst[base + 5] = o1[1];
-            dst[base + 6] = o1[2];
-            dst[base + 7] = o1[3];
+            float4 o0 = (float4(d0) + float4(s0)) * scale;
+            float4 o1 = (float4(d1) + float4(s1)) * scale;
+            dst[base] = bfloat(o0[0]);
+            dst[base + 1] = bfloat(o0[1]);
+            dst[base + 2] = bfloat(o0[2]);
+            dst[base + 3] = bfloat(o0[3]);
+            dst[base + 4] = bfloat(o1[0]);
+            dst[base + 5] = bfloat(o1[1]);
+            dst[base + 6] = bfloat(o1[2]);
+            dst[base + 7] = bfloat(o1[3]);
         }
     } else {
-        accumulate_scale_tail<bfloat>(dst, src, scale, base, count);
+        for (uint i = base; i < min(base + kElementsPerThread, count); ++i) {
+            dst[i] = bfloat((float(dst[i]) + float(src[i])) * scale);
+        }
     }
 }
 #endif

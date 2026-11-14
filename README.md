@@ -208,7 +208,7 @@ Software:
   author  = {Sasso, Kevin},
   title   = {{MCCL} (Metal Collective Communication Library)},
   year    = {2026},
-  version = {6.9.0},
+  version = {6.9.1},
   url     = {https://github.com/mps-ddp/mccl}
 }
 ```

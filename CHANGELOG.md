@@ -1,9 +1,15 @@
 # Changelog
 
-## Unreleased
+## v6.9.1 — `all_to_all_single`, clean shutdown, and `bfloat16` / `reduce_scatter` fixes
+
+### Added
+- **Native MPS `all_to_all_single` (`alltoall_base`)**: dim-0 equal and uneven splits in unified memory (with page-aligned blit staging fallback for private buffers) plus opt-in stream-ordered completion (`MCCL_STREAM_ORDERED_A2A=1`).
+- **Non-reducing transport dtypes**: `broadcast`, `all_gather`, `all_to_all_single`, `send`, and `recv` now pass through `int8`, `int16`, `uint16`, `uint32`, `uint64`, `complex64`, `float8_e4m3fn`, and `float8_e5m2` bytes directly (reduction collectives remain restricted to `float32`/`float16`/`bfloat16`/`int32`/`int64`/`bool`).
 
 ### Fixed
-- **Clean exit after `destroy_process_group()`.** `ProcessGroupMCCL` now overrides `shutdown()`, which `destroy_process_group()` calls, so the health monitor, watchdog, progress engines and transport readers are joined and the sockets closed at that point instead of only in the destructor.  While anything still held the group (DDP's reducer does), those threads ran until process exit; a reader logging a peer's close during C++ static destruction then locked the already destroyed logger mutex and the process aborted with `libc++abi: ... mutex lock failed: Invalid argument` (SIGABRT) after a successful run, in 4 of 10 two-host runs.  The logger mutex is now never destroyed, and the health monitor and watchdog wake from their sleep on `stop()`, so shutdown no longer waits up to one heartbeat interval (5 s).
+- **Clean exit after `destroy_process_group()`** ([#25](https://github.com/mps-ddp/mccl/pull/25)): `ProcessGroupMCCL` now overrides `shutdown()`, which `destroy_process_group()` calls, so the health monitor, watchdog, progress engines and transport readers are joined and the sockets closed at that point instead of only in the destructor.  While anything still held the group (DDP's reducer does), those threads ran until process exit; a reader logging a peer's close during C++ static destruction then locked the already destroyed logger mutex and the process aborted with `libc++abi: ... mutex lock failed: Invalid argument` (SIGABRT) after a successful run, in 4 of 10 two-host runs.  The logger mutex is now never destroyed, and the health monitor and watchdog wake from their sleep on `stop()`, so shutdown no longer waits up to one heartbeat interval (5 s).
+- **`bfloat16` `AVG` parity (CPU vs Metal)**: `scale_inplace_bf16` and `accumulate_scale_bf16` now compute `float32` scaling before narrowing back to `bfloat16` instead of truncating `1/N` to 7-bit `bfloat16` first, matching the CPU path bit-for-bit on `SUM` and `AVG`.
+- **`reduce_scatter` `AVG` and MPS sync**: `reduce_scatter` now scales by `1 / world_size` for `ReduceOp.AVG`, keeps async Metal receive tensors alive until completion (`IncomingKeepAlive`), and uses MCCL-queue blits instead of engine-thread `.copy_()` calls.
 
 ## v6.9 — low-latency pipeline inference
 
